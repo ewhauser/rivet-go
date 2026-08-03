@@ -192,8 +192,12 @@ pub extern "C" fn rk_string_free(string: RkBytes) {
 }
 
 /// Serializes an error as UTF-8 JSON owned by the caller.
+///
+/// # Safety
+///
+/// `error` must be null or a live `RkError` returned by this library.
 #[unsafe(no_mangle)]
-pub extern "C" fn rk_error_json(error: *const RkError) -> RkBytes {
+pub unsafe extern "C" fn rk_error_json(error: *const RkError) -> RkBytes {
     match catch_unwind(AssertUnwindSafe(|| {
         if error.is_null() {
             return Vec::new();
@@ -211,8 +215,13 @@ pub extern "C" fn rk_error_json(error: *const RkError) -> RkBytes {
 }
 
 /// Releases an owned error handle.
+///
+/// # Safety
+///
+/// `error` must be null or an `RkError` returned by this library that has not
+/// already been freed.
 #[unsafe(no_mangle)]
-pub extern "C" fn rk_error_free(error: *mut RkError) {
+pub unsafe extern "C" fn rk_error_free(error: *mut RkError) {
     let _ = catch_unwind(AssertUnwindSafe(|| {
         if !error.is_null() {
             // SAFETY: Error pointers originate in error_into_raw and are freed once.
@@ -270,12 +279,14 @@ mod tests {
 
     fn decode_and_free(error: *mut RkError) -> ErrorPayload {
         assert!(!error.is_null());
-        let bytes = rk_error_json(error);
+        // SAFETY: error is a live handle returned by this module.
+        let bytes = unsafe { rk_error_json(error) };
         assert!(!bytes.ptr.is_null());
         // SAFETY: rk_error_json returned a live buffer for bytes.len bytes.
         let json = unsafe { std::slice::from_raw_parts(bytes.ptr, bytes.len) }.to_vec();
         rk_bytes_free(bytes);
-        rk_error_free(error);
+        // SAFETY: error is live and has not previously been freed.
+        unsafe { rk_error_free(error) };
         serde_json::from_slice(&json).expect("valid error JSON")
     }
 

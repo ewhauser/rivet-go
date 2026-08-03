@@ -66,11 +66,20 @@ void rk_string_free(struct RkBytes string);
 
 /**
  * Serializes an error as UTF-8 JSON owned by the caller.
+ *
+ * # Safety
+ *
+ * `error` must be null or a live `RkError` returned by this library.
  */
 struct RkBytes rk_error_json(const struct RkError *error);
 
 /**
  * Releases an owned error handle.
+ *
+ * # Safety
+ *
+ * `error` must be null or an `RkError` returned by this library that has not
+ * already been freed.
  */
 void rk_error_free(struct RkError *error);
 
