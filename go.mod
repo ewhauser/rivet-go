@@ -10,6 +10,7 @@ require (
 )
 
 require (
+	github.com/gorilla/websocket v1.5.3 // indirect
 	github.com/vmihailenco/tagparser/v2 v2.0.0 // indirect
 	github.com/x448/float16 v0.8.4 // indirect
 )
