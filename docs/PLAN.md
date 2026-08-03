@@ -355,3 +355,56 @@ errors, and actor-local action/fetch panic handling exclusively from public
 HTTP and engine-observed results. A separate restart case mutates state only
 inside an action and proves the implicit successful-action save rehydrates in
 a higher actor generation after a real engine process replacement.
+
+## M4 pin-specific deviation notes — 2026-08-03
+
+M4 adds raw gateway WebSockets to the typed actor definition through
+`OnConnect`, `OnMessage`, and `OnDisconnect`. One `Connection` object is kept
+for the complete open/message/close lifecycle and exposes text or binary send,
+actor-initiated close, path/header metadata, the core connection ID, and the
+pin's hibernation capability. `Context.Broadcast(event, payload)` encodes one
+CBOR argument and sends the named event to every live raw connection on the
+actor; `BroadcastExcept` excludes the supplied connection. Actions use the
+same actor context and can broadcast without a separate integration path.
+
+The v2.3.10 native actor-event surface and raw WebSocket surface are distinct.
+`ActorContext::broadcast` reaches actor-connect clients that subscribed to the
+event, but it does not write raw WebSocket frames. The M4 FFI invokes that
+native method with the CBOR argument-array bytes and additionally frames raw
+client broadcasts as a binary CBOR `{event, args}` map. This keeps the public
+call shaped as `ctx.Broadcast("countChanged", value)` and gives raw clients an
+unambiguous named-event envelope without changing targeted text/binary sends.
+
+Raw WebSocket messages are complete frames capped at 1 MiB. They are not split
+because multiple frames are not equivalent to one WebSocket message. Native
+command submission uses the M3 backpressure retry discipline on the handler
+goroutine, leaving polling available. Each connection also has a 64-command
+native outbound queue; overflow closes only that connection with WebSocket
+code 1013 and reason `outbound_backpressure`. At this pin core immediately
+accepts sends into an internal unbounded envoy queue and exposes no transport
+flush or buffered-byte metric. Conformance therefore proves that a client with
+no read loop cannot block a peer's burst, and a deterministic Rust unit test
+proves the per-connection overflow close while a peer queue remains usable.
+
+Connection ownership is recorded on both sides of the boundary. Client close,
+actor-issued close, actor stop, and runner shutdown remove the Rust registry
+entry deterministically and deliver `OnDisconnect` once in Go. A panic in any
+WebSocket hook is contained by the existing handler firewall, submits the
+cataloged `StopIntent`, and stops that actor generation without ending the
+pump or peer actors.
+
+The real-engine conformance test uses the public gateway with the same Rivet
+WebSocket subprotocol metadata as the pinned official client. It proves
+two-client handler-mediated broadcast, `BroadcastExcept`, targeted send, text
+and 1 MiB binary frames, client- and actor-initiated close hooks with a live
+peer, action-originated broadcast, exactly-once delivery to 50 simultaneous
+connections, and progress for a reading client while another connection does
+not read.
+
+Hibernation is deliberately deferred to M5. M4 keeps `no_sleep = true` and
+configures core with `can_hibernate_websocket = false`, while still carrying
+`can_hibernate`, `msg_index` acknowledgements, and `WsCloseCmd.hibernate`
+through ABI 4. The command takes the ordinary close path and the acknowledgement
+is process-local bookkeeping only. M5 must add durable replay and reconcile
+core's current post-callback acknowledgement timing before enabling either
+sleep or hibernating WebSockets.

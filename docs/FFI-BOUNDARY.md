@@ -344,3 +344,61 @@ the envelope's 1 MiB per-blob ceiling and fail structurally before crossing it.
 
 WebSockets, event broadcast, alarm delivery, sleep scheduling, and the
 standalone client package remain outside M3.
+
+## M4 pin-specific notes — 2026-08-03
+
+M4 adds `WsOpen`, `WsMessage`, and `WsClose` events plus `WsOpenResult`,
+`WsMessageAck`, `WsSend`, `WsCloseCmd`, `Broadcast`, and `StopIntent` commands,
+and bumps the boundary ABI to 4. The existing MessagePack shape scanner limits
+do not change: its 1 MiB blob limit is the WebSocket message maximum, its 1024
+entry map limit contains the schema-capped 256-header open map, and every new
+identifier and close reason is smaller than an existing string limit. Rust
+goldens cover every M4 event and command kind, including the fields that are
+carried now for M5.
+
+The raw WebSocket mapping at v2.3.10 is:
+
+- `ActorEvent::WebSocketOpen` supplies the `ConnHandle`, `WebSocket`, and
+  optional request used to emit `WsOpen`; its reply waits up to 30 seconds for
+  `WsOpenResult`, and a rejected Go `OnConnect` follows core's structured raw
+  WebSocket failure path;
+- the core connection ID is the stable `ws_id` for one actor generation;
+  request path and the pinned core's single-value header map cross unchanged;
+- core supplies a `u16` client message index for every raw message. Rust
+  records it before `WsMessage`, and Go submits `WsMessageAck` after the
+  serialized handler returns;
+- the raw close callback supplies the peer close code and reason. Actor stop,
+  runner shutdown, and an actor-issued close remove the registry entry first,
+  emit one `WsClose`, and make later core close notifications harmless;
+- all messages are complete text or binary WebSocket frames. A frame may be at
+  most 1 MiB and is not split, because splitting would change WebSocket message
+  semantics. Text must be valid UTF-8.
+
+Each raw connection has a 64-command FFI-owned outbound queue. `WsSend` and
+each raw recipient of `Broadcast` use non-blocking `try_send`; if that queue is
+full, only that connection is removed and closed with code 1013 and reason
+`outbound_backpressure`. Other connections continue. The pinned core's
+`WebSocketSender` accepts into its own unbounded envoy tunnel queue and exposes
+no write-completion or buffered-byte signal, so the FFI cannot measure a
+gateway peer's socket backlog after core accepts a send. The real-engine test
+therefore proves that an unread peer does not delay a reading peer, while the
+Rust queue test deterministically proves the close-on-overflow policy. Go uses
+the same bounded native-submit retry and 30-second backpressure ceiling as the
+M3 HTTP writer, from the handler goroutine rather than the poll goroutine.
+
+`Broadcast.payload` is one CBOR argument array. Core's native
+`ActorContext::broadcast` receives those bytes directly for actor-connect
+subscriptions. Raw WebSocket clients are not part of that native subscription
+surface at this pin, so the FFI also sends them a binary CBOR map shaped as
+`{event, args}`. `exclude_conn` filters the matching raw `ws_id`; actor-connect
+delivery remains governed by core's subscription registry. Direct
+`Connection.Send` uses `WsSend` and does not involve subscriptions.
+
+Hibernation remains an M5 marker, not an M4 behavior. M4 configures
+`can_hibernate_websocket = false` and `no_sleep = true`, but faithfully carries
+`WsOpen.can_hibernate`, records and acknowledges `WsMessage.msg_index`, and
+decodes `WsCloseCmd.hibernate`. The close command always takes the normal
+non-hibernating path in M4. Core currently persists and acknowledges a
+hibernating raw message after its embedder callback returns, which happens
+before the asynchronous Go handler completes; M5 must reconcile that pin
+behavior with durable replay before enabling hibernation.
