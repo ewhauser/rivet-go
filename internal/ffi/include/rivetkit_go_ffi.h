@@ -22,7 +22,7 @@
 typedef struct RkError RkError;
 
 /**
- * Opaque runner handle. M0 never creates one.
+ * Opaque runner handle.
  */
 typedef struct RkRunner RkRunner;
 
@@ -84,28 +84,51 @@ struct RkBytes rk_error_json(const struct RkError *error);
 void rk_error_free(struct RkError *error);
 
 /**
- * Creates a runner. M0 returns a structured not-implemented error.
+ * Creates a runner and waits for bounded, management-API-confirmed engine
+ * registration before returning its owned handle.
+ *
+ * # Safety
+ *
+ * `config` must be null when `config_len` is zero or point to
+ * `config_len` readable bytes for this call.
  */
-struct RkRunnerResult rk_runner_new(const uint8_t *_config, size_t _config_len);
+struct RkRunnerResult rk_runner_new(const uint8_t *config, size_t config_len);
 
 /**
- * Releases a runner handle. M0 has no constructible runner handles.
+ * Releases a runner handle, forcing a bounded drain if shutdown was omitted.
+ *
+ * # Safety
+ *
+ * `runner` must be null or a live handle returned by `rk_runner_new` that has
+ * not already been freed. No other call may borrow it concurrently.
  */
-void rk_runner_free(struct RkRunner *_runner);
+void rk_runner_free(struct RkRunner *runner);
 
 /**
- * Polls a runner. M0 returns a structured not-implemented error.
+ * Polls a runner for an encoded EventBatch.
+ *
+ * # Safety
+ *
+ * `runner` must be a live handle for the duration of this call.
  */
-struct RkPollResult rk_runner_poll(struct RkRunner *_runner, uint32_t _timeout_ms);
+struct RkPollResult rk_runner_poll(struct RkRunner *runner, uint32_t timeout_ms);
 
 /**
- * Submits a command batch. M0 returns a structured not-implemented error.
+ * Submits an encoded CommandBatch without blocking on command execution.
+ *
+ * # Safety
+ *
+ * `runner` must be live and `batch` must satisfy the borrowed-buffer rules.
  */
-struct RkSubmitResult rk_runner_submit(struct RkRunner *_runner, const uint8_t *_batch, size_t len);
+struct RkSubmitResult rk_runner_submit(struct RkRunner *runner, const uint8_t *batch, size_t len);
 
 /**
- * Begins graceful shutdown. M0 returns a structured not-implemented error.
+ * Begins graceful shutdown; polling continues through RunnerStopped.
+ *
+ * # Safety
+ *
+ * `runner` must be a live handle for the duration of this call.
  */
-struct RkSubmitResult rk_runner_shutdown(struct RkRunner *_runner, uint32_t _deadline_ms);
+struct RkSubmitResult rk_runner_shutdown(struct RkRunner *runner, uint32_t deadline_ms);
 
 #endif  /* RIVETKIT_GO_FFI_H */
