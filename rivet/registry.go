@@ -4,6 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
+	"strings"
+	"sync"
 	"sync/atomic"
 
 	"github.com/ewhauser/rivet-go/internal/ffi"
@@ -18,9 +21,9 @@ const (
 	defaultLogLevel   = "info"
 )
 
-// Config controls engine registration for an empty M1 registry. Version is
-// the engine-visible runner version and TotalSlots is retained in the stable
-// boundary for the actor-capable milestones.
+// Config controls engine registration. Version is the engine-visible runner
+// version. TotalSlots remains a stable boundary field but v2.3.10 does not
+// expose a CoreRegistry setter for it.
 type Config struct {
 	Endpoint   string
 	Namespace  string
@@ -30,19 +33,45 @@ type Config struct {
 	LogLevel   string
 }
 
-// Registry is the actor registration owner. M1 has no actor registration
-// methods; M2 and M3 add actors and actions without changing Serve.
+// Registry owns typed actor registrations and may serve only once at a time.
 type Registry struct {
 	serving atomic.Bool
+	mu      sync.RWMutex
+	actors  map[string]pump.ActorHandler
 }
 
 func NewRegistry() *Registry {
-	return &Registry{}
+	return &Registry{actors: make(map[string]pump.ActorHandler)}
 }
 
-// Serve registers this zero-actor runner with the configured engine and blocks
-// until ctx is canceled, graceful drain completes, or a fatal runtime error is
-// returned.
+// Register adds one typed actor definition to registry. Registrations are
+// immutable while Serve is running so the engine manifest and Go dispatcher
+// always describe the same set of actor names.
+func Register[T any](registry *Registry, name string, actor Actor[T]) error {
+	if registry == nil {
+		return errors.New("rivet registry is nil")
+	}
+	if strings.TrimSpace(name) == "" {
+		return errors.New("actor name must not be empty")
+	}
+	if registry.serving.Load() {
+		return errors.New("cannot register an actor while registry is serving")
+	}
+	registry.mu.Lock()
+	defer registry.mu.Unlock()
+	if registry.serving.Load() {
+		return errors.New("cannot register an actor while registry is serving")
+	}
+	if _, exists := registry.actors[name]; exists {
+		return fmt.Errorf("actor %q is already registered", name)
+	}
+	registry.actors[name] = &actorAdapter[T]{definition: actor}
+	return nil
+}
+
+// Serve registers this runner and its actor manifest with the configured
+// engine, then blocks until ctx is canceled, graceful drain completes, or a
+// fatal runtime error is returned.
 func (r *Registry) Serve(ctx context.Context, config Config) error {
 	if r == nil {
 		return errors.New("rivet registry is nil")
@@ -55,6 +84,7 @@ func (r *Registry) Serve(ctx context.Context, config Config) error {
 	}
 	defer r.serving.Store(false)
 
+	actorNames, handlers := r.snapshotActors()
 	config = withDefaults(config)
 	encoded, err := wire.EncodeRunnerConfig(wire.RunnerConfig{
 		EngineEndpoint: config.Endpoint,
@@ -62,7 +92,7 @@ func (r *Registry) Serve(ctx context.Context, config Config) error {
 		RunnerName:     config.RunnerName,
 		Version:        config.Version,
 		TotalSlots:     config.TotalSlots,
-		ActorNames:     []string{},
+		ActorNames:     actorNames,
 		LogLevel:       config.LogLevel,
 	})
 	if err != nil {
@@ -84,7 +114,20 @@ func (r *Registry) Serve(ctx context.Context, config Config) error {
 		return errors.New("start native runner: native constructor returned neither runner nor error")
 	}
 
-	return pump.New(result.Runner).Run(ctx)
+	return pump.NewWithHandlers(result.Runner, handlers).Run(ctx)
+}
+
+func (r *Registry) snapshotActors() ([]string, map[string]pump.ActorHandler) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	names := make([]string, 0, len(r.actors))
+	handlers := make(map[string]pump.ActorHandler, len(r.actors))
+	for name, handler := range r.actors {
+		names = append(names, name)
+		handlers[name] = handler
+	}
+	sort.Strings(names)
+	return names, handlers
 }
 
 func withDefaults(config Config) Config {
