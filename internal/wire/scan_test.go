@@ -70,6 +70,9 @@ func TestValidateShapeAcceptsGoldens(t *testing.T) {
 		"event_http_request.msgpack",
 		"event_http_request_chunk.msgpack",
 		"event_http_request_abort.msgpack",
+		"event_ws_open.msgpack",
+		"event_ws_message.msgpack",
+		"event_ws_close.msgpack",
 		"event_kv_result.msgpack",
 		"event_state_persisted.msgpack",
 	} {

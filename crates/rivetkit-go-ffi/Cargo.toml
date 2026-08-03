@@ -15,6 +15,7 @@ ffi-test = []
 [dependencies]
 anyhow = "1"
 crossbeam-channel = "0.5"
+ciborium = "0.2"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 rmp-serde = "1"
 serde = { version = "1", features = ["derive"] }

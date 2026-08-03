@@ -141,7 +141,7 @@ impl RunnerInner {
         if batch.contains_unknown() {
             return Err(ErrorPayload::new(
                 "unknown_command",
-                "CommandBatch contains a command not supported by M3",
+                "CommandBatch contains a command not supported by M4",
             ));
         }
         batch
@@ -497,6 +497,7 @@ async fn run_runner(
             result = &mut serve => {
                 let reason = serve_error("runner runtime stopped unexpectedly", result).message;
                 let _ = events.send(Event::RunnerDisconnected { reason });
+                actor_proxy.drain_shutdown();
                 let _ = events.send(Event::RunnerStopped {
                     drain_report: DrainReport {
                         graceful: false,
@@ -507,7 +508,6 @@ async fn run_runner(
                 });
                 command_cancellation.cancel();
                 let _ = command_task.await;
-                actor_proxy.drain_shutdown();
                 correlations.drain_shutdown();
                 return;
             }
@@ -610,6 +610,7 @@ async fn finish_shutdown(
     let actors_remaining = handle.status().active_actor_count as u32;
     command_cancellation.cancel();
     let _ = command_task.await;
+    actor_proxy.drain_shutdown();
     let _ = events.send(Event::RunnerStopped {
         drain_report: DrainReport {
             graceful,
@@ -618,7 +619,6 @@ async fn finish_shutdown(
             actors_remaining,
         },
     });
-    actor_proxy.drain_shutdown();
     correlations.drain_shutdown();
 }
 
@@ -713,7 +713,7 @@ mod tests {
     }
 
     #[test]
-    fn validates_m3_config() {
+    fn validates_m4_config() {
         assert!(validate_config(&valid_config()).is_ok());
         let mut config = valid_config();
         config.actor_names.push("actor".to_owned());

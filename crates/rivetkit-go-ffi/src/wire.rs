@@ -85,6 +85,25 @@ pub(crate) enum Event {
     HttpRequestAbort {
         req_id: u64,
     },
+    WsOpen {
+        aid: String,
+        ws_id: String,
+        path: String,
+        headers: BTreeMap<String, String>,
+        can_hibernate: bool,
+    },
+    WsMessage {
+        ws_id: String,
+        #[serde(with = "serde_bytes")]
+        data: Vec<u8>,
+        binary: bool,
+        msg_index: u16,
+    },
+    WsClose {
+        ws_id: String,
+        code: Option<u16>,
+        reason: Option<String>,
+    },
     KvResult {
         kv_id: u64,
         #[serde(
@@ -186,6 +205,39 @@ pub(crate) enum Command {
         #[serde(with = "serde_bytes")]
         body: Vec<u8>,
         finish: bool,
+    },
+    WsOpenResult {
+        ws_id: String,
+        accept: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<WireError>,
+    },
+    WsMessageAck {
+        ws_id: String,
+        msg_index: u16,
+    },
+    WsSend {
+        ws_id: String,
+        #[serde(with = "serde_bytes")]
+        data: Vec<u8>,
+        binary: bool,
+    },
+    WsCloseCmd {
+        ws_id: String,
+        code: Option<u16>,
+        reason: Option<String>,
+        #[serde(default)]
+        hibernate: bool,
+    },
+    Broadcast {
+        aid: String,
+        event: String,
+        #[serde(with = "serde_bytes")]
+        payload: Vec<u8>,
+        exclude_conn: Option<String>,
+    },
+    StopIntent {
+        aid: String,
     },
     SaveState {
         aid: String,
@@ -359,6 +411,67 @@ impl CommandBatch {
                         );
                     }
                 }
+                Command::WsOpenResult {
+                    ws_id,
+                    accept,
+                    error,
+                } => {
+                    require_ws_id(ws_id)?;
+                    if *accept == error.is_some() {
+                        return Err(
+                            "ws_open_result must contain exactly one of accept=true or error"
+                                .to_owned(),
+                        );
+                    }
+                    require_wire_error(error.as_ref())?;
+                }
+                Command::WsMessageAck { ws_id, .. } => require_ws_id(ws_id)?,
+                Command::WsSend {
+                    ws_id,
+                    data,
+                    binary,
+                } => {
+                    require_ws_id(ws_id)?;
+                    require_ws_data("ws_send", data, *binary, MAX_BODY_CHUNK)?;
+                }
+                Command::WsCloseCmd {
+                    ws_id,
+                    code,
+                    reason,
+                    ..
+                } => {
+                    require_ws_id(ws_id)?;
+                    if code.is_some_and(|code| !valid_close_code(code)) {
+                        return Err("ws_close_cmd contains an invalid close code".to_owned());
+                    }
+                    if reason.as_ref().is_some_and(|reason| reason.len() > 123) {
+                        return Err(
+                            "ws_close_cmd reason exceeds the WebSocket 123-byte limit".to_owned()
+                        );
+                    }
+                }
+                Command::Broadcast {
+                    aid,
+                    event,
+                    payload,
+                    exclude_conn,
+                } => {
+                    require_aid(aid)?;
+                    if event.trim().is_empty() {
+                        return Err("broadcast event must not be empty".to_owned());
+                    }
+                    if payload.len() > MAX_BODY_CHUNK {
+                        return Err(format!(
+                            "broadcast payload exceeds boundary maximum {MAX_BODY_CHUNK} bytes"
+                        ));
+                    }
+                    let _: ciborium::Value = ciborium::from_reader(payload.as_slice())
+                        .map_err(|error| format!("broadcast payload must be CBOR: {error}"))?;
+                    if exclude_conn.as_ref().is_some_and(String::is_empty) {
+                        return Err("broadcast exclude_conn must not be empty".to_owned());
+                    }
+                }
+                Command::StopIntent { aid } => require_aid(aid)?,
                 Command::KvGet { kv_id, aid, .. }
                 | Command::KvPut { kv_id, aid, .. }
                 | Command::KvDelete { kv_id, aid, .. } => {
@@ -387,6 +500,30 @@ fn require_aid(aid: &str) -> Result<(), String> {
     } else {
         Ok(())
     }
+}
+
+fn require_ws_id(ws_id: &str) -> Result<(), String> {
+    if ws_id.is_empty() {
+        Err("WebSocket command ws_id must not be empty".to_owned())
+    } else {
+        Ok(())
+    }
+}
+
+fn require_ws_data(kind: &str, data: &[u8], binary: bool, maximum: usize) -> Result<(), String> {
+    if data.len() > maximum {
+        return Err(format!(
+            "{kind} data exceeds boundary maximum {maximum} bytes"
+        ));
+    }
+    if !binary && std::str::from_utf8(data).is_err() {
+        return Err(format!("{kind} text data must be valid UTF-8"));
+    }
+    Ok(())
+}
+
+fn valid_close_code(code: u16) -> bool {
+    matches!(code, 1000..=1003 | 1007..=1014 | 3000..=4999)
 }
 
 fn require_kv(kv_id: u64, aid: &str) -> Result<(), String> {
@@ -449,6 +586,19 @@ mod tests {
         body: Option<Vec<u8>>,
         stream: bool,
         finish: bool,
+        ws_id: &'static str,
+        accept: bool,
+        #[serde(with = "optional_bytes")]
+        data: Option<Vec<u8>>,
+        binary: bool,
+        msg_index: u16,
+        code: Option<u16>,
+        reason: Option<&'static str>,
+        hibernate: bool,
+        event: &'static str,
+        #[serde(with = "optional_bytes")]
+        payload: Option<Vec<u8>>,
+        exclude_conn: Option<&'static str>,
     }
 
     #[derive(Serialize)]
@@ -478,6 +628,17 @@ mod tests {
             body: None,
             stream: false,
             finish: false,
+            ws_id: "",
+            accept: false,
+            data: None,
+            binary: false,
+            msg_index: 0,
+            code: None,
+            reason: None,
+            hibernate: false,
+            event: "",
+            payload: None,
+            exclude_conn: None,
         }
     }
 
@@ -679,6 +840,46 @@ mod tests {
                 .expect("encode HTTP request abort event"),
         );
 
+        let ws_open = EventBatch {
+            seq: 14,
+            events: vec![Event::WsOpen {
+                aid: "actor-golden".to_owned(),
+                ws_id: "ws-golden".to_owned(),
+                path: "/chat?room=golden".to_owned(),
+                headers: BTreeMap::from([("x-test".to_owned(), "one".to_owned())]),
+                can_hibernate: false,
+            }],
+        };
+        write_golden(
+            "event_ws_open.msgpack",
+            &ws_open.encode().expect("encode WebSocket open event"),
+        );
+        let ws_message = EventBatch {
+            seq: 15,
+            events: vec![Event::WsMessage {
+                ws_id: "ws-golden".to_owned(),
+                data: b"hello".to_vec(),
+                binary: false,
+                msg_index: 3,
+            }],
+        };
+        write_golden(
+            "event_ws_message.msgpack",
+            &ws_message.encode().expect("encode WebSocket message event"),
+        );
+        let ws_close = EventBatch {
+            seq: 16,
+            events: vec![Event::WsClose {
+                ws_id: "ws-golden".to_owned(),
+                code: Some(1000),
+                reason: Some("done".to_owned()),
+            }],
+        };
+        write_golden(
+            "event_ws_close.msgpack",
+            &ws_close.encode().expect("encode WebSocket close event"),
+        );
+
         let kv_result = EventBatch {
             seq: 6,
             events: vec![Event::KvResult {
@@ -774,6 +975,41 @@ mod tests {
             .expect("Rust command decoder accepts the full Go M3 command shape");
         assert_eq!(decoded.commands.len(), 3);
         write_golden("command_m3.msgpack", &command_m3);
+
+        let mut ws_open_result = golden_command("ws_open_result");
+        ws_open_result.ws_id = "ws-golden";
+        ws_open_result.accept = true;
+        let mut ws_ack = golden_command("ws_message_ack");
+        ws_ack.ws_id = "ws-golden";
+        ws_ack.msg_index = 3;
+        let mut ws_send = golden_command("ws_send");
+        ws_send.ws_id = "ws-golden";
+        ws_send.data = Some(b"targeted".to_vec());
+        let mut ws_close_cmd = golden_command("ws_close_cmd");
+        ws_close_cmd.ws_id = "ws-golden";
+        ws_close_cmd.code = Some(1000);
+        ws_close_cmd.reason = Some("done");
+        let mut broadcast = golden_command("broadcast");
+        broadcast.event = "countChanged";
+        broadcast.payload = Some(vec![0x81, 0x18, 0x2a]);
+        broadcast.exclude_conn = Some("ws-excluded");
+        let mut stop_intent = golden_command("stop_intent");
+        stop_intent.aid = "actor-golden";
+        let command_m4 = rmp_serde::to_vec_named(&GoldenCommandBatch {
+            commands: vec![
+                ws_open_result,
+                ws_ack,
+                ws_send,
+                ws_close_cmd,
+                broadcast,
+                stop_intent,
+            ],
+        })
+        .expect("encode M4 command batch");
+        let decoded = CommandBatch::decode(&command_m4)
+            .expect("Rust command decoder accepts the full Go M4 command shape");
+        assert_eq!(decoded.commands.len(), 6);
+        write_golden("command_m4.msgpack", &command_m4);
     }
 
     #[test]

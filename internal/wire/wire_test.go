@@ -67,6 +67,9 @@ func TestRustEventBatchGoldens(t *testing.T) {
 		{"event_http_request.msgpack", EventHTTPRequest, 11},
 		{"event_http_request_chunk.msgpack", EventHTTPRequestChunk, 12},
 		{"event_http_request_abort.msgpack", EventHTTPRequestAbort, 13},
+		{"event_ws_open.msgpack", EventWSOpen, 14},
+		{"event_ws_message.msgpack", EventWSMessage, 15},
+		{"event_ws_close.msgpack", EventWSClose, 16},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -81,6 +84,52 @@ func TestRustEventBatchGoldens(t *testing.T) {
 				t.Fatalf("action timeout = %d ms, want 60000", batch.Events[0].ActionTimeoutMS)
 			}
 		})
+	}
+}
+
+func TestRustM4CommandBatchGolden(t *testing.T) {
+	data := golden(t, "command_m4.msgpack")
+	var batch CommandBatch
+	if err := decode(data, &batch); err != nil {
+		t.Fatal(err)
+	}
+	want := []CommandKind{
+		CommandWSOpenResult,
+		CommandWSMessageAck,
+		CommandWSSend,
+		CommandWSClose,
+		CommandBroadcast,
+		CommandStopIntent,
+	}
+	if len(batch.Commands) != len(want) {
+		t.Fatalf("command count = %d, want %d", len(batch.Commands), len(want))
+	}
+	for index, kind := range want {
+		if batch.Commands[index].Kind != kind {
+			t.Fatalf("command %d kind = %q, want %q", index, batch.Commands[index].Kind, kind)
+		}
+	}
+	if batch.Commands[0].WSID != "ws-golden" || !batch.Commands[0].Accept {
+		t.Fatalf("unexpected WebSocket open result: %#v", batch.Commands[0])
+	}
+	if batch.Commands[1].MessageIndex != 3 {
+		t.Fatalf("unexpected WebSocket message acknowledgement: %#v", batch.Commands[1])
+	}
+	if string(batch.Commands[2].Data) != "targeted" || batch.Commands[2].Binary {
+		t.Fatalf("unexpected targeted WebSocket send: %#v", batch.Commands[2])
+	}
+	if batch.Commands[3].CloseCode == nil || *batch.Commands[3].CloseCode != 1000 {
+		t.Fatalf("unexpected WebSocket close command: %#v", batch.Commands[3])
+	}
+	if batch.Commands[4].Event != "countChanged" || batch.Commands[4].ExcludeConn == nil {
+		t.Fatalf("unexpected broadcast command: %#v", batch.Commands[4])
+	}
+	encoded, err := EncodeCommandBatch(batch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(encoded, data) {
+		t.Fatal("Go CommandBatch encoding differs from the Rust-generated M4 golden")
 	}
 }
 

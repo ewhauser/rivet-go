@@ -5,6 +5,7 @@ package wire
 import (
 	"bytes"
 	"fmt"
+	"unicode/utf8"
 
 	"github.com/vmihailenco/msgpack/v5"
 )
@@ -21,6 +22,9 @@ const (
 	EventHTTPRequest        EventKind = "http_request"
 	EventHTTPRequestChunk   EventKind = "http_request_chunk"
 	EventHTTPRequestAbort   EventKind = "http_request_abort"
+	EventWSOpen             EventKind = "ws_open"
+	EventWSMessage          EventKind = "ws_message"
+	EventWSClose            EventKind = "ws_close"
 	EventKVResult           EventKind = "kv_result"
 	EventStatePersisted     EventKind = "state_persisted"
 )
@@ -33,6 +37,12 @@ const (
 	CommandActionResult      CommandKind = "action_result"
 	CommandHTTPResponseStart CommandKind = "http_response_start"
 	CommandHTTPResponseChunk CommandKind = "http_response_chunk"
+	CommandWSOpenResult      CommandKind = "ws_open_result"
+	CommandWSMessageAck      CommandKind = "ws_message_ack"
+	CommandWSSend            CommandKind = "ws_send"
+	CommandWSClose           CommandKind = "ws_close_cmd"
+	CommandBroadcast         CommandKind = "broadcast"
+	CommandStopIntent        CommandKind = "stop_intent"
 	CommandSaveState         CommandKind = "save_state"
 	CommandKVGet             CommandKind = "kv_get"
 	CommandKVList            CommandKind = "kv_list"
@@ -58,7 +68,7 @@ type EventBatch struct {
 	Events []Event `msgpack:"events"`
 }
 
-// Event is the M3 event union. Fields not selected by Kind are absent from
+// Event is the M4 event union. Fields not selected by Kind are absent from
 // Rust's encoded map and remain zero-valued after decoding.
 type Event struct {
 	Kind            EventKind         `msgpack:"kind"`
@@ -90,6 +100,12 @@ type Event struct {
 	Body            []byte            `msgpack:"body,omitempty"`
 	Stream          bool              `msgpack:"stream,omitempty"`
 	Finish          bool              `msgpack:"finish,omitempty"`
+	WSID            string            `msgpack:"ws_id,omitempty"`
+	CanHibernate    bool              `msgpack:"can_hibernate,omitempty"`
+	Data            []byte            `msgpack:"data,omitempty"`
+	Binary          bool              `msgpack:"binary,omitempty"`
+	MessageIndex    uint16            `msgpack:"msg_index,omitempty"`
+	CloseCode       *uint16           `msgpack:"code,omitempty"`
 }
 
 type DrainReport struct {
@@ -120,30 +136,41 @@ type CommandBatch struct {
 	Commands []Command `msgpack:"commands"`
 }
 
-// Command is the M3 command union. All fields are encoded so zero-length keys,
+// Command is the M4 command union. All fields are encoded so zero-length keys,
 // values, state, and generation zero remain distinguishable from a missing
 // required field. Rust ignores fields that do not belong to the selected kind.
 type Command struct {
-	Kind       CommandKind       `msgpack:"kind"`
-	AID        string            `msgpack:"aid"`
-	Generation uint64            `msgpack:"gen"`
-	OK         bool              `msgpack:"ok"`
-	Error      *WireError        `msgpack:"error"`
-	State      []byte            `msgpack:"state"`
-	KVID       uint64            `msgpack:"kv_id"`
-	Key        []byte            `msgpack:"key"`
-	Prefix     []byte            `msgpack:"prefix"`
-	Reverse    bool              `msgpack:"reverse"`
-	Limit      *uint32           `msgpack:"limit"`
-	Value      []byte            `msgpack:"value"`
-	CallID     uint64            `msgpack:"call_id"`
-	Output     []byte            `msgpack:"output"`
-	RequestID  uint64            `msgpack:"req_id"`
-	Status     uint16            `msgpack:"status"`
-	Headers    map[string]string `msgpack:"headers"`
-	Body       []byte            `msgpack:"body"`
-	Stream     bool              `msgpack:"stream"`
-	Finish     bool              `msgpack:"finish"`
+	Kind         CommandKind       `msgpack:"kind"`
+	AID          string            `msgpack:"aid"`
+	Generation   uint64            `msgpack:"gen"`
+	OK           bool              `msgpack:"ok"`
+	Error        *WireError        `msgpack:"error"`
+	State        []byte            `msgpack:"state"`
+	KVID         uint64            `msgpack:"kv_id"`
+	Key          []byte            `msgpack:"key"`
+	Prefix       []byte            `msgpack:"prefix"`
+	Reverse      bool              `msgpack:"reverse"`
+	Limit        *uint32           `msgpack:"limit"`
+	Value        []byte            `msgpack:"value"`
+	CallID       uint64            `msgpack:"call_id"`
+	Output       []byte            `msgpack:"output"`
+	RequestID    uint64            `msgpack:"req_id"`
+	Status       uint16            `msgpack:"status"`
+	Headers      map[string]string `msgpack:"headers"`
+	Body         []byte            `msgpack:"body"`
+	Stream       bool              `msgpack:"stream"`
+	Finish       bool              `msgpack:"finish"`
+	WSID         string            `msgpack:"ws_id"`
+	Accept       bool              `msgpack:"accept"`
+	Data         []byte            `msgpack:"data"`
+	Binary       bool              `msgpack:"binary"`
+	MessageIndex uint16            `msgpack:"msg_index"`
+	CloseCode    *uint16           `msgpack:"code"`
+	CloseReason  *string           `msgpack:"reason"`
+	Hibernate    bool              `msgpack:"hibernate"`
+	Event        string            `msgpack:"event"`
+	Payload      []byte            `msgpack:"payload"`
+	ExcludeConn  *string           `msgpack:"exclude_conn"`
 }
 
 func EncodeRunnerConfig(config RunnerConfig) ([]byte, error) {
@@ -221,6 +248,24 @@ func validateEvent(event Event) error {
 	case EventHTTPRequestAbort:
 		if event.RequestID == 0 {
 			return fmt.Errorf("%s event has invalid req_id", event.Kind)
+		}
+	case EventWSOpen:
+		if event.AID == "" || event.WSID == "" || event.Path == "" {
+			return fmt.Errorf("%s event requires aid, ws_id, and path", event.Kind)
+		}
+		if len(event.Headers) > 256 {
+			return fmt.Errorf("%s event exceeds the 256-header schema limit", event.Kind)
+		}
+	case EventWSMessage:
+		if event.WSID == "" {
+			return fmt.Errorf("%s event has empty ws_id", event.Kind)
+		}
+		if !event.Binary && !utf8.Valid(event.Data) {
+			return fmt.Errorf("%s text data is not valid UTF-8", event.Kind)
+		}
+	case EventWSClose:
+		if event.WSID == "" {
+			return fmt.Errorf("%s event has empty ws_id", event.Kind)
 		}
 	case EventKVResult:
 		if event.KVID == 0 {

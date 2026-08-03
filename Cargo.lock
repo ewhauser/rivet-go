@@ -1649,6 +1649,7 @@ name = "rivetkit-go-ffi"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "ciborium",
  "crossbeam-channel",
  "proptest",
  "reqwest",

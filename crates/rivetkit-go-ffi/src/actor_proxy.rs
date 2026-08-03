@@ -11,7 +11,8 @@ use rivet_error::{RivetError, RivetErrorKind};
 use rivetkit_core::actor::ShutdownKind;
 use rivetkit_core::{
     ActionDefinition, ActorConfig, ActorContext, ActorEvent, ActorFactory, ActorStart,
-    CoreRegistry, ListOpts, Response, StateDelta, format_actor_key,
+    CanHibernateWebSocket, ConnHandle, CoreRegistry, ListOpts, Response, StateDelta, WebSocket,
+    WsMessage, format_actor_key,
 };
 use serde::{Deserialize, Serialize};
 
@@ -22,9 +23,12 @@ const LIFECYCLE_RESULT_TIMEOUT: Duration = Duration::from_secs(30);
 const SAVE_STATE_TIMEOUT: Duration = Duration::from_secs(30);
 const ACTION_RESULT_TIMEOUT: Duration = Duration::from_secs(60);
 const HTTP_RESULT_TIMEOUT: Duration = Duration::from_secs(30);
+const WS_OPEN_RESULT_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_BODY_CHUNK: usize = 1 << 20;
 const MAX_HTTP_HEADERS: usize = 256;
 const MAX_KV_LIST_ENTRIES: u32 = 1_024;
+const WS_OUTBOUND_QUEUE_CAPACITY: usize = 64;
+const WS_BACKPRESSURE_CLOSE_CODE: u16 = 1013;
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
 struct ActorIdentity {
@@ -156,9 +160,92 @@ struct HttpResponseAssembly {
     body: Vec<u8>,
 }
 
+#[derive(Debug, Deserialize, Serialize)]
+struct WsOpenResolution {
+    error: Option<WireError>,
+}
+
+enum WsOutbound {
+    Send(WsMessage),
+    Close {
+        code: Option<u16>,
+        reason: Option<String>,
+    },
+}
+
+#[derive(Clone)]
+struct ActiveWebSocket {
+    actor: ActorIdentity,
+    can_hibernate: bool,
+    ws: WebSocket,
+    outbound: tokio::sync::mpsc::Sender<WsOutbound>,
+    pending_acks: Arc<Mutex<HashSet<u16>>>,
+}
+
+#[derive(Serialize)]
+struct RawBroadcastEnvelope<'a> {
+    event: &'a str,
+    args: ciborium::Value,
+}
+
 #[derive(Clone, Default)]
 struct LifecyclePending {
     entries: Arc<Mutex<HashMap<LifecycleKey, u64>>>,
+}
+
+#[derive(Clone, Default)]
+struct WsOpenPending {
+    entries: Arc<Mutex<HashMap<String, u64>>>,
+}
+
+impl WsOpenPending {
+    fn insert(&self, ws_id: &str, id: u64) -> Result<()> {
+        let mut entries = self.entries.lock().expect("WebSocket open table poisoned");
+        if entries.insert(ws_id.to_owned(), id).is_some() {
+            return Err(anyhow!("duplicate pending WebSocket open result"));
+        }
+        Ok(())
+    }
+
+    fn resolve(
+        &self,
+        ws_id: &str,
+        resolution: WsOpenResolution,
+        correlations: &CorrelationTable,
+    ) -> bool {
+        let id = self
+            .entries
+            .lock()
+            .expect("WebSocket open table poisoned")
+            .remove(ws_id);
+        let Some(id) = id else {
+            return false;
+        };
+        let payload = rmp_serde::to_vec_named(&resolution)
+            .expect("WsOpenResolution serialization is infallible");
+        correlations.resolve(id, payload)
+    }
+
+    fn remove(&self, ws_id: &str) -> Option<u64> {
+        self.entries
+            .lock()
+            .expect("WebSocket open table poisoned")
+            .remove(ws_id)
+    }
+
+    fn retain_live(&self, correlations: &CorrelationTable) {
+        self.entries
+            .lock()
+            .expect("WebSocket open table poisoned")
+            .retain(|_, id| correlations.contains(*id));
+    }
+
+    fn clear(&self) {
+        self.entries
+            .lock()
+            .expect("WebSocket open table poisoned")
+            .clear();
+    }
 }
 
 impl LifecyclePending {
@@ -219,7 +306,9 @@ pub(crate) struct ActorProxy {
     events: Sender<Event>,
     correlations: CorrelationTable,
     pending: LifecyclePending,
+    pending_ws_open: WsOpenPending,
     actors: Arc<Mutex<HashMap<ActorIdentity, ActiveActor>>>,
+    websockets: Arc<Mutex<HashMap<String, ActiveWebSocket>>>,
     active_http: Arc<Mutex<HashSet<u64>>>,
     http_responses: Arc<Mutex<HashMap<u64, HttpResponseAssembly>>>,
 }
@@ -230,7 +319,9 @@ impl ActorProxy {
             events,
             correlations,
             pending: LifecyclePending::default(),
+            pending_ws_open: WsOpenPending::default(),
             actors: Arc::new(Mutex::new(HashMap::new())),
+            websockets: Arc::new(Mutex::new(HashMap::new())),
             active_http: Arc::new(Mutex::new(HashSet::new())),
             http_responses: Arc::new(Mutex::new(HashMap::new())),
         }
@@ -255,6 +346,9 @@ impl ActorProxy {
                 // Sleep/alarm behavior belongs to M5. Keeping M3 actors awake
                 // makes lifecycle changes engine-driven and deterministic.
                 no_sleep: true,
+                can_hibernate_websocket: CanHibernateWebSocket::Bool(false),
+                max_incoming_message_size: MAX_BODY_CHUNK as u32,
+                max_outgoing_message_size: MAX_BODY_CHUNK as u32,
                 action_timeout: ACTION_RESULT_TIMEOUT,
                 actions: actor_actions
                     .get(actor_name)
@@ -335,6 +429,42 @@ impl ActorProxy {
                 body,
                 finish,
             } => self.append_http_response(req_id, body, finish),
+            Command::WsOpenResult {
+                ws_id,
+                accept: _,
+                error,
+            } => {
+                self.pending_ws_open.resolve(
+                    &ws_id,
+                    WsOpenResolution { error },
+                    &self.correlations,
+                );
+            }
+            Command::WsMessageAck { ws_id, msg_index } => {
+                self.ack_ws_message(&ws_id, msg_index);
+            }
+            Command::WsSend {
+                ws_id,
+                data,
+                binary,
+            } => self.send_ws(&ws_id, data, binary),
+            Command::WsCloseCmd {
+                ws_id,
+                code,
+                reason,
+                hibernate: _,
+            } => self.close_ws(&ws_id, code, reason),
+            Command::Broadcast {
+                aid,
+                event,
+                payload,
+                exclude_conn,
+            } => self.broadcast(&aid, &event, payload, exclude_conn.as_deref()),
+            Command::StopIntent { aid } => {
+                if let Some(actor) = self.actor_current(&aid) {
+                    let _ = actor.ctx.stop_with_error("Go WebSocket handler panicked");
+                }
+            }
             Command::SaveState {
                 aid,
                 r#gen: generation,
@@ -351,6 +481,7 @@ impl ActorProxy {
 
     pub(crate) fn sweep_pending(&self) {
         self.pending.retain_live(&self.correlations);
+        self.pending_ws_open.retain_live(&self.correlations);
         let expired = {
             let mut active = self.active_http.lock().expect("active HTTP table poisoned");
             let expired = active
@@ -375,6 +506,8 @@ impl ActorProxy {
 
     pub(crate) fn drain_shutdown(&self) {
         self.pending.clear();
+        self.pending_ws_open.clear();
+        self.close_all_websockets(Some(1001), Some("runner shutting down".to_owned()));
         self.active_http
             .lock()
             .expect("active HTTP table poisoned")
@@ -423,6 +556,7 @@ impl ActorProxy {
                 startup_ready,
             )
             .await;
+        self.close_actor_websockets(&identity, Some(1001), Some("actor stopped".to_owned()));
         self.actors
             .lock()
             .expect("active actor table poisoned")
@@ -553,16 +687,26 @@ impl ActorProxy {
                     }
                 }
                 ActorEvent::QueueSend { reply, .. } => {
-                    reply.send(Err(anyhow!("queue requests are not supported before M4")));
+                    reply.send(Err(anyhow!("queue requests are outside the M4 surface")));
                 }
                 ActorEvent::ConnectionPreflight { reply, .. }
                 | ActorEvent::ConnectionOpen { reply, .. } => reply.send(Ok(())),
-                ActorEvent::WebSocketOpen { reply, .. }
-                | ActorEvent::SubscribeRequest { reply, .. } => {
-                    reply.send(Err(anyhow!("connections are not supported before M4")));
+                ActorEvent::WebSocketOpen {
+                    conn,
+                    ws,
+                    request,
+                    reply,
+                } => match self.request_ws_open(identity, conn, ws, request).await {
+                    Ok(()) => reply.send(Ok(())),
+                    Err(error) => reply.send(Err(actor_wire_error(&error))),
+                },
+                ActorEvent::SubscribeRequest { reply, .. } => {
+                    reply.send(Ok(()));
                 }
                 ActorEvent::DisconnectConn { reply, .. } => reply.send(Ok(())),
-                ActorEvent::ConnectionClosed { .. } => {}
+                ActorEvent::ConnectionClosed { conn } => {
+                    self.websocket_closed(conn.id(), None, None);
+                }
                 ActorEvent::WorkflowHistoryRequested { reply }
                 | ActorEvent::WorkflowReplayRequested { reply, .. } => reply.send(Ok(None)),
             }
@@ -646,6 +790,12 @@ impl ActorProxy {
             | Command::ActionResult { .. }
             | Command::HttpResponseStart { .. }
             | Command::HttpResponseChunk { .. }
+            | Command::WsOpenResult { .. }
+            | Command::WsMessageAck { .. }
+            | Command::WsSend { .. }
+            | Command::WsCloseCmd { .. }
+            | Command::Broadcast { .. }
+            | Command::StopIntent { .. }
             | Command::Unknown => {}
         }
     }
@@ -809,6 +959,341 @@ impl ActorProxy {
             resolution.body,
         )
         .map_err(|error| WireError::new("http_response_invalid", format!("{error:#}")))
+    }
+
+    async fn request_ws_open(
+        &self,
+        identity: &ActorIdentity,
+        conn: ConnHandle,
+        ws: WebSocket,
+        request: Option<rivetkit_core::Request>,
+    ) -> Result<(), WireError> {
+        let ws_id = conn.id().to_owned();
+        let (path, headers) = if let Some(request) = request {
+            let (_, path, headers, _) = request.to_parts();
+            (path, headers.into_iter().collect::<BTreeMap<_, _>>())
+        } else {
+            ("/".to_owned(), BTreeMap::new())
+        };
+        if headers.len() > MAX_HTTP_HEADERS {
+            return Err(WireError::new(
+                "ws_open_headers_too_large",
+                format!("WebSocket open has more than {MAX_HTTP_HEADERS} headers"),
+            ));
+        }
+        if headers
+            .iter()
+            .any(|(name, value)| name.len() > MAX_BODY_CHUNK || value.len() > MAX_BODY_CHUNK)
+        {
+            return Err(WireError::new(
+                "ws_open_header_too_large",
+                format!("WebSocket header exceeds the {MAX_BODY_CHUNK}-byte boundary maximum"),
+            ));
+        }
+
+        let (outbound, receiver) = tokio::sync::mpsc::channel(WS_OUTBOUND_QUEUE_CAPACITY);
+        tokio::spawn(websocket_outbound_loop(ws.clone(), receiver));
+        let active = ActiveWebSocket {
+            actor: identity.clone(),
+            can_hibernate: conn.is_hibernatable(),
+            ws: ws.clone(),
+            outbound,
+            pending_acks: Arc::new(Mutex::new(HashSet::new())),
+        };
+        {
+            let mut websockets = self.websockets.lock().expect("WebSocket table poisoned");
+            if websockets.insert(ws_id.clone(), active).is_some() {
+                return Err(WireError::new(
+                    "ws_duplicate",
+                    format!("WebSocket `{ws_id}` is already active"),
+                ));
+            }
+        }
+
+        let message_proxy = self.clone();
+        let message_ws_id = ws_id.clone();
+        ws.configure_message_event_callback(Some(Arc::new(move |message, msg_index| {
+            message_proxy.websocket_message(&message_ws_id, message, msg_index.unwrap_or(0))
+        })));
+        let close_proxy = self.clone();
+        let close_ws_id = ws_id.clone();
+        ws.configure_close_event_callback(Some(Arc::new(move |code, reason, _was_clean| {
+            close_proxy.websocket_closed(&close_ws_id, Some(code), Some(reason));
+            Box::pin(async { Ok(()) })
+        })));
+
+        let (correlation_id, receiver) = self.correlations.insert(WS_OPEN_RESULT_TIMEOUT);
+        if let Err(error) = self.pending_ws_open.insert(&ws_id, correlation_id) {
+            self.close_ws(
+                &ws_id,
+                Some(1011),
+                Some("actor.ws_open_duplicate".to_owned()),
+            );
+            return Err(WireError::new("ws_open_duplicate", error.to_string()));
+        }
+        if self
+            .events
+            .send(Event::WsOpen {
+                aid: identity.aid.clone(),
+                ws_id: ws_id.clone(),
+                path,
+                headers,
+                can_hibernate: conn.is_hibernatable(),
+            })
+            .is_err()
+        {
+            self.pending_ws_open.remove(&ws_id);
+            self.close_ws(
+                &ws_id,
+                Some(1011),
+                Some("runner event queue closed".to_owned()),
+            );
+            self.correlations.resolve(
+                correlation_id,
+                rmp_serde::to_vec_named(&WsOpenResolution {
+                    error: Some(WireError::new("runner_stopped", "Go event queue is closed")),
+                })
+                .expect("encode WebSocket open queue error"),
+            );
+        }
+
+        let payload = receiver
+            .await
+            .map_err(|_| WireError::new("runner_stopped", "WebSocket open result sender dropped"))?
+            .map_err(|error| match error {
+                CorrelationError::Timeout => WireError::new(
+                    "ws_open_timed_out",
+                    "Go OnConnect did not complete before the boundary deadline",
+                ),
+                CorrelationError::Shutdown => {
+                    WireError::new("runner_stopped", "runner stopped during WebSocket open")
+                }
+            })?;
+        self.pending_ws_open.remove(&ws_id);
+        let resolution: WsOpenResolution = rmp_serde::from_slice(&payload)
+            .map_err(|error| WireError::new("ws_open_result_invalid", error.to_string()))?;
+        if let Some(error) = resolution.error {
+            self.close_ws(&ws_id, Some(1008), Some(format!("actor.{}", error.code)));
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn websocket_message(&self, ws_id: &str, message: WsMessage, msg_index: u16) -> Result<()> {
+        let (data, binary) = match message {
+            WsMessage::Text(text) => (text.into_bytes(), false),
+            WsMessage::Binary(data) => (data, true),
+        };
+        if data.len() > MAX_BODY_CHUNK {
+            self.close_ws(
+                ws_id,
+                Some(1009),
+                Some("message.incoming_too_long".to_owned()),
+            );
+            return Ok(());
+        }
+        let pending = {
+            let websockets = self.websockets.lock().expect("WebSocket table poisoned");
+            let Some(active) = websockets.get(ws_id) else {
+                return Ok(());
+            };
+            active.pending_acks.clone()
+        };
+        pending
+            .lock()
+            .expect("WebSocket acknowledgement table poisoned")
+            .insert(msg_index);
+        self.events
+            .send(Event::WsMessage {
+                ws_id: ws_id.to_owned(),
+                data,
+                binary,
+                msg_index,
+            })
+            .map_err(|_| anyhow!("Go event queue is closed"))
+    }
+
+    fn websocket_closed(&self, ws_id: &str, code: Option<u16>, reason: Option<String>) {
+        let removed = self
+            .websockets
+            .lock()
+            .expect("WebSocket table poisoned")
+            .remove(ws_id);
+        if removed.is_none() {
+            return;
+        }
+        if let Some(correlation_id) = self.pending_ws_open.remove(ws_id) {
+            self.correlations.resolve(
+                correlation_id,
+                rmp_serde::to_vec_named(&WsOpenResolution {
+                    error: Some(WireError::new(
+                        "ws_closed_during_open",
+                        "WebSocket closed before OnConnect completed",
+                    )),
+                })
+                .expect("encode WebSocket close during open"),
+            );
+        }
+        let _ = self.events.send(Event::WsClose {
+            ws_id: ws_id.to_owned(),
+            code,
+            reason,
+        });
+    }
+
+    fn ack_ws_message(&self, ws_id: &str, msg_index: u16) {
+        let active = self
+            .websockets
+            .lock()
+            .expect("WebSocket table poisoned")
+            .get(ws_id)
+            .cloned();
+        let Some(active) = active else {
+            return;
+        };
+        active
+            .pending_acks
+            .lock()
+            .expect("WebSocket acknowledgement table poisoned")
+            .remove(&msg_index);
+        // M4 configures every raw WebSocket as non-hibernating. The index is
+        // still tracked and acknowledged across the FFI so M5 can attach the
+        // persisted gateway/request metadata without changing this surface.
+        let _ = active.can_hibernate;
+    }
+
+    fn send_ws(&self, ws_id: &str, data: Vec<u8>, binary: bool) {
+        let message = if binary {
+            WsMessage::Binary(data)
+        } else {
+            match String::from_utf8(data) {
+                Ok(text) => WsMessage::Text(text),
+                Err(_) => return,
+            }
+        };
+        self.enqueue_ws(ws_id, WsOutbound::Send(message));
+    }
+
+    fn enqueue_ws(&self, ws_id: &str, outbound: WsOutbound) {
+        let sender = self
+            .websockets
+            .lock()
+            .expect("WebSocket table poisoned")
+            .get(ws_id)
+            .map(|active| active.outbound.clone());
+        let Some(sender) = sender else {
+            return;
+        };
+        match sender.try_send(outbound) {
+            Ok(()) => {}
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => self.close_ws(
+                ws_id,
+                Some(WS_BACKPRESSURE_CLOSE_CODE),
+                Some("outbound_backpressure".to_owned()),
+            ),
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                self.websocket_closed(ws_id, Some(1011), Some("outbound_sender_closed".to_owned()));
+            }
+        }
+    }
+
+    fn close_ws(&self, ws_id: &str, code: Option<u16>, reason: Option<String>) {
+        let active = self
+            .websockets
+            .lock()
+            .expect("WebSocket table poisoned")
+            .remove(ws_id);
+        let Some(active) = active else {
+            return;
+        };
+        if let Some(correlation_id) = self.pending_ws_open.remove(ws_id) {
+            self.correlations.resolve(
+                correlation_id,
+                rmp_serde::to_vec_named(&WsOpenResolution {
+                    error: Some(WireError::new(
+                        "ws_closed_during_open",
+                        "WebSocket closed before OnConnect completed",
+                    )),
+                })
+                .expect("encode WebSocket close during open"),
+            );
+        }
+        let close = WsOutbound::Close {
+            code,
+            reason: reason.clone(),
+        };
+        if active.outbound.try_send(close).is_err() {
+            let ws = active.ws.clone();
+            let direct_reason = reason.clone();
+            tokio::spawn(async move { ws.close(code, direct_reason).await });
+        }
+        let _ = self.events.send(Event::WsClose {
+            ws_id: ws_id.to_owned(),
+            code,
+            reason,
+        });
+    }
+
+    fn broadcast(&self, aid: &str, event: &str, payload: Vec<u8>, exclude_conn: Option<&str>) {
+        if let Some(actor) = self.actor_current(aid) {
+            actor.ctx.broadcast(event, &payload);
+        }
+
+        let args: ciborium::Value = match ciborium::from_reader(payload.as_slice()) {
+            Ok(args) => args,
+            Err(_) => return,
+        };
+        let mut frame = Vec::new();
+        if ciborium::into_writer(&RawBroadcastEnvelope { event, args }, &mut frame).is_err()
+            || frame.len() > MAX_BODY_CHUNK
+        {
+            return;
+        }
+        let ids = self
+            .websockets
+            .lock()
+            .expect("WebSocket table poisoned")
+            .iter()
+            .filter(|(ws_id, active)| {
+                active.actor.aid == aid && exclude_conn != Some(ws_id.as_str())
+            })
+            .map(|(ws_id, _)| ws_id.clone())
+            .collect::<Vec<_>>();
+        for ws_id in ids {
+            self.enqueue_ws(&ws_id, WsOutbound::Send(WsMessage::Binary(frame.clone())));
+        }
+    }
+
+    fn close_actor_websockets(
+        &self,
+        identity: &ActorIdentity,
+        code: Option<u16>,
+        reason: Option<String>,
+    ) {
+        let ids = self
+            .websockets
+            .lock()
+            .expect("WebSocket table poisoned")
+            .iter()
+            .filter(|(_, active)| active.actor == *identity)
+            .map(|(ws_id, _)| ws_id.clone())
+            .collect::<Vec<_>>();
+        for ws_id in ids {
+            self.close_ws(&ws_id, code, reason.clone());
+        }
+    }
+
+    fn close_all_websockets(&self, code: Option<u16>, reason: Option<String>) {
+        let ids = self
+            .websockets
+            .lock()
+            .expect("WebSocket table poisoned")
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        for ws_id in ids {
+            self.close_ws(&ws_id, code, reason.clone());
+        }
     }
 
     fn start_http_response(
@@ -1169,6 +1654,21 @@ fn actor_wire_error(error: &WireError) -> anyhow::Error {
     })
 }
 
+async fn websocket_outbound_loop(
+    ws: WebSocket,
+    mut receiver: tokio::sync::mpsc::Receiver<WsOutbound>,
+) {
+    while let Some(outbound) = receiver.recv().await {
+        match outbound {
+            WsOutbound::Send(message) => ws.send(message),
+            WsOutbound::Close { code, reason } => {
+                ws.close(code, reason).await;
+                return;
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::Instant;
@@ -1343,6 +1843,86 @@ mod tests {
                 .http_responses
                 .lock()
                 .expect("HTTP response table")
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn full_connection_queue_closes_only_that_websocket() {
+        let (events, event_rx) = bounded(8);
+        let proxy = ActorProxy::new(events, CorrelationTable::default());
+        let identity = ActorIdentity::new("actor", 1);
+        let (slow_tx, slow_rx) = tokio::sync::mpsc::channel(1);
+        slow_tx
+            .try_send(WsOutbound::Send(WsMessage::Text("blocked".to_owned())))
+            .expect("fill slow WebSocket queue");
+        let (fast_tx, mut fast_rx) = tokio::sync::mpsc::channel(1);
+        let websocket = |outbound| ActiveWebSocket {
+            actor: identity.clone(),
+            can_hibernate: false,
+            ws: WebSocket::new(),
+            outbound,
+            pending_acks: Arc::new(Mutex::new(HashSet::new())),
+        };
+        proxy.websockets.lock().expect("WebSocket table").extend([
+            ("slow".to_owned(), websocket(slow_tx)),
+            ("fast".to_owned(), websocket(fast_tx)),
+        ]);
+
+        proxy.broadcast("actor", "updated", vec![0x81, 0x01], None);
+
+        assert!(
+            !proxy
+                .websockets
+                .lock()
+                .expect("WebSocket table")
+                .contains_key("slow")
+        );
+        assert!(
+            proxy
+                .websockets
+                .lock()
+                .expect("WebSocket table")
+                .contains_key("fast")
+        );
+        assert!(matches!(fast_rx.recv().await, Some(WsOutbound::Send(_))));
+        assert_eq!(
+            event_rx.recv_timeout(Duration::from_secs(1)),
+            Ok(Event::WsClose {
+                ws_id: "slow".to_owned(),
+                code: Some(WS_BACKPRESSURE_CLOSE_CODE),
+                reason: Some("outbound_backpressure".to_owned()),
+            })
+        );
+        drop(slow_rx);
+    }
+
+    #[test]
+    fn non_hibernating_message_ack_clears_bookkeeping() {
+        let (events, _event_rx) = bounded(4);
+        let proxy = ActorProxy::new(events, CorrelationTable::default());
+        let (outbound, _receiver) = tokio::sync::mpsc::channel(1);
+        let pending_acks = Arc::new(Mutex::new(HashSet::from([7])));
+        proxy.websockets.lock().expect("WebSocket table").insert(
+            "ws".to_owned(),
+            ActiveWebSocket {
+                actor: ActorIdentity::new("actor", 1),
+                can_hibernate: false,
+                ws: WebSocket::new(),
+                outbound,
+                pending_acks: pending_acks.clone(),
+            },
+        );
+
+        proxy.handle_command(Command::WsMessageAck {
+            ws_id: "ws".to_owned(),
+            msg_index: 7,
+        });
+
+        assert!(
+            pending_acks
+                .lock()
+                .expect("WebSocket acknowledgement table")
                 .is_empty()
         );
     }
