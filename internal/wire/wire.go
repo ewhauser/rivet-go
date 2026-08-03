@@ -70,6 +70,9 @@ func EncodeCommandBatch(batch CommandBatch) ([]byte, error) {
 }
 
 func DecodeEventBatch(data []byte) (EventBatch, error) {
+	if err := validateShape(data); err != nil {
+		return EventBatch{}, fmt.Errorf("decode EventBatch: %w", err)
+	}
 	var batch EventBatch
 	if err := msgpack.Unmarshal(data, &batch); err != nil {
 		return EventBatch{}, fmt.Errorf("decode EventBatch: %w", err)

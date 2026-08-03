@@ -1,0 +1,2 @@
+go test fuzz v1
+[]byte("\x82\xa3seq\x02\xa6events\xddted\xa6nnect{\xd6ц\xed\x85c")
