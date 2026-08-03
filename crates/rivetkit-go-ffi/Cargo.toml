@@ -21,6 +21,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "time"] }
 tokio-util = "0.7"
+tracing-subscriber = { version = "0.3", features = ["fmt"] }
 url = "2"
 
 # v2.3.10 is the newest stable, non-RC engine release in rivet-dev/rivet as of

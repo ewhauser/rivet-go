@@ -238,3 +238,25 @@ approach there.
 - Protocol schemas: `engine/sdks/schemas/runner-protocol/*.bare` (v7 current)
 - Pattern source: `github.com/ewhauser/gomonty` (purego loader, wire layer,
   release workflows, upstream-refresh skill)
+
+## Implementation notes
+
+### M1 — 2026-08-02
+
+The pinned `rivetkit-core` at `v2.3.10` has completed an internal runner-to-envoy
+rename that the original plan did not reflect. `CoreRegistry` now connects
+through `/envoys/connect` using `rivet-envoy-protocol` v6 and publishes initial
+metadata as `ToRivetMetadata`; it does not use the legacy runner-protocol
+`ToServerInit` path. Accordingly, the engine's active registration is asserted
+through the management API's `GET /envoys`, while the public Go and FFI names
+remain `Runner` to keep this upstream rename out of the SDK contract. The
+legacy `GET /runners` endpoint cannot observe a `CoreRegistry` registration at
+this pin.
+
+`CoreRegistry::serve_with_config_and_handle_observer` is the supported embedded
+registration seam and accepts the runner version and pool/name, but its
+`ServeConfig` and the underlying `EnvoyConfig` have no `total_slots` field.
+M1 therefore retains and validates `RunnerConfig.total_slots` at the stable FFI
+boundary but cannot transmit it at `v2.3.10`. Actor capacity remains zero
+because the actor manifest is empty. This field stays in place for the M2
+actor-capable adapter rather than changing the boundary or bumping the pin.

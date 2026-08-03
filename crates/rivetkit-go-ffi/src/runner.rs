@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Mutex, mpsc as std_mpsc};
+use std::sync::{Mutex, Once, mpsc as std_mpsc};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -26,6 +26,8 @@ const HEALTH_CHECK_INTERVAL: Duration = Duration::from_millis(250);
 const CORRELATION_SWEEP_INTERVAL: Duration = Duration::from_millis(100);
 const MAX_POLL_BATCH: usize = 64;
 
+static TRACING_INIT: Once = Once::new();
+
 enum StartupResult {
     Ready,
     Failed(ErrorPayload),
@@ -45,6 +47,7 @@ pub(crate) struct RunnerInner {
 impl RunnerInner {
     pub(crate) fn start(config: RunnerConfig) -> Result<Box<Self>, ErrorPayload> {
         validate_config(&config)?;
+        init_tracing(&config.log_level);
 
         let (event_tx, event_rx) = bounded(EVENT_QUEUE_CAPACITY);
         let (command_tx, command_rx) = mpsc::channel(COMMAND_QUEUE_CAPACITY);
@@ -181,6 +184,24 @@ impl RunnerInner {
             let _ = thread.join();
         }
     }
+}
+
+fn init_tracing(log_level: &str) {
+    let level = match log_level {
+        "trace" => tracing_subscriber::filter::LevelFilter::TRACE,
+        "debug" => tracing_subscriber::filter::LevelFilter::DEBUG,
+        "info" => tracing_subscriber::filter::LevelFilter::INFO,
+        "warn" => tracing_subscriber::filter::LevelFilter::WARN,
+        "error" => tracing_subscriber::filter::LevelFilter::ERROR,
+        _ => return,
+    };
+    TRACING_INIT.call_once(|| {
+        let _ = tracing_subscriber::fmt()
+            .with_max_level(level)
+            .with_target(false)
+            .with_ansi(false)
+            .try_init();
+    });
 }
 
 #[derive(Debug)]
@@ -626,5 +647,68 @@ mod tests {
         assert_eq!(error.code, "poll_in_progress");
         drop(first);
         assert!(PollPermit::acquire(&flag).is_ok());
+    }
+
+    #[test]
+    fn submit_accepts_empty_rejects_unknown_and_reports_backpressure() {
+        let (event_tx, event_rx) = bounded(1);
+        drop(event_tx);
+        let (command_tx, _command_rx) = mpsc::channel(1);
+        let (shutdown_tx, _shutdown_rx) = watch::channel(None);
+        let runner = RunnerInner {
+            events: event_rx,
+            commands: command_tx,
+            shutdown: shutdown_tx,
+            thread: Mutex::new(None),
+            polling: AtomicBool::new(false),
+            shutdown_started: AtomicBool::new(false),
+            next_seq: AtomicU64::new(1),
+            correlations: CorrelationTable::default(),
+        };
+        let empty = rmp_serde::to_vec_named(&CommandBatch {
+            commands: Vec::new(),
+        })
+        .expect("encode empty batch");
+        assert!(runner.submit(&empty).is_ok());
+        assert_eq!(
+            runner
+                .submit(&empty)
+                .expect_err("full queue must fail")
+                .code,
+            "backpressure"
+        );
+
+        let unknown = rmp_serde::to_vec_named(&serde_json::json!({
+            "commands": [{"kind": "future_command"}]
+        }))
+        .expect("encode unknown command");
+        assert_eq!(
+            runner
+                .submit(&unknown)
+                .expect_err("unknown command must fail")
+                .code,
+            "unknown_command"
+        );
+    }
+
+    #[test]
+    fn unreachable_endpoint_fails_within_startup_bound() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("reserve endpoint");
+        let address = listener.local_addr().expect("endpoint address");
+        drop(listener);
+        let mut config = valid_config();
+        config.engine_endpoint = format!("http://{address}");
+        let started = Instant::now();
+        let error = match RunnerInner::start(config) {
+            Ok(_) => panic!("unreachable endpoint must fail"),
+            Err(error) => error,
+        };
+        assert_eq!(error.code, "connection_failed");
+        assert!(
+            started.elapsed() <= STARTUP_RESULT_TIMEOUT,
+            "startup exceeded {:?}: {:?}",
+            STARTUP_RESULT_TIMEOUT,
+            started.elapsed()
+        );
     }
 }

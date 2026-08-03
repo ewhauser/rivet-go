@@ -75,7 +75,7 @@ jobs:
 
       - name: Test committed native library
         if: matrix.libc != 'musl'
-        run: go test -count=1 -v ./...
+        run: go test -short -count=1 -v ./...
 
       - name: Test committed musl library
         if: matrix.libc == 'musl'
@@ -83,7 +83,7 @@ jobs:
         run: |
           set -euo pipefail
           docker run --rm --volume "$PWD:/src" --workdir /src golang:1.26-alpine \
-            go test -count=1 -v ./...
+            go test -short -count=1 -v ./...
 
       - name: Build native FFI library
         shell: bash
@@ -95,7 +95,7 @@ jobs:
 
       - name: Test rebuilt native library
         if: matrix.libc != 'musl'
-        run: go test -count=1 -v ./...
+        run: go test -short -count=1 -v ./...
 
       - name: Test rebuilt musl library
         if: matrix.libc == 'musl'
@@ -103,4 +103,29 @@ jobs:
         run: |
           set -euo pipefail
           docker run --rm --volume "$PWD:/src" --workdir /src golang:1.26-alpine \
-            go test -count=1 -v ./...
+            go test -short -count=1 -v ./...
+
+  conformance:
+    name: linux-amd64-conformance
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install 1.97.0 --profile minimal
+          rustup default 1.97.0
+
+      - name: Cache pinned engine
+        uses: actions/cache@v5
+        with:
+          path: ~/.cache/rivet-go/engine-v2.3.10
+          key: rivet-engine-v2.3.10-${{ runner.os }}-${{ runner.arch }}-957d4e482f404913ca1955d8ecc357533f6fd081
+
+      - name: Run real-engine conformance
+        run: go test -count=1 -v ./conformance

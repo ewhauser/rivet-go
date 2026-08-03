@@ -80,89 +80,89 @@ impl CommandBatch {
 
 #[cfg(test)]
 mod tests {
-	use std::fs;
-	use std::path::PathBuf;
+    use std::fs;
+    use std::path::PathBuf;
 
-	use super::*;
+    use super::*;
 
-	fn golden_dir() -> PathBuf {
-		PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-			.join("../..")
-			.join("internal/wire/testdata")
-	}
+    fn golden_dir() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join("internal/wire/testdata")
+    }
 
-	fn write_golden(name: &str, bytes: &[u8]) {
-		let directory = golden_dir();
-		fs::create_dir_all(&directory).expect("create Go wire testdata directory");
-		fs::write(directory.join(name), bytes).expect("write Rust-produced golden")
-	}
+    fn write_golden(name: &str, bytes: &[u8]) {
+        let directory = golden_dir();
+        fs::create_dir_all(&directory).expect("create Go wire testdata directory");
+        fs::write(directory.join(name), bytes).expect("write Rust-produced golden")
+    }
 
-	#[test]
-	fn generate_go_wire_goldens() {
-		let config = RunnerConfig {
-			engine_endpoint: "http://127.0.0.1:6420".to_owned(),
-			namespace: "default".to_owned(),
-			runner_name: "rivet-go-golden".to_owned(),
-			version: 1,
-			total_slots: 4,
-			actor_names: Vec::new(),
-			log_level: "info".to_owned(),
-		};
-		write_golden(
-			"runner_config.msgpack",
-			&rmp_serde::to_vec_named(&config).expect("encode runner config"),
-		);
+    #[test]
+    fn generate_go_wire_goldens() {
+        let config = RunnerConfig {
+            engine_endpoint: "http://127.0.0.1:6420".to_owned(),
+            namespace: "default".to_owned(),
+            runner_name: "rivet-go-golden".to_owned(),
+            version: 1,
+            total_slots: 4,
+            actor_names: Vec::new(),
+            log_level: "info".to_owned(),
+        };
+        write_golden(
+            "runner_config.msgpack",
+            &rmp_serde::to_vec_named(&config).expect("encode runner config"),
+        );
 
-		let connected = EventBatch {
-			seq: 1,
-			events: vec![Event::RunnerConnected {
-				runner_id: "envoy-golden".to_owned(),
-				metadata: BTreeMap::from([
-					("management_resource".to_owned(), "/envoys".to_owned()),
-					("protocol".to_owned(), "envoy-v6".to_owned()),
-				]),
-			}],
-		};
-		write_golden(
-			"event_connected.msgpack",
-			&connected.encode().expect("encode connected event"),
-		);
+        let connected = EventBatch {
+            seq: 1,
+            events: vec![Event::RunnerConnected {
+                runner_id: "envoy-golden".to_owned(),
+                metadata: BTreeMap::from([
+                    ("management_resource".to_owned(), "/envoys".to_owned()),
+                    ("protocol".to_owned(), "envoy-v6".to_owned()),
+                ]),
+            }],
+        };
+        write_golden(
+            "event_connected.msgpack",
+            &connected.encode().expect("encode connected event"),
+        );
 
-		let disconnected = EventBatch {
-			seq: 2,
-			events: vec![Event::RunnerDisconnected {
-				reason: "engine connection lost".to_owned(),
-			}],
-		};
-		write_golden(
-			"event_disconnected.msgpack",
-			&disconnected.encode().expect("encode disconnected event"),
-		);
+        let disconnected = EventBatch {
+            seq: 2,
+            events: vec![Event::RunnerDisconnected {
+                reason: "engine connection lost".to_owned(),
+            }],
+        };
+        write_golden(
+            "event_disconnected.msgpack",
+            &disconnected.encode().expect("encode disconnected event"),
+        );
 
-		let stopped = EventBatch {
-			seq: 3,
-			events: vec![Event::RunnerStopped {
-				drain_report: DrainReport {
-					graceful: true,
-					elapsed_ms: 12,
-					actors_stopped: 0,
-					actors_remaining: 0,
-				},
-			}],
-		};
-		write_golden(
-			"event_stopped.msgpack",
-			&stopped.encode().expect("encode stopped event"),
-		);
+        let stopped = EventBatch {
+            seq: 3,
+            events: vec![Event::RunnerStopped {
+                drain_report: DrainReport {
+                    graceful: true,
+                    elapsed_ms: 12,
+                    actors_stopped: 0,
+                    actors_remaining: 0,
+                },
+            }],
+        };
+        write_golden(
+            "event_stopped.msgpack",
+            &stopped.encode().expect("encode stopped event"),
+        );
 
-		write_golden(
-			"command_empty.msgpack",
-			&rmp_serde::to_vec_named(&CommandBatch {
-				commands: Vec::new(),
-			})
-			.expect("encode empty command batch"),
-		);
-	}
+        write_golden(
+            "command_empty.msgpack",
+            &rmp_serde::to_vec_named(&CommandBatch {
+                commands: Vec::new(),
+            })
+            .expect("encode empty command batch"),
+        );
+    }
 
     #[test]
     fn event_batch_round_trip() {

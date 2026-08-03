@@ -168,3 +168,30 @@ most bug-prone structure in the crate; it gets dedicated loom/proptest coverage.
 4. Whether `rk_runner_poll` should also carry a wakeup fd/eventfd alternative
    for integration with Go netpoller — only if the pinned thread ever shows up
    as a real cost.
+
+## M1 pin-specific notes — 2026-08-02
+
+Rivet `v2.3.10` names the `rivetkit-core` registration transport “envoy.” The
+FFI contract deliberately keeps its language-neutral `Runner*` vocabulary, but
+the concrete mappings at this pin are:
+
+- core transport: `/envoys/connect`, `rivet-envoy-protocol` v6, and
+  `ToRivetMetadata`/`ToEnvoyInit`;
+- management assertion: active `GET /envoys` entry rather than the legacy
+  `GET /runners` resource;
+- `RunnerConnected.runner_id`: the engine-visible `envoy_key` from that
+  management entry;
+- `RunnerConnected.metadata`: string metadata that records the management
+  resource, concrete protocol, runner name, configured log level, and the
+  engine metadata JSON when present.
+
+The supported `CoreRegistry` embedding API exposes version and pool/name but
+does not expose `total_slots`. `RunnerConfig.total_slots` is still required and
+validated so the boundary does not churn before M2, but it is not transmitted
+by the v2.3.10 core adapter. With an empty actor manifest the M1 registration
+advertises no actors.
+
+The M1 `RunnerStopped` drain report is
+`{ graceful, elapsed_ms, actors_stopped, actors_remaining }`. The M1 command
+catalog is empty: an empty `CommandBatch` is accepted, while every non-empty
+batch is rejected as `unknown_command` before enqueue.
