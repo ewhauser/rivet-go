@@ -302,3 +302,37 @@ misassociation without permanently disabling later saves.
 The remaining pin-specific lifecycle mappings are documented in
 [FFI-BOUNDARY.md](FFI-BOUNDARY.md). Actions, HTTP, WebSockets, alarms, and sleep
 remain outside M2.
+
+## M3 pin-specific deviation notes — 2026-08-03
+
+M3 adds the explicit action manifest, typed and raw action adapters, and the
+`OnFetch` HTTP bridge. Successful actions persist the complete typed actor
+state before their result is released to the engine. Handler errors use
+client-visible structured actor errors. A panic returns `handler_panic`, stops
+only that actor generation through core's run-handler failure path, and leaves
+the shared pump and peer actors running.
+
+The v2.3.10 gateway accepts JSON action requests but normalizes the arguments
+to a CBOR array before `ActorEvent::Action` reaches an embedder. The typed Go
+adapter therefore decodes and encodes CBOR while honoring `json` struct tags;
+`RawAction` receives the exact CBOR argument array and returns one CBOR value.
+HTTP action dispatch also produces ephemeral connection preflight and open
+hooks. The FFI acknowledges those hooks so the action can run, but does not
+expose the M4 connection or WebSocket APIs.
+
+At this pin, `ActorEvent::HttpRequest` contains a buffered request and its
+reply type is `Response<Vec<u8>>`. The M3 boundary still divides request and
+response bodies into chunks no larger than 1 MiB, and Go submits response
+chunks from the handler goroutine with bounded-queue retry. Rust must assemble
+the response chunks once before satisfying core's buffered reply. Core does
+not expose a client-disconnect notification at this embedder seam, so
+`HttpRequestAbort` is emitted for boundary deadline expiry; runner and actor
+shutdown cancel the request context directly. These constraints are pinned-core
+deviations, not public streaming or abort guarantees for later engine versions.
+
+The real-engine conformance test uses `net/http` against
+`/gateway/{actor_id}/action/{action}` and `/gateway/{actor_id}/request/...`.
+It asserts action results and persisted state, cross-actor isolation, a raw
+HTTP response spanning multiple boundary chunks, structured missing-action
+errors, and actor-local action/fetch panic handling exclusively from public
+HTTP and engine-observed results.

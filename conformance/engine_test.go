@@ -79,6 +79,12 @@ type actorRecord struct {
 	Error         json.RawMessage `json:"error"`
 }
 
+type gatewayResponse struct {
+	response *http.Response
+	body     []byte
+	err      error
+}
+
 type persistentCounterState struct {
 	Count int
 }
@@ -636,6 +642,185 @@ func TestTwoActorsOnOneRunnerHaveIsolatedState(t *testing.T) {
 	deleteActor(t, engine.endpoint, secondActor.ActorID)
 }
 
+func TestActionsAndHTTPTunnelRoundTrip(t *testing.T) {
+	if testing.Short() {
+		t.Skip("real-engine conformance is disabled by -short")
+	}
+	engineBinary, err := acquireEngine(context.Background())
+	if err != nil {
+		t.Fatalf("obtain Rivet engine %s: %v\n%s", engineTag, err, engineRemediation())
+	}
+	engine := startEngine(t, engineBinary)
+
+	type counterState struct {
+		Count int `json:"count"`
+	}
+	type slowArgument struct {
+		Amount  int `json:"amount"`
+		DelayMS int `json:"delay_ms"`
+	}
+	slowStarted := make(chan string, 1)
+	streamBody := bytes.Repeat([]byte("rivet-go-stream\n"), 150_000)
+	registry := rivet.NewRegistry()
+	if err := rivet.Register(registry, "m3-counter", rivet.Actor[counterState]{
+		Actions: rivet.Actions[counterState]{
+			"increment": rivet.Action(func(ctx *rivet.Context[counterState], amount int) (int, error) {
+				ctx.State().Count += amount
+				return ctx.State().Count, nil
+			}),
+			"get": rivet.Action(func(ctx *rivet.Context[counterState], _ struct{}) (int, error) {
+				return ctx.State().Count, nil
+			}),
+			"slow_increment": rivet.Action(func(ctx *rivet.Context[counterState], input slowArgument) (int, error) {
+				slowStarted <- ctx.ActorID()
+				time.Sleep(time.Duration(input.DelayMS) * time.Millisecond)
+				ctx.State().Count += input.Amount
+				return ctx.State().Count, nil
+			}),
+			"panic": rivet.Action(func(*rivet.Context[counterState], struct{}) (int, error) {
+				panic("intentional M3 action panic")
+			}),
+			"reject": rivet.Action(func(*rivet.Context[counterState], struct{}) (int, error) {
+				return 0, rivet.ActionError{Code: "counter_rejected", Message: "counter rejected the action"}
+			}),
+		},
+		OnFetch: func(_ *rivet.Context[counterState], writer http.ResponseWriter, request *http.Request) {
+			if request.URL.Path == "/panic" {
+				panic("intentional M3 fetch panic")
+			}
+			writer.Header().Set("Content-Type", "text/plain")
+			writer.Header().Set("X-Rivet-Go-M3", "streamed")
+			writer.WriteHeader(http.StatusCreated)
+			first := len(streamBody)/2 + 137
+			if _, err := writer.Write(streamBody[:first]); err != nil {
+				panic(fmt.Sprintf("write first response segment: %v", err))
+			}
+			if _, err := writer.Write(streamBody[first:]); err != nil {
+				panic(fmt.Sprintf("write second response segment: %v", err))
+			}
+		},
+	}); err != nil {
+		t.Fatalf("register M3 counter: %v", err)
+	}
+	runnerName := fmt.Sprintf("rivet-go-m3-%d", time.Now().UnixNano())
+	startRegistry(t, engine, runnerName, registry)
+	primary := createActor(t, engine.endpoint, "m3-counter", runnerName, "destroy", nil, nil)
+	fast := createActor(t, engine.endpoint, "m3-counter", runnerName, "destroy", nil, nil)
+	slow := createActor(t, engine.endpoint, "m3-counter", runnerName, "destroy", nil, nil)
+	for _, actor := range []actorRecord{primary, fast, slow} {
+		waitForActor(t, engine.endpoint, actor.ActorID, false, func(actor actorRecord) bool {
+			return actor.ConnectableTS != nil && actor.DestroyTS == nil
+		})
+	}
+
+	increment := gatewayAction(t, engine.endpoint, primary.ActorID, "increment", []any{3}, 10*time.Second)
+	assertActionOutput(t, increment, http.StatusOK, 3)
+	observed := gatewayAction(t, engine.endpoint, primary.ActorID, "get", []any{struct{}{}}, 10*time.Second)
+	assertActionOutput(t, observed, http.StatusOK, 3)
+
+	slowResult := make(chan gatewayResponse, 1)
+	go func() {
+		response, body, requestErr := gatewayRequest(
+			engine.endpoint,
+			slow.ActorID,
+			"/action/slow_increment",
+			map[string]any{"args": []any{slowArgument{Amount: 4, DelayMS: 1_200}}},
+			5*time.Second,
+		)
+		slowResult <- gatewayResponse{response: response, body: body, err: requestErr}
+	}()
+	select {
+	case actorID := <-slowStarted:
+		if actorID != slow.ActorID {
+			t.Fatalf("slow action actor ID = %s, want %s", actorID, slow.ActorID)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("slow action did not reach the Go handler")
+	}
+	fastStarted := time.Now()
+	fastResponse := gatewayAction(t, engine.endpoint, fast.ActorID, "increment", []any{9}, 5*time.Second)
+	assertActionOutput(t, fastResponse, http.StatusOK, 9)
+	if elapsed := time.Since(fastStarted); elapsed > 750*time.Millisecond {
+		t.Fatalf("fast actor action took %s while peer was slow", elapsed)
+	}
+	select {
+	case result := <-slowResult:
+		t.Fatalf("slow action completed before isolation assertion: status=%v err=%v body=%s", responseStatus(result.response), result.err, result.body)
+	default:
+	}
+	result := <-slowResult
+	if result.err != nil {
+		t.Fatalf("slow action request: %v", result.err)
+	}
+	assertActionOutput(t, result, http.StatusOK, 4)
+
+	rawResponse, rawBody, err := gatewayRequest(
+		engine.endpoint,
+		primary.ActorID,
+		"/request/stream",
+		nil,
+		10*time.Second,
+	)
+	if err != nil {
+		t.Fatalf("raw HTTP gateway request: %v", err)
+	}
+	if rawResponse.StatusCode != http.StatusCreated {
+		t.Fatalf("raw HTTP status = %s, want 201", rawResponse.Status)
+	}
+	if rawResponse.Header.Get("X-Rivet-Go-M3") != "streamed" {
+		t.Fatalf("raw HTTP response header = %q", rawResponse.Header.Get("X-Rivet-Go-M3"))
+	}
+	if !bytes.Equal(rawBody, streamBody) || len(rawBody) <= 2*(1<<20) {
+		t.Fatalf("raw HTTP response length = %d, want %d bytes across multiple chunks", len(rawBody), len(streamBody))
+	}
+
+	missing := gatewayAction(t, engine.endpoint, primary.ActorID, "missing", []any{}, 10*time.Second)
+	assertGatewayError(t, missing, http.StatusNotFound, "actor", "action_not_found")
+	rejected := gatewayAction(t, engine.endpoint, primary.ActorID, "reject", []any{struct{}{}}, 10*time.Second)
+	assertGatewayError(t, rejected, http.StatusInternalServerError, "actor", "counter_rejected")
+
+	panicActionActor := createActor(t, engine.endpoint, "m3-counter", runnerName, "destroy", nil, nil)
+	waitForActor(t, engine.endpoint, panicActionActor.ActorID, false, func(actor actorRecord) bool {
+		return actor.ConnectableTS != nil
+	})
+	panickedAction := gatewayAction(t, engine.endpoint, panicActionActor.ActorID, "panic", []any{struct{}{}}, 10*time.Second)
+	assertGatewayError(t, panickedAction, http.StatusInternalServerError, "actor", "handler_panic")
+	waitForActor(t, engine.endpoint, panicActionActor.ActorID, true, func(actor actorRecord) bool {
+		return actor.ConnectableTS == nil || actor.DestroyTS != nil || (len(actor.Error) != 0 && string(actor.Error) != "null")
+	})
+	assertActionOutput(
+		t,
+		gatewayAction(t, engine.endpoint, fast.ActorID, "get", []any{struct{}{}}, 10*time.Second),
+		http.StatusOK,
+		9,
+	)
+
+	panicFetchActor := createActor(t, engine.endpoint, "m3-counter", runnerName, "destroy", nil, nil)
+	waitForActor(t, engine.endpoint, panicFetchActor.ActorID, false, func(actor actorRecord) bool {
+		return actor.ConnectableTS != nil
+	})
+	panicFetchResponse, panicFetchBody, err := gatewayRequest(
+		engine.endpoint,
+		panicFetchActor.ActorID,
+		"/request/panic",
+		nil,
+		10*time.Second,
+	)
+	if err != nil {
+		t.Fatalf("panicking fetch request: %v", err)
+	}
+	assertGatewayError(t, gatewayResponse{response: panicFetchResponse, body: panicFetchBody}, http.StatusInternalServerError, "actor", "handler_panic")
+	waitForActor(t, engine.endpoint, panicFetchActor.ActorID, true, func(actor actorRecord) bool {
+		return actor.ConnectableTS == nil || actor.DestroyTS != nil || (len(actor.Error) != 0 && string(actor.Error) != "null")
+	})
+	assertActionOutput(
+		t,
+		gatewayAction(t, engine.endpoint, fast.ActorID, "get", []any{struct{}{}}, 10*time.Second),
+		http.StatusOK,
+		9,
+	)
+}
+
 func TestActorDestroyRunsGoCleanupHook(t *testing.T) {
 	if testing.Short() {
 		t.Skip("real-engine conformance is disabled by -short")
@@ -1033,6 +1218,114 @@ func (s *servedRegistry) stop(t *testing.T) {
 	}
 }
 
+func gatewayAction(
+	t *testing.T,
+	endpoint, actorID, action string,
+	args []any,
+	timeout time.Duration,
+) gatewayResponse {
+	t.Helper()
+	response, body, err := gatewayRequest(
+		endpoint,
+		actorID,
+		"/action/"+url.PathEscape(action),
+		map[string]any{"args": args},
+		timeout,
+	)
+	return gatewayResponse{response: response, body: body, err: err}
+}
+
+func gatewayRequest(
+	endpoint, actorID, path string,
+	payload any,
+	timeout time.Duration,
+) (*http.Response, []byte, error) {
+	method := http.MethodGet
+	var body io.Reader
+	if payload != nil {
+		method = http.MethodPost
+		encoded, err := json.Marshal(payload)
+		if err != nil {
+			return nil, nil, fmt.Errorf("encode gateway request: %w", err)
+		}
+		body = bytes.NewReader(encoded)
+	}
+	request, err := http.NewRequest(
+		method,
+		endpoint+"/gateway/"+url.PathEscape(actorID)+path,
+		body,
+	)
+	if err != nil {
+		return nil, nil, fmt.Errorf("build gateway request: %w", err)
+	}
+	request.Header.Set("Authorization", "Bearer dev")
+	if payload != nil {
+		request.Header.Set("Content-Type", "application/json")
+	}
+	response, err := (&http.Client{Timeout: timeout}).Do(request)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer response.Body.Close()
+	responseBody, err := io.ReadAll(response.Body)
+	if err != nil {
+		return response, nil, fmt.Errorf("read gateway response: %w", err)
+	}
+	return response, responseBody, nil
+}
+
+func assertActionOutput(t *testing.T, result gatewayResponse, status, output int) {
+	t.Helper()
+	if result.err != nil {
+		t.Fatalf("action request: %v", result.err)
+	}
+	if result.response == nil || result.response.StatusCode != status {
+		t.Fatalf("action status = %s, want %d; body=%s", responseStatus(result.response), status, result.body)
+	}
+	var response struct {
+		Output int `json:"output"`
+	}
+	if err := json.Unmarshal(result.body, &response); err != nil {
+		t.Fatalf("decode action response: %v; body=%s", err, result.body)
+	}
+	if response.Output != output {
+		t.Fatalf("action output = %d, want %d", response.Output, output)
+	}
+}
+
+func assertGatewayError(
+	t *testing.T,
+	result gatewayResponse,
+	status int,
+	group, code string,
+) {
+	t.Helper()
+	if result.err != nil {
+		t.Fatalf("gateway error request: %v", result.err)
+	}
+	if result.response == nil || result.response.StatusCode != status {
+		t.Fatalf("gateway error status = %s, want %d; body=%s", responseStatus(result.response), status, result.body)
+	}
+	var response struct {
+		Group   string `json:"group"`
+		Code    string `json:"code"`
+		Message string `json:"message"`
+	}
+	if err := json.Unmarshal(result.body, &response); err != nil {
+		t.Fatalf("decode gateway error: %v; body=%s", err, result.body)
+	}
+	if response.Group != group || response.Code != code || response.Message == "" {
+		t.Fatalf("gateway structured error = %#v, want group=%q code=%q", response, group, code)
+	}
+}
+
+func responseStatus(response *http.Response) string {
+	if response == nil {
+		return "<no response>"
+	}
+	return response.Status
+}
+
 func createActor(
 	t *testing.T,
 	endpoint, name, runnerName, crashPolicy string,
@@ -1345,6 +1638,7 @@ func expectRunnerNewError(t *testing.T, endpoint string) ffi.ErrorPayload {
 		Version:        1,
 		TotalSlots:     1,
 		ActorNames:     []string{},
+		ActorActions:   map[string][]string{},
 		LogLevel:       "error",
 	})
 	if err != nil {
@@ -1382,6 +1676,7 @@ func startNativeRunnerWithActors(t *testing.T, endpoint, name string, actorNames
 		Version:        1,
 		TotalSlots:     1,
 		ActorNames:     actorNames,
+		ActorActions:   map[string][]string{},
 		LogLevel:       "error",
 	})
 	if err != nil {
