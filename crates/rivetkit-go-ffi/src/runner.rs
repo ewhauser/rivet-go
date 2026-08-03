@@ -141,7 +141,7 @@ impl RunnerInner {
         if batch.contains_unknown() {
             return Err(ErrorPayload::new(
                 "unknown_command",
-                "CommandBatch contains a command not supported by M2",
+                "CommandBatch contains a command not supported by M3",
             ));
         }
         batch
@@ -290,6 +290,35 @@ fn validate_config(config: &RunnerConfig) -> Result<(), ErrorPayload> {
             ));
         }
     }
+    for (actor_name, actions) in &config.actor_actions {
+        if !seen_actor_names.contains(actor_name) {
+            return Err(ErrorPayload::new(
+                "invalid_config",
+                format!("actor_actions contains unknown actor `{actor_name}`"),
+            ));
+        }
+        if actions.len() > 1_024 {
+            return Err(ErrorPayload::new(
+                "invalid_config",
+                format!("actor `{actor_name}` must contain at most 1024 actions"),
+            ));
+        }
+        let mut seen_actions = BTreeSet::new();
+        for action in actions {
+            if action.trim().is_empty() {
+                return Err(ErrorPayload::new(
+                    "invalid_config",
+                    format!("actor `{actor_name}` action names must not be empty"),
+                ));
+            }
+            if !seen_actions.insert(action) {
+                return Err(ErrorPayload::new(
+                    "invalid_config",
+                    format!("actor `{actor_name}` contains duplicate action `{action}`"),
+                ));
+            }
+        }
+    }
     if !matches!(
         config.log_level.as_str(),
         "trace" | "debug" | "info" | "warn" | "error"
@@ -348,7 +377,7 @@ async fn run_runner(
     let (handle_tx, handle_rx) = oneshot::channel();
     let actor_proxy = ActorProxy::new(events.clone(), correlations.clone());
     let mut registry = CoreRegistry::new();
-    actor_proxy.register(&mut registry, &config.actor_names);
+    actor_proxy.register(&mut registry, &config.actor_names, &config.actor_actions);
     let serve_config = ServeConfig {
         version: config.version,
         endpoint: config.engine_endpoint.clone(),
@@ -678,15 +707,19 @@ mod tests {
             version: 1,
             total_slots: 1,
             actor_names: Vec::new(),
+            actor_actions: BTreeMap::new(),
             log_level: "info".to_owned(),
         }
     }
 
     #[test]
-    fn validates_m2_config() {
+    fn validates_m3_config() {
         assert!(validate_config(&valid_config()).is_ok());
         let mut config = valid_config();
         config.actor_names.push("actor".to_owned());
+        config
+            .actor_actions
+            .insert("actor".to_owned(), vec!["increment".to_owned()]);
         assert!(validate_config(&config).is_ok());
         config.actor_names.push("actor".to_owned());
         assert_eq!(

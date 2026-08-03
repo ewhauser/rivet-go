@@ -104,6 +104,8 @@ func (e ErrorPayload) Error() string {
 	return fmt.Sprintf("%s: %s", e.Code, e.Message)
 }
 
+func (e ErrorPayload) ErrorCode() string { return e.Code }
+
 // Load extracts, verifies, opens, and binds the embedded native library.
 func Load() error {
 	api.once.Do(func() {

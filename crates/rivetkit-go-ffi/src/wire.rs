@@ -14,6 +14,8 @@ pub(crate) struct RunnerConfig {
     pub total_slots: u32,
     #[serde(default)]
     pub actor_names: Vec<String>,
+    #[serde(default)]
+    pub actor_actions: BTreeMap<String, Vec<String>>,
     pub log_level: String,
 }
 
@@ -52,6 +54,35 @@ pub(crate) enum Event {
         aid: String,
         r#gen: u64,
         reason: String,
+    },
+    ActionCall {
+        aid: String,
+        r#gen: u64,
+        call_id: u64,
+        action: String,
+        #[serde(with = "serde_bytes")]
+        args: Vec<u8>,
+        conn_id: Option<String>,
+    },
+    HttpRequest {
+        aid: String,
+        r#gen: u64,
+        req_id: u64,
+        method: String,
+        path: String,
+        headers: BTreeMap<String, String>,
+        #[serde(with = "serde_bytes")]
+        body: Vec<u8>,
+        stream: bool,
+    },
+    HttpRequestChunk {
+        req_id: u64,
+        #[serde(with = "serde_bytes")]
+        body: Vec<u8>,
+        finish: bool,
+    },
+    HttpRequestAbort {
+        req_id: u64,
     },
     KvResult {
         kv_id: u64,
@@ -130,6 +161,31 @@ pub(crate) enum Command {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         error: Option<WireError>,
     },
+    ActionResult {
+        call_id: u64,
+        #[serde(default, with = "optional_bytes")]
+        output: Option<Vec<u8>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<WireError>,
+    },
+    HttpResponseStart {
+        req_id: u64,
+        status: u16,
+        #[serde(default)]
+        headers: BTreeMap<String, String>,
+        #[serde(default, with = "serde_bytes")]
+        body: Vec<u8>,
+        #[serde(default)]
+        stream: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<WireError>,
+    },
+    HttpResponseChunk {
+        req_id: u64,
+        #[serde(with = "serde_bytes")]
+        body: Vec<u8>,
+        finish: bool,
+    },
     SaveState {
         aid: String,
         #[serde(default)]
@@ -171,18 +227,18 @@ pub(crate) enum Command {
     Unknown,
 }
 
-mod optional_bytes {
+pub(crate) mod optional_bytes {
     use serde::{Deserialize, Deserializer, Serialize, Serializer};
     use serde_bytes::{ByteBuf, Bytes};
 
-    pub(super) fn serialize<S>(value: &Option<Vec<u8>>, serializer: S) -> Result<S::Ok, S::Error>
+    pub(crate) fn serialize<S>(value: &Option<Vec<u8>>, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
     {
         value.as_deref().map(Bytes::new).serialize(serializer)
     }
 
-    pub(super) fn deserialize<'de, D>(deserializer: D) -> Result<Option<Vec<u8>>, D::Error>
+    pub(crate) fn deserialize<'de, D>(deserializer: D) -> Result<Option<Vec<u8>>, D::Error>
     where
         D: Deserializer<'de>,
     {
@@ -209,6 +265,8 @@ impl CommandBatch {
 
     pub(crate) fn validate(&self) -> Result<(), String> {
         const MAX_KV_LIST_ENTRIES: u32 = 1_024;
+        const MAX_HTTP_HEADERS: usize = 256;
+        const MAX_BODY_CHUNK: usize = 1 << 20;
 
         for command in &self.commands {
             match command {
@@ -220,9 +278,78 @@ impl CommandBatch {
                                 .to_owned(),
                         );
                     }
+                    require_wire_error(error.as_ref())?;
                 }
-                Command::ActorStopResult { aid, .. } | Command::SaveState { aid, .. } => {
+                Command::ActorStopResult { aid, error, .. } => {
                     require_aid(aid)?;
+                    require_wire_error(error.as_ref())?;
+                }
+                Command::SaveState { aid, .. } => {
+                    require_aid(aid)?;
+                }
+                Command::ActionResult {
+                    call_id,
+                    output,
+                    error,
+                } => {
+                    require_correlation("action_result", *call_id)?;
+                    if output.is_some() == error.is_some() {
+                        return Err(
+                            "action_result must contain exactly one of output or error".to_owned()
+                        );
+                    }
+                    require_wire_error(error.as_ref())?;
+                    if output
+                        .as_ref()
+                        .is_some_and(|output| output.len() > MAX_BODY_CHUNK)
+                    {
+                        return Err(format!(
+                            "action_result output exceeds boundary maximum {MAX_BODY_CHUNK} bytes"
+                        ));
+                    }
+                }
+                Command::HttpResponseStart {
+                    req_id,
+                    status,
+                    headers,
+                    body,
+                    error,
+                    ..
+                } => {
+                    require_correlation("http_response_start", *req_id)?;
+                    require_wire_error(error.as_ref())?;
+                    if error.is_none() && !(100..=999).contains(status) {
+                        return Err(
+                            "http_response_start status must be between 100 and 999".to_owned()
+                        );
+                    }
+                    if headers.len() > MAX_HTTP_HEADERS {
+                        return Err(format!(
+                            "http_response_start headers exceed boundary maximum {MAX_HTTP_HEADERS}"
+                        ));
+                    }
+                    if body.len() > MAX_BODY_CHUNK {
+                        return Err(format!(
+                            "http_response_start body exceeds boundary maximum {MAX_BODY_CHUNK} bytes"
+                        ));
+                    }
+                }
+                Command::HttpResponseChunk {
+                    req_id,
+                    body,
+                    finish,
+                } => {
+                    require_correlation("http_response_chunk", *req_id)?;
+                    if body.len() > MAX_BODY_CHUNK {
+                        return Err(format!(
+                            "http_response_chunk body exceeds boundary maximum {MAX_BODY_CHUNK} bytes"
+                        ));
+                    }
+                    if body.is_empty() && !finish {
+                        return Err(
+                            "http_response_chunk must contain body bytes or finish=true".to_owned()
+                        );
+                    }
                 }
                 Command::KvGet { kv_id, aid, .. }
                 | Command::KvPut { kv_id, aid, .. }
@@ -263,6 +390,22 @@ fn require_kv(kv_id: u64, aid: &str) -> Result<(), String> {
     }
 }
 
+fn require_correlation(kind: &str, id: u64) -> Result<(), String> {
+    if id == 0 {
+        Err(format!("{kind} correlation ID must be greater than zero"))
+    } else {
+        Ok(())
+    }
+}
+
+fn require_wire_error(error: Option<&WireError>) -> Result<(), String> {
+    if error.is_some_and(|error| error.code.is_empty() || error.message.is_empty()) {
+        Err("structured errors require non-empty code and message".to_owned())
+    } else {
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -288,6 +431,16 @@ mod tests {
         limit: Option<u32>,
         #[serde(with = "optional_bytes")]
         value: Option<Vec<u8>>,
+        call_id: u64,
+        #[serde(with = "optional_bytes")]
+        output: Option<Vec<u8>>,
+        req_id: u64,
+        status: u16,
+        headers: Option<BTreeMap<String, String>>,
+        #[serde(with = "optional_bytes")]
+        body: Option<Vec<u8>>,
+        stream: bool,
+        finish: bool,
     }
 
     #[derive(Serialize)]
@@ -309,6 +462,14 @@ mod tests {
             reverse: false,
             limit: None,
             value: None,
+            call_id: 0,
+            output: None,
+            req_id: 0,
+            status: 0,
+            headers: None,
+            body: None,
+            stream: false,
+            finish: false,
         }
     }
 
@@ -333,6 +494,7 @@ mod tests {
             version: 1,
             total_slots: 4,
             actor_names: vec!["counter".to_owned()],
+            actor_actions: BTreeMap::from([("counter".to_owned(), vec!["increment".to_owned()])]),
             log_level: "info".to_owned(),
         };
         write_golden(
@@ -450,6 +612,64 @@ mod tests {
             &actor_stop.encode().expect("encode actor stop event"),
         );
 
+        let action_call = EventBatch {
+            seq: 10,
+            events: vec![Event::ActionCall {
+                aid: "actor-golden".to_owned(),
+                r#gen: 7,
+                call_id: 21,
+                action: "increment".to_owned(),
+                args: vec![0x81, 0x02],
+                conn_id: Some("conn-golden".to_owned()),
+            }],
+        };
+        write_golden(
+            "event_action_call.msgpack",
+            &action_call.encode().expect("encode action call event"),
+        );
+
+        let http_request = EventBatch {
+            seq: 11,
+            events: vec![Event::HttpRequest {
+                aid: "actor-golden".to_owned(),
+                r#gen: 7,
+                req_id: 22,
+                method: "POST".to_owned(),
+                path: "/upload?part=1".to_owned(),
+                headers: BTreeMap::from([("content-type".to_owned(), "text/plain".to_owned())]),
+                body: b"first".to_vec(),
+                stream: true,
+            }],
+        };
+        write_golden(
+            "event_http_request.msgpack",
+            &http_request.encode().expect("encode HTTP request event"),
+        );
+        let http_chunk = EventBatch {
+            seq: 12,
+            events: vec![Event::HttpRequestChunk {
+                req_id: 22,
+                body: b"second".to_vec(),
+                finish: true,
+            }],
+        };
+        write_golden(
+            "event_http_request_chunk.msgpack",
+            &http_chunk
+                .encode()
+                .expect("encode HTTP request chunk event"),
+        );
+        let http_abort = EventBatch {
+            seq: 13,
+            events: vec![Event::HttpRequestAbort { req_id: 23 }],
+        };
+        write_golden(
+            "event_http_request_abort.msgpack",
+            &http_abort
+                .encode()
+                .expect("encode HTTP request abort event"),
+        );
+
         let kv_result = EventBatch {
             seq: 6,
             events: vec![Event::KvResult {
@@ -520,6 +740,31 @@ mod tests {
             .expect("Rust command decoder accepts the full Go command shape");
         assert_eq!(decoded.commands.len(), 7);
         write_golden("command_m2.msgpack", &command_m2);
+
+        let mut action = golden_command("action_result");
+        action.call_id = 21;
+        action.output = Some(vec![0x18, 0x2a]);
+        let mut response_start = golden_command("http_response_start");
+        response_start.req_id = 22;
+        response_start.status = 201;
+        response_start.headers = Some(BTreeMap::from([(
+            "content-type".to_owned(),
+            "text/plain".to_owned(),
+        )]));
+        response_start.body = Some(Vec::new());
+        response_start.stream = true;
+        let mut response_chunk = golden_command("http_response_chunk");
+        response_chunk.req_id = 22;
+        response_chunk.body = Some(b"response".to_vec());
+        response_chunk.finish = true;
+        let command_m3 = rmp_serde::to_vec_named(&GoldenCommandBatch {
+            commands: vec![action, response_start, response_chunk],
+        })
+        .expect("encode M3 command batch");
+        let decoded = CommandBatch::decode(&command_m3)
+            .expect("Rust command decoder accepts the full Go M3 command shape");
+        assert_eq!(decoded.commands.len(), 3);
+        write_golden("command_m3.msgpack", &command_m3);
     }
 
     #[test]

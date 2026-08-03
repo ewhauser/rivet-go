@@ -34,6 +34,8 @@ func (e ErrorPayload) Error() string {
 	return e.Code + ": " + e.Message
 }
 
+func (e ErrorPayload) ErrorCode() string { return e.Code }
+
 // Load reports that the current target has no embedded native library.
 func Load() error { return errUnsupportedPlatform }
 

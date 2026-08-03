@@ -158,9 +158,9 @@ most bug-prone structure in the crate; it gets dedicated loom/proptest coverage.
 
 1. **Resolved in the M2 notes below.** Core supports explicit state save, so
    `SaveState` and `StatePersisted` remain in the boundary.
-2. Action args encoding: pass through raw client encoding (JSON/CBOR) vs
-   normalize to msgpack in the FFI crate. Leaning pass-through — Go decodes
-   per-request, avoiding a double transcode.
+2. **Resolved in the M3 notes below.** The pinned core normalizes action args
+   to CBOR before the embedder callback, so the boundary passes those bytes
+   through unchanged.
 3. Hibernating WS resume: how much of the `msg_index` replay bookkeeping does
    core hide from its embedder vs expect the embedder to persist? Check what
    rivetkit-napi exposes to JS.
@@ -262,3 +262,60 @@ State and KV use core's `sqlite-remote` feature with
 engine/envoy and persists it in the engine data directory. The native-local
 backend requires an atomic-write-enabled SQLite build at this pin and is not
 used by the prebuilt Go library.
+
+## M3 pin-specific notes — 2026-08-03
+
+M3 expands both envelope unions and bumps the boundary ABI to 3. The runner
+configuration now carries `actor_actions`, keyed by registered actor name, and
+the core `ActorConfig` advertises each `ActionDefinition`. Action names are
+non-empty, unique within an actor, and capped at 1024. HTTP request and
+response header maps are capped at 256 entries. The Go shape scanner keeps its
+existing 1024-entry map ceiling because it must contain the outer envelope as
+well as the schema-capped header map; its existing 1 MiB blob ceiling exactly
+matches one HTTP boundary chunk, so no scanner cap changes were needed.
+
+The action mapping at v2.3.10 is:
+
+- a gateway JSON or CBOR request is normalized by core to a CBOR argument
+  array, which `ActionCall.args` carries without transcoding;
+- `conn_id` carries the ephemeral HTTP action connection ID when core supplies
+  it; the required connection preflight and open hooks are acknowledged but
+  no public connection surface is introduced in M3;
+- `ActionResult.output` is one CBOR value, while the error arm becomes a
+  dynamic Rivet error in group `actor`; `action_not_found` uses core's native
+  404 error constructor;
+- action arguments and results are single, non-streamed boundary blobs and
+  retain the existing 1 MiB envelope limit;
+- the action correlation uses the pinned core default 60-second action
+  deadline. Expiry and runner shutdown resolve the same correlation table as
+  lifecycle and state operations.
+
+The public typed adapter uses `fxamacker/cbor` for arguments and results and
+honors Go `json` field tags. `RawAction` is the byte-level escape hatch for the
+unchanged CBOR argument array and result value. A successful typed or raw
+action saves the complete actor state before releasing its output. Ordinary
+handler errors remain actor-local; `handler_panic` is returned to the client
+and then ends that actor factory future without ending the runner pump.
+
+The HTTP mapping has two limitations imposed by the pinned core trait. Core
+buffers the incoming body before creating `ActorEvent::HttpRequest`, and the
+reply channel accepts only `Response<Vec<u8>>`. The FFI divides the buffered
+request into `HttpRequest` plus `HttpRequestChunk` events of at most 1 MiB and
+accepts `HttpResponseStart` plus equally bounded response chunks, but it must
+assemble all response chunks before replying to core. A 30-second boundary
+deadline applies because this callback exposes no separate core deadline.
+Deadline expiry emits `HttpRequestAbort`; actor or runner shutdown cancels the
+Go request context directly. Client socket aborts are not visible through this
+v2.3.10 embedder callback and therefore cannot produce their own abort event.
+
+Go's `ResponseWriter.Write` splits large writes and calls `rk_runner_submit`
+from the handler goroutine. Native `backpressure` responses are retried with
+jitter there, leaving the sole poll goroutine free to dispatch other actors.
+The pinned core request and response types use `HashMap<String, String>`, so
+the boundary preserves one value per header name; multiple Go response values
+are joined with a comma and space before crossing the boundary. This includes
+the known limitation that independently repeated response fields cannot be
+represented at this pin.
+
+WebSockets, event broadcast, alarm delivery, sleep scheduling, and the
+standalone client package remain outside M3.

@@ -1652,6 +1652,7 @@ dependencies = [
  "crossbeam-channel",
  "proptest",
  "reqwest",
+ "rivet-error",
  "rivetkit-core",
  "rmp-serde",
  "serde",

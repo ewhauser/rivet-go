@@ -3,6 +3,7 @@ package wire
 import (
 	"bytes"
 	"encoding/binary"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -65,6 +66,10 @@ func TestValidateShapeAcceptsGoldens(t *testing.T) {
 		"event_actor_start_fresh.msgpack",
 		"event_actor_start_empty_state.msgpack",
 		"event_actor_stop.msgpack",
+		"event_action_call.msgpack",
+		"event_http_request.msgpack",
+		"event_http_request_chunk.msgpack",
+		"event_http_request_abort.msgpack",
 		"event_kv_result.msgpack",
 		"event_state_persisted.msgpack",
 	} {
@@ -72,6 +77,32 @@ func TestValidateShapeAcceptsGoldens(t *testing.T) {
 		if err := validateShape(data); err != nil {
 			t.Fatalf("golden %s rejected: %v", name, err)
 		}
+	}
+}
+
+func TestValidateShapeAcceptsMaximumM3HTTPChunkAndHeaderSchema(t *testing.T) {
+	headers := make(map[string]string, 256)
+	for index := range 256 {
+		headers[fmt.Sprintf("x-rivet-go-%03d", index)] = "value"
+	}
+	data, err := encode(EventBatch{Seq: 1, Events: []Event{{
+		Kind:       EventHTTPRequest,
+		AID:        "actor",
+		Generation: 1,
+		RequestID:  1,
+		Method:     "POST",
+		Path:       "/upload",
+		Headers:    headers,
+		Body:       bytes.Repeat([]byte("x"), maxBlobBytes),
+	}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := validateShape(data); err != nil {
+		t.Fatalf("valid M3 HTTP boundary event rejected: %v", err)
+	}
+	if _, err := DecodeEventBatch(data); err != nil {
+		t.Fatalf("decode valid M3 HTTP boundary event: %v", err)
 	}
 }
 
@@ -168,6 +199,7 @@ func TestGoEncoderOutputsPassShapeValidation(t *testing.T) {
 			Version:        1,
 			TotalSlots:     1,
 			ActorNames:     []string{},
+			ActorActions:   map[string][]string{},
 			LogLevel:       "info",
 		},
 		CommandBatch{Commands: []Command{}},

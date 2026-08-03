@@ -1,16 +1,17 @@
 //! Callback-free proxy from rivetkit-core actor factories to the Go pump.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
 use crossbeam_channel::Sender;
+use rivet_error::{RivetError, RivetErrorKind};
 use rivetkit_core::actor::ShutdownKind;
 use rivetkit_core::{
-    ActorConfig, ActorContext, ActorEvent, ActorFactory, ActorStart, CoreRegistry, ListOpts,
-    StateDelta, format_actor_key,
+    ActionDefinition, ActorConfig, ActorContext, ActorEvent, ActorFactory, ActorStart,
+    CoreRegistry, ListOpts, Response, StateDelta, format_actor_key,
 };
 use serde::{Deserialize, Serialize};
 
@@ -19,6 +20,10 @@ use crate::wire::{Command, Event, KvEntry, WireError};
 
 const LIFECYCLE_RESULT_TIMEOUT: Duration = Duration::from_secs(30);
 const SAVE_STATE_TIMEOUT: Duration = Duration::from_secs(30);
+const ACTION_RESULT_TIMEOUT: Duration = Duration::from_secs(60);
+const HTTP_RESULT_TIMEOUT: Duration = Duration::from_secs(30);
+const MAX_BODY_CHUNK: usize = 1 << 20;
+const MAX_HTTP_HEADERS: usize = 256;
 const MAX_KV_LIST_ENTRIES: u32 = 1_024;
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
@@ -129,6 +134,28 @@ struct LifecycleResolution {
     error: Option<WireError>,
 }
 
+#[derive(Debug, Deserialize, Serialize)]
+struct ActionResolution {
+    #[serde(default, with = "crate::wire::optional_bytes")]
+    output: Option<Vec<u8>>,
+    error: Option<WireError>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct HttpResolution {
+    status: u16,
+    headers: BTreeMap<String, String>,
+    #[serde(with = "serde_bytes")]
+    body: Vec<u8>,
+    error: Option<WireError>,
+}
+
+struct HttpResponseAssembly {
+    status: u16,
+    headers: BTreeMap<String, String>,
+    body: Vec<u8>,
+}
+
 #[derive(Clone, Default)]
 struct LifecyclePending {
     entries: Arc<Mutex<HashMap<LifecycleKey, u64>>>,
@@ -193,6 +220,8 @@ pub(crate) struct ActorProxy {
     correlations: CorrelationTable,
     pending: LifecyclePending,
     actors: Arc<Mutex<HashMap<ActorIdentity, ActiveActor>>>,
+    active_http: Arc<Mutex<HashSet<u64>>>,
+    http_responses: Arc<Mutex<HashMap<u64, HttpResponseAssembly>>>,
 }
 
 impl ActorProxy {
@@ -202,10 +231,17 @@ impl ActorProxy {
             correlations,
             pending: LifecyclePending::default(),
             actors: Arc::new(Mutex::new(HashMap::new())),
+            active_http: Arc::new(Mutex::new(HashSet::new())),
+            http_responses: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
-    pub(crate) fn register(&self, registry: &mut CoreRegistry, actor_names: &[String]) {
+    pub(crate) fn register(
+        &self,
+        registry: &mut CoreRegistry,
+        actor_names: &[String],
+        actor_actions: &BTreeMap<String, Vec<String>>,
+    ) {
         for actor_name in actor_names {
             let proxy = self.clone();
             let config = ActorConfig {
@@ -216,9 +252,15 @@ impl ActorProxy {
                 // atomic-write-enabled SQLite build that the Go SDK does not
                 // otherwise need to ship.
                 remote_sqlite: true,
-                // Sleep/alarm behavior belongs to M5. Keeping M2 actors awake
+                // Sleep/alarm behavior belongs to M5. Keeping M3 actors awake
                 // makes lifecycle changes engine-driven and deterministic.
                 no_sleep: true,
+                actions: actor_actions
+                    .get(actor_name)
+                    .into_iter()
+                    .flatten()
+                    .map(|name| ActionDefinition { name: name.clone() })
+                    .collect(),
                 ..ActorConfig::default()
             };
             registry.register(
@@ -270,6 +312,28 @@ impl ActorProxy {
                         .resolve(&key, LifecycleResolution { error }, &self.correlations);
                 }
             }
+            Command::ActionResult {
+                call_id,
+                output,
+                error,
+            } => {
+                let payload = rmp_serde::to_vec_named(&ActionResolution { output, error })
+                    .expect("ActionResolution serialization is infallible");
+                self.correlations.resolve(call_id, payload);
+            }
+            Command::HttpResponseStart {
+                req_id,
+                status,
+                headers,
+                body,
+                stream,
+                error,
+            } => self.start_http_response(req_id, status, headers, body, stream, error),
+            Command::HttpResponseChunk {
+                req_id,
+                body,
+                finish,
+            } => self.append_http_response(req_id, body, finish),
             Command::SaveState {
                 aid,
                 r#gen: generation,
@@ -286,10 +350,38 @@ impl ActorProxy {
 
     pub(crate) fn sweep_pending(&self) {
         self.pending.retain_live(&self.correlations);
+        let expired = {
+            let mut active = self.active_http.lock().expect("active HTTP table poisoned");
+            let expired = active
+                .iter()
+                .filter(|req_id| !self.correlations.contains(**req_id))
+                .copied()
+                .collect::<Vec<_>>();
+            for req_id in &expired {
+                active.remove(req_id);
+            }
+            expired
+        };
+        let mut responses = self
+            .http_responses
+            .lock()
+            .expect("HTTP response table poisoned");
+        for req_id in expired {
+            responses.remove(&req_id);
+            let _ = self.events.send(Event::HttpRequestAbort { req_id });
+        }
     }
 
     pub(crate) fn drain_shutdown(&self) {
         self.pending.clear();
+        self.active_http
+            .lock()
+            .expect("active HTTP table poisoned")
+            .clear();
+        self.http_responses
+            .lock()
+            .expect("HTTP response table poisoned")
+            .clear();
     }
 
     async fn run_actor(&self, start: ActorStart) -> Result<()> {
@@ -417,18 +509,54 @@ impl ActorProxy {
                         }
                     }
                 }
-                ActorEvent::Action { reply, .. } => {
-                    reply.send(Err(anyhow!("actions are not supported before M3")));
+                ActorEvent::Action {
+                    name,
+                    args,
+                    conn,
+                    reply,
+                    ..
+                } => {
+                    let resolution = self
+                        .request_action(
+                            identity,
+                            name.clone(),
+                            args,
+                            conn.map(|conn| conn.id().to_owned()),
+                        )
+                        .await;
+                    match resolution {
+                        Ok(output) => reply.send(Ok(output)),
+                        Err(error) => {
+                            let fatal = error.code == "handler_panic";
+                            reply.send(Err(action_wire_error(&name, &error)));
+                            if fatal {
+                                return Err(anyhow!(
+                                    "Go action handler panicked: {}",
+                                    error.message
+                                ));
+                            }
+                        }
+                    }
                 }
-                ActorEvent::HttpRequest { reply, .. } => {
-                    reply.send(Err(anyhow!("HTTP requests are not supported before M3")));
+                ActorEvent::HttpRequest { request, reply } => {
+                    let resolution = self.request_http(identity, request).await;
+                    match resolution {
+                        Ok(response) => reply.send(Ok(response)),
+                        Err(error) => {
+                            let fatal = error.code == "handler_panic";
+                            reply.send(Err(actor_wire_error(&error)));
+                            if fatal {
+                                return Err(anyhow!("Go HTTP handler panicked: {}", error.message));
+                            }
+                        }
+                    }
                 }
                 ActorEvent::QueueSend { reply, .. } => {
-                    reply.send(Err(anyhow!("queue requests are not supported in M2")));
+                    reply.send(Err(anyhow!("queue requests are not supported before M4")));
                 }
+                ActorEvent::ConnectionPreflight { reply, .. }
+                | ActorEvent::ConnectionOpen { reply, .. } => reply.send(Ok(())),
                 ActorEvent::WebSocketOpen { reply, .. }
-                | ActorEvent::ConnectionPreflight { reply, .. }
-                | ActorEvent::ConnectionOpen { reply, .. }
                 | ActorEvent::SubscribeRequest { reply, .. } => {
                     reply.send(Err(anyhow!("connections are not supported before M4")));
                 }
@@ -514,8 +642,275 @@ impl ActorProxy {
             Command::KvDelete { kv_id, aid, key } => self.kv_delete(kv_id, aid, key).await,
             Command::ActorStartResult { .. }
             | Command::ActorStopResult { .. }
+            | Command::ActionResult { .. }
+            | Command::HttpResponseStart { .. }
+            | Command::HttpResponseChunk { .. }
             | Command::Unknown => {}
         }
+    }
+
+    async fn request_action(
+        &self,
+        identity: &ActorIdentity,
+        action: String,
+        args: Vec<u8>,
+        conn_id: Option<String>,
+    ) -> Result<Vec<u8>, WireError> {
+        if args.len() > MAX_BODY_CHUNK {
+            return Err(WireError::new(
+                "action_args_too_large",
+                format!("action arguments exceed the {MAX_BODY_CHUNK}-byte boundary maximum"),
+            ));
+        }
+        let (call_id, receiver) = self.correlations.insert(ACTION_RESULT_TIMEOUT);
+        if self
+            .events
+            .send(Event::ActionCall {
+                aid: identity.aid.clone(),
+                r#gen: identity.generation,
+                call_id,
+                action,
+                args,
+                conn_id,
+            })
+            .is_err()
+        {
+            self.correlations.resolve(
+                call_id,
+                rmp_serde::to_vec_named(&ActionResolution {
+                    output: None,
+                    error: Some(WireError::new("runner_stopped", "Go event queue is closed")),
+                })
+                .expect("encode action queue error"),
+            );
+        }
+        let payload = receiver
+            .await
+            .map_err(|_| WireError::new("runner_stopped", "action correlation sender dropped"))?
+            .map_err(correlation_wire_error)?;
+        let resolution: ActionResolution = rmp_serde::from_slice(&payload)
+            .map_err(|error| WireError::new("action_result_invalid", error.to_string()))?;
+        match (resolution.output, resolution.error) {
+            (Some(output), None) => Ok(output),
+            (None, Some(error)) => Err(error),
+            _ => Err(WireError::new(
+                "action_result_invalid",
+                "action result must contain exactly one of output or error",
+            )),
+        }
+    }
+
+    async fn request_http(
+        &self,
+        identity: &ActorIdentity,
+        request: rivetkit_core::Request,
+    ) -> Result<Response, WireError> {
+        let (method, path, headers, body) = request.to_parts();
+        let headers = headers.into_iter().collect::<BTreeMap<_, _>>();
+        if headers.len() > MAX_HTTP_HEADERS {
+            return Err(WireError::new(
+                "http_request_headers_too_large",
+                format!("HTTP request has more than {MAX_HTTP_HEADERS} headers"),
+            ));
+        }
+        let (req_id, receiver) = self.correlations.insert(HTTP_RESULT_TIMEOUT);
+        self.active_http
+            .lock()
+            .expect("active HTTP table poisoned")
+            .insert(req_id);
+
+        let first_len = body.len().min(MAX_BODY_CHUNK);
+        let stream = first_len < body.len();
+        if self
+            .events
+            .send(Event::HttpRequest {
+                aid: identity.aid.clone(),
+                r#gen: identity.generation,
+                req_id,
+                method,
+                path,
+                headers,
+                body: body[..first_len].to_vec(),
+                stream,
+            })
+            .is_err()
+        {
+            self.resolve_http_error(
+                req_id,
+                WireError::new("runner_stopped", "Go event queue is closed"),
+            );
+        } else if stream {
+            let remaining = &body[first_len..];
+            let chunk_count = remaining.len().div_ceil(MAX_BODY_CHUNK);
+            for (index, chunk) in remaining.chunks(MAX_BODY_CHUNK).enumerate() {
+                if self
+                    .events
+                    .send(Event::HttpRequestChunk {
+                        req_id,
+                        body: chunk.to_vec(),
+                        finish: index + 1 == chunk_count,
+                    })
+                    .is_err()
+                {
+                    self.resolve_http_error(
+                        req_id,
+                        WireError::new("runner_stopped", "Go event queue is closed"),
+                    );
+                    break;
+                }
+            }
+        }
+
+        let result = receiver.await;
+        self.active_http
+            .lock()
+            .expect("active HTTP table poisoned")
+            .remove(&req_id);
+        self.http_responses
+            .lock()
+            .expect("HTTP response table poisoned")
+            .remove(&req_id);
+        let payload = match result {
+            Ok(Ok(payload)) => payload,
+            Ok(Err(error)) => {
+                let _ = self.events.send(Event::HttpRequestAbort { req_id });
+                return Err(correlation_wire_error(error));
+            }
+            Err(_) => {
+                let _ = self.events.send(Event::HttpRequestAbort { req_id });
+                return Err(WireError::new(
+                    "runner_stopped",
+                    "HTTP correlation sender dropped",
+                ));
+            }
+        };
+        let resolution: HttpResolution = rmp_serde::from_slice(&payload)
+            .map_err(|error| WireError::new("http_response_invalid", error.to_string()))?;
+        if let Some(error) = resolution.error {
+            return Err(error);
+        }
+        Response::from_parts(
+            resolution.status,
+            resolution.headers.into_iter().collect(),
+            resolution.body,
+        )
+        .map_err(|error| WireError::new("http_response_invalid", format!("{error:#}")))
+    }
+
+    fn start_http_response(
+        &self,
+        req_id: u64,
+        status: u16,
+        headers: BTreeMap<String, String>,
+        body: Vec<u8>,
+        stream: bool,
+        error: Option<WireError>,
+    ) {
+        if !self.correlations.contains(req_id) {
+            return;
+        }
+        if let Some(error) = error {
+            self.http_responses
+                .lock()
+                .expect("HTTP response table poisoned")
+                .remove(&req_id);
+            self.resolve_http_error(req_id, error);
+            return;
+        }
+        if stream {
+            let prior = self
+                .http_responses
+                .lock()
+                .expect("HTTP response table poisoned")
+                .insert(
+                    req_id,
+                    HttpResponseAssembly {
+                        status,
+                        headers,
+                        body,
+                    },
+                );
+            if prior.is_some() {
+                self.resolve_http_error(
+                    req_id,
+                    WireError::new(
+                        "http_response_invalid",
+                        "HTTP response was started more than once",
+                    ),
+                );
+            }
+        } else {
+            let payload = rmp_serde::to_vec_named(&HttpResolution {
+                status,
+                headers,
+                body,
+                error: None,
+            })
+            .expect("HttpResolution serialization is infallible");
+            self.active_http
+                .lock()
+                .expect("active HTTP table poisoned")
+                .remove(&req_id);
+            self.correlations.resolve(req_id, payload);
+        }
+    }
+
+    fn append_http_response(&self, req_id: u64, body: Vec<u8>, finish: bool) {
+        if !self.correlations.contains(req_id) {
+            return;
+        }
+        let completed = {
+            let mut responses = self
+                .http_responses
+                .lock()
+                .expect("HTTP response table poisoned");
+            let Some(response) = responses.get_mut(&req_id) else {
+                drop(responses);
+                self.resolve_http_error(
+                    req_id,
+                    WireError::new(
+                        "http_response_invalid",
+                        "HTTP response chunk arrived before response start",
+                    ),
+                );
+                return;
+            };
+            response.body.extend_from_slice(&body);
+            finish.then(|| responses.remove(&req_id).expect("HTTP response exists"))
+        };
+        if let Some(response) = completed {
+            let payload = rmp_serde::to_vec_named(&HttpResolution {
+                status: response.status,
+                headers: response.headers,
+                body: response.body,
+                error: None,
+            })
+            .expect("HttpResolution serialization is infallible");
+            self.active_http
+                .lock()
+                .expect("active HTTP table poisoned")
+                .remove(&req_id);
+            self.correlations.resolve(req_id, payload);
+        }
+    }
+
+    fn resolve_http_error(&self, req_id: u64, error: WireError) {
+        self.http_responses
+            .lock()
+            .expect("HTTP response table poisoned")
+            .remove(&req_id);
+        self.active_http
+            .lock()
+            .expect("active HTTP table poisoned")
+            .remove(&req_id);
+        let payload = rmp_serde::to_vec_named(&HttpResolution {
+            status: 0,
+            headers: BTreeMap::new(),
+            body: Vec::new(),
+            error: Some(error),
+        })
+        .expect("HttpResolution serialization is infallible");
+        self.correlations.resolve(req_id, payload);
     }
 
     fn dispatch_save_state(&self, aid: String, generation: u64, state: Vec<u8>) {
@@ -726,8 +1121,46 @@ fn shutdown_reason(reason: ShutdownKind) -> &'static str {
     }
 }
 
+fn correlation_wire_error(error: CorrelationError) -> WireError {
+    match error {
+        CorrelationError::Timeout => WireError::new(
+            "action_timed_out",
+            "Go handler did not complete before the core dispatch deadline",
+        ),
+        CorrelationError::Shutdown => WireError::new(
+            "runner_stopped",
+            "runner stopped while the Go handler was active",
+        ),
+    }
+}
+
+fn action_wire_error(action: &str, error: &WireError) -> anyhow::Error {
+    if error.code == "action_not_found" {
+        rivetkit_core::error::action_not_found(action)
+    } else {
+        actor_wire_error(error)
+    }
+}
+
+fn actor_wire_error(error: &WireError) -> anyhow::Error {
+    anyhow::Error::new(RivetError {
+        kind: RivetErrorKind::Dynamic {
+            group: "actor".to_owned(),
+            code: error.code.clone(),
+            default_message: error.message.clone(),
+        },
+        meta: None,
+        message: Some(error.message.clone()),
+        actor: None,
+    })
+}
+
 #[cfg(test)]
 mod tests {
+    use std::time::Instant;
+
+    use crossbeam_channel::bounded;
+
     use super::*;
 
     #[tokio::test]
@@ -750,5 +1183,99 @@ mod tests {
             .await
             .expect("stop waiter timed out")
             .expect("stop waiter task failed");
+    }
+
+    #[tokio::test]
+    async fn action_result_resolves_its_exact_correlation() {
+        let (events, _event_rx) = bounded(4);
+        let correlations = CorrelationTable::default();
+        let proxy = ActorProxy::new(events, correlations.clone());
+        let (call_id, receiver) = correlations.insert(Duration::from_secs(1));
+
+        proxy.handle_command(Command::ActionResult {
+            call_id,
+            output: Some(vec![0x18, 0x2a]),
+            error: None,
+        });
+
+        let payload = receiver
+            .await
+            .expect("action correlation sender")
+            .expect("action correlation result");
+        let resolution: ActionResolution =
+            rmp_serde::from_slice(&payload).expect("decode action resolution");
+        assert_eq!(resolution.output, Some(vec![0x18, 0x2a]));
+        assert_eq!(resolution.error, None);
+        assert_eq!(correlations.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn streamed_http_commands_assemble_before_core_reply() {
+        let (events, event_rx) = bounded(4);
+        let correlations = CorrelationTable::default();
+        let proxy = ActorProxy::new(events, correlations.clone());
+        let (req_id, receiver) = correlations.insert(Duration::from_secs(1));
+        proxy
+            .active_http
+            .lock()
+            .expect("active HTTP table")
+            .insert(req_id);
+
+        proxy.handle_command(Command::HttpResponseStart {
+            req_id,
+            status: 201,
+            headers: BTreeMap::from([("content-type".to_owned(), "text/plain".to_owned())]),
+            body: b"first".to_vec(),
+            stream: true,
+            error: None,
+        });
+        proxy.handle_command(Command::HttpResponseChunk {
+            req_id,
+            body: b"-second".to_vec(),
+            finish: false,
+        });
+        proxy.handle_command(Command::HttpResponseChunk {
+            req_id,
+            body: b"-third".to_vec(),
+            finish: true,
+        });
+
+        let payload = receiver
+            .await
+            .expect("HTTP correlation sender")
+            .expect("HTTP correlation result");
+        let resolution: HttpResolution =
+            rmp_serde::from_slice(&payload).expect("decode HTTP resolution");
+        assert_eq!(resolution.status, 201);
+        assert_eq!(resolution.body, b"first-second-third");
+        assert_eq!(resolution.headers["content-type"], "text/plain");
+        assert_eq!(resolution.error, None);
+        assert_eq!(correlations.len(), 0);
+        proxy.sweep_pending();
+        assert!(event_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn expired_http_correlation_emits_abort() {
+        let (events, event_rx) = bounded(4);
+        let correlations = CorrelationTable::default();
+        let proxy = ActorProxy::new(events, correlations.clone());
+        let (req_id, receiver) = correlations.insert(Duration::ZERO);
+        proxy
+            .active_http
+            .lock()
+            .expect("active HTTP table")
+            .insert(req_id);
+
+        assert_eq!(correlations.expire(Instant::now()), 1);
+        proxy.sweep_pending();
+        assert_eq!(
+            receiver.await.expect("HTTP correlation sender"),
+            Err(CorrelationError::Timeout)
+        );
+        assert_eq!(
+            event_rx.recv_timeout(Duration::from_secs(1)),
+            Ok(Event::HttpRequestAbort { req_id })
+        );
     }
 }
