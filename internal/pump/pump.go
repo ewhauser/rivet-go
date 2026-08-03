@@ -79,6 +79,8 @@ type Pump struct {
 	nextSubID uint64
 	resultMu  sync.Mutex
 	result    error
+	seenSeq   bool
+	lastSeq   uint64
 }
 
 func New(runner Runner) *Pump {
@@ -211,6 +213,16 @@ func (p *Pump) pollLoop(ctx context.Context) {
 			p.setResult(err)
 			return
 		}
+		if p.seenSeq && batch.Seq <= p.lastSeq {
+			p.setResult(fmt.Errorf(
+				"non-monotonic event batch sequence: got %d after %d",
+				batch.Seq,
+				p.lastSeq,
+			))
+			return
+		}
+		p.seenSeq = true
+		p.lastSeq = batch.Seq
 		for _, event := range batch.Events {
 			if !p.dispatch(event) {
 				return

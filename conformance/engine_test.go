@@ -1,26 +1,26 @@
 package conformance
 
 import (
-	"bufio"
-	"bytes"
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/ewhauser/rivet-go/internal/ffi"
+	"github.com/ewhauser/rivet-go/internal/wire"
 	"github.com/ewhauser/rivet-go/rivet"
 )
 
@@ -29,6 +29,10 @@ const (
 	engineVersion    = "2.3.10"
 	engineCommit     = "957d4e482f404913ca1955d8ecc357533f6fd081"
 	engineRepository = "https://github.com/rivet-dev/rivet.git"
+	startupBound     = 13 * time.Second
+	// rivet-envoy-client v2.3.10 declares a 20-second ping-health threshold;
+	// the adapter samples that status every 250 milliseconds.
+	disconnectLivenessWindow = 22 * time.Second
 )
 
 type runningEngine struct {
@@ -123,9 +127,160 @@ func TestRunnerRegistersWithEngine(t *testing.T) {
 	})
 }
 
+func TestRunnerNewFailuresAreStructuredAndBounded(t *testing.T) {
+	tests := []struct {
+		name     string
+		endpoint func(*testing.T) string
+	}{
+		{name: "dead endpoint", endpoint: silentEndpoint},
+		{name: "wrong port", endpoint: closedEndpoint},
+		{name: "non-engine HTTP server", endpoint: nonEngineEndpoint},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			started := time.Now()
+			payload := expectRunnerNewError(t, test.endpoint(t))
+			if payload.Code == "" {
+				t.Fatal("runner_new returned an error without a structured code")
+			}
+			if elapsed := time.Since(started); elapsed > startupBound {
+				t.Fatalf("runner_new took %s, want at most %s", elapsed, startupBound)
+			}
+		})
+	}
+}
+
+func TestNativeBoundaryConcurrencyAndLifecycle(t *testing.T) {
+	if testing.Short() {
+		t.Skip("real-engine conformance is disabled by -short")
+	}
+	engineBinary, err := acquireEngine(context.Background())
+	if err != nil {
+		t.Fatalf("obtain Rivet engine %s: %v\n%s", engineTag, err, engineRemediation())
+	}
+	engine := startEngine(t, engineBinary)
+
+	runner := startNativeRunner(t, engine.endpoint, "rivet-go-boundary")
+	connectedBatch, connected := waitForNativeEvent(t, runner, wire.EventRunnerConnected, 5*time.Second)
+	if connected.RunnerID == "" {
+		t.Fatal("RunnerConnected has an empty runner_id")
+	}
+
+	firstPoll := make(chan struct {
+		batch wire.EventBatch
+		err   error
+	}, 1)
+	go func() {
+		data, pollErr := runner.Poll(2 * time.Second)
+		if pollErr != nil {
+			firstPoll <- struct {
+				batch wire.EventBatch
+				err   error
+			}{err: pollErr}
+			return
+		}
+		batch, decodeErr := wire.DecodeEventBatch(data)
+		firstPoll <- struct {
+			batch wire.EventBatch
+			err   error
+		}{batch: batch, err: decodeErr}
+	}()
+	time.Sleep(100 * time.Millisecond)
+	if _, err := runner.Poll(10 * time.Millisecond); nativeErrorCode(err) != "poll_in_progress" {
+		t.Fatalf("second concurrent Poll error = %v, want poll_in_progress", err)
+	}
+	first := <-firstPoll
+	if first.err != nil {
+		t.Fatalf("first concurrent Poll: %v", first.err)
+	}
+	if first.batch.Seq <= connectedBatch.Seq {
+		t.Fatalf("poll sequence = %d after %d, want strictly increasing", first.batch.Seq, connectedBatch.Seq)
+	}
+
+	emptyBatch, err := wire.EncodeCommandBatch(wire.CommandBatch{Commands: []wire.Command{}})
+	if err != nil {
+		t.Fatalf("encode empty command batch: %v", err)
+	}
+	const (
+		submitters = 16
+		submits    = 32
+	)
+	var submitWG sync.WaitGroup
+	submitErrors := make(chan error, submitters)
+	submitWG.Add(submitters)
+	for range submitters {
+		go func() {
+			defer submitWG.Done()
+			for range submits {
+				if err := runner.Submit(emptyBatch); err != nil {
+					submitErrors <- err
+					return
+				}
+			}
+		}()
+	}
+	submitWG.Wait()
+	close(submitErrors)
+	for err := range submitErrors {
+		t.Fatalf("concurrent native Submit: %v", err)
+	}
+
+	if err := runner.Shutdown(3 * time.Second); err != nil {
+		t.Fatalf("Shutdown: %v", err)
+	}
+	stoppedBatch, stopped := waitForNativeEvent(t, runner, wire.EventRunnerStopped, 5*time.Second)
+	if stoppedBatch.Seq <= first.batch.Seq {
+		t.Fatalf("shutdown sequence = %d after %d, want strictly increasing", stoppedBatch.Seq, first.batch.Seq)
+	}
+	if stopped.DrainReport == nil || !stopped.DrainReport.Graceful {
+		t.Fatalf("RunnerStopped drain report = %#v, want graceful", stopped.DrainReport)
+	}
+	runner.Close()
+	runner.Close() // The owning Go handle must make a duplicate free harmless.
+
+	forced := startNativeRunner(t, engine.endpoint, "rivet-go-forced-free")
+	waitForNativeEvent(t, forced, wire.EventRunnerConnected, 5*time.Second)
+	started := time.Now()
+	forced.Close() // Free without a preceding shutdown or poll drain.
+	if elapsed := time.Since(started); elapsed > 5*time.Second {
+		t.Fatalf("free without shutdown took %s", elapsed)
+	}
+	forced.Close()
+}
+
+func TestRunnerReportsEngineDisconnect(t *testing.T) {
+	if testing.Short() {
+		t.Skip("real-engine conformance is disabled by -short")
+	}
+	engineBinary, err := acquireEngine(context.Background())
+	if err != nil {
+		t.Fatalf("obtain Rivet engine %s: %v\n%s", engineTag, err, engineRemediation())
+	}
+	engine := startEngine(t, engineBinary)
+	runner := startNativeRunner(t, engine.endpoint, "rivet-go-disconnect")
+	defer runner.Close()
+	waitForNativeEvent(t, runner, wire.EventRunnerConnected, 5*time.Second)
+
+	started := time.Now()
+	if err := engine.command.Process.Kill(); err != nil {
+		t.Fatalf("kill engine: %v", err)
+	}
+	_, disconnected := waitForNativeEvent(t, runner, wire.EventRunnerDisconnected, disconnectLivenessWindow)
+	if disconnected.Reason == "" {
+		t.Fatal("RunnerDisconnected has an empty reason")
+	}
+	if elapsed := time.Since(started); elapsed > disconnectLivenessWindow {
+		t.Fatalf("RunnerDisconnected arrived after %s, liveness window is %s", elapsed, disconnectLivenessWindow)
+	}
+	if err := runner.Shutdown(2 * time.Second); err != nil {
+		t.Fatalf("Shutdown after disconnect: %v", err)
+	}
+	waitForNativeEvent(t, runner, wire.EventRunnerStopped, 5*time.Second)
+}
+
 func acquireEngine(ctx context.Context) (string, error) {
 	if override := os.Getenv("RIVET_GO_ENGINE_BIN"); override != "" {
-		return verifyExecutable(override)
+		return verifyEngineBinary(ctx, override)
 	}
 	home, err := os.UserHomeDir()
 	if err != nil {
@@ -133,52 +288,14 @@ func acquireEngine(ctx context.Context) (string, error) {
 	}
 	cache := filepath.Join(home, ".cache", "rivet-go", "engine-"+engineTag)
 	binary := filepath.Join(cache, executableName("rivet-engine"))
-	if path, err := verifyExecutable(binary); err == nil {
+	if path, err := verifyEngineBinary(ctx, binary); err == nil {
 		return path, nil
 	}
 	if err := os.MkdirAll(cache, 0o755); err != nil {
 		return "", fmt.Errorf("create engine cache: %w", err)
 	}
 
-	if downloaded, err := downloadPinnedEngine(ctx, cache); err == nil {
-		return downloaded, nil
-	}
 	return buildPinnedEngine(ctx, cache)
-}
-
-func downloadPinnedEngine(ctx context.Context, cache string) (string, error) {
-	artifact, err := engineArtifactName()
-	if err != nil {
-		return "", err
-	}
-	base := "https://releases.rivet.dev/rivet/" + engineVersion + "/engine/"
-	client := &http.Client{Timeout: 60 * time.Second}
-	manifest, err := fetch(ctx, client, base+"SHA256SUMS")
-	if err != nil {
-		return "", err
-	}
-	expected := checksumFor(manifest, artifact)
-	if expected == "" {
-		return "", fmt.Errorf("prebuilt manifest has no %s", artifact)
-	}
-	data, err := fetch(ctx, client, base+artifact)
-	if err != nil {
-		return "", err
-	}
-	digest := sha256.Sum256(data)
-	actual := hex.EncodeToString(digest[:])
-	if !strings.EqualFold(actual, expected) {
-		return "", fmt.Errorf("prebuilt checksum mismatch: got %s, want %s", actual, expected)
-	}
-	temporary := filepath.Join(cache, artifact+".tmp")
-	if err := os.WriteFile(temporary, data, 0o755); err != nil {
-		return "", fmt.Errorf("write downloaded engine: %w", err)
-	}
-	destination := filepath.Join(cache, executableName("rivet-engine"))
-	if err := os.Rename(temporary, destination); err != nil {
-		return "", fmt.Errorf("install downloaded engine: %w", err)
-	}
-	return verifyExecutable(destination)
 }
 
 func buildPinnedEngine(ctx context.Context, cache string) (string, error) {
@@ -227,7 +344,7 @@ func buildPinnedEngine(ctx context.Context, cache string) (string, error) {
 	if err := os.WriteFile(destination, data, 0o755); err != nil {
 		return "", fmt.Errorf("cache built engine: %w", err)
 	}
-	return verifyExecutable(destination)
+	return verifyEngineBinary(ctx, destination)
 }
 
 func startEngine(t *testing.T, binary string) *runningEngine {
@@ -358,50 +475,6 @@ func portsAvailable(ports ...int) bool {
 	return true
 }
 
-func fetch(ctx context.Context, client *http.Client, url string) ([]byte, error) {
-	request, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-	if err != nil {
-		return nil, err
-	}
-	response, err := client.Do(request)
-	if err != nil {
-		return nil, err
-	}
-	defer response.Body.Close()
-	if response.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("GET %s returned %s", url, response.Status)
-	}
-	return io.ReadAll(response.Body)
-}
-
-func checksumFor(manifest []byte, artifact string) string {
-	scanner := bufio.NewScanner(bytes.NewReader(manifest))
-	for scanner.Scan() {
-		fields := strings.Fields(scanner.Text())
-		if len(fields) == 2 && strings.TrimPrefix(fields[1], "*") == artifact {
-			return fields[0]
-		}
-	}
-	return ""
-}
-
-func engineArtifactName() (string, error) {
-	arch := map[string]string{"amd64": "x86_64", "arm64": "aarch64"}[runtime.GOARCH]
-	if arch == "" {
-		return "", fmt.Errorf("no engine prebuilt naming rule for %s/%s", runtime.GOOS, runtime.GOARCH)
-	}
-	var target string
-	switch runtime.GOOS {
-	case "darwin":
-		target = arch + "-apple-darwin"
-	case "linux":
-		target = arch + "-unknown-linux-musl"
-	default:
-		return "", fmt.Errorf("no engine prebuilt naming rule for %s/%s", runtime.GOOS, runtime.GOARCH)
-	}
-	return "rivet-engine-" + target, nil
-}
-
 func verifyExecutable(path string) (string, error) {
 	info, err := os.Stat(path)
 	if err != nil {
@@ -442,4 +515,191 @@ func tail(data []byte, lines int) string {
 func engineRemediation() string {
 	return "Set RIVET_GO_ENGINE_BIN to a v2.3.10 rivet-engine binary, or install git + Rust and retry. " +
 		"The automatic fallback clones tag v2.3.10 and runs `cargo build -p rivet-engine --release`; see conformance/README.md."
+}
+
+// silentEndpoint returns a URL whose listener accepts connections but never
+// responds, forcing rk_runner_new to hit its startup deadline.
+func silentEndpoint(t *testing.T) string {
+	t.Helper()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	var (
+		mu    sync.Mutex
+		conns []net.Conn
+	)
+	go func() {
+		for {
+			conn, acceptErr := listener.Accept()
+			if acceptErr != nil {
+				return
+			}
+			mu.Lock()
+			conns = append(conns, conn)
+			mu.Unlock()
+		}
+	}()
+	t.Cleanup(func() {
+		listener.Close()
+		mu.Lock()
+		defer mu.Unlock()
+		for _, conn := range conns {
+			conn.Close()
+		}
+	})
+	return "http://" + listener.Addr().String()
+}
+
+// closedEndpoint returns a URL for a port that was just released, so
+// connections are refused.
+func closedEndpoint(t *testing.T) string {
+	t.Helper()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	endpoint := "http://" + listener.Addr().String()
+	if err := listener.Close(); err != nil {
+		t.Fatalf("release port: %v", err)
+	}
+	return endpoint
+}
+
+// nonEngineEndpoint returns a live HTTP server that is not a Rivet engine.
+func nonEngineEndpoint(t *testing.T) string {
+	t.Helper()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "not a rivet engine", http.StatusNotFound)
+	}))
+	t.Cleanup(server.Close)
+	return server.URL
+}
+
+func expectRunnerNewError(t *testing.T, endpoint string) ffi.ErrorPayload {
+	t.Helper()
+	config, err := wire.EncodeRunnerConfig(wire.RunnerConfig{
+		EngineEndpoint: endpoint,
+		Namespace:      "default",
+		RunnerName:     "rivet-go-error-probe",
+		Version:        1,
+		TotalSlots:     1,
+		ActorNames:     []string{},
+		LogLevel:       "error",
+	})
+	if err != nil {
+		t.Fatalf("encode config: %v", err)
+	}
+	result, err := ffi.NewRunner(config)
+	if err != nil {
+		t.Fatalf("invoke rk_runner_new: %v", err)
+	}
+	if result.Runner != nil {
+		result.Runner.Close()
+		t.Fatalf("rk_runner_new against %s returned a runner, want error", endpoint)
+	}
+	if result.Error == nil {
+		t.Fatal("rk_runner_new returned neither runner nor error")
+	}
+	defer result.Error.Close()
+	payload, err := result.Error.Payload()
+	if err != nil {
+		t.Fatalf("decode rk_runner_new error: %v", err)
+	}
+	return payload
+}
+
+func startNativeRunner(t *testing.T, endpoint, name string) *ffi.Runner {
+	t.Helper()
+	config, err := wire.EncodeRunnerConfig(wire.RunnerConfig{
+		EngineEndpoint: endpoint,
+		Namespace:      "default",
+		RunnerName:     name,
+		Version:        1,
+		TotalSlots:     1,
+		ActorNames:     []string{},
+		LogLevel:       "error",
+	})
+	if err != nil {
+		t.Fatalf("encode config: %v", err)
+	}
+	result, err := ffi.NewRunner(config)
+	if err != nil {
+		t.Fatalf("invoke rk_runner_new: %v", err)
+	}
+	if result.Error != nil {
+		defer result.Error.Close()
+		payload, decodeErr := result.Error.Payload()
+		if decodeErr != nil {
+			t.Fatalf("start native runner: decode error: %v", decodeErr)
+		}
+		t.Fatalf("start native runner: %v", payload)
+	}
+	if result.Runner == nil {
+		t.Fatal("rk_runner_new returned neither runner nor error")
+	}
+	t.Cleanup(result.Runner.Close)
+	return result.Runner
+}
+
+// waitForNativeEvent polls until an event of the wanted kind arrives and
+// returns it with its enclosing batch.
+func waitForNativeEvent(t *testing.T, runner *ffi.Runner, kind wire.EventKind, timeout time.Duration) (wire.EventBatch, wire.Event) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			t.Fatalf("no %s event within %s", kind, timeout)
+		}
+		pollTimeout := remaining
+		if pollTimeout > 500*time.Millisecond {
+			pollTimeout = 500 * time.Millisecond
+		}
+		data, err := runner.Poll(pollTimeout)
+		if err != nil {
+			t.Fatalf("poll while waiting for %s: %v", kind, err)
+		}
+		if len(data) == 0 {
+			continue
+		}
+		batch, err := wire.DecodeEventBatch(data)
+		if err != nil {
+			t.Fatalf("decode poll batch: %v", err)
+		}
+		for _, event := range batch.Events {
+			if event.Kind == kind {
+				return batch, event
+			}
+		}
+	}
+}
+
+func nativeErrorCode(err error) string {
+	var payload ffi.ErrorPayload
+	if errors.As(err, &payload) {
+		return payload.Code
+	}
+	return ""
+}
+
+// verifyEngineBinary checks that path is executable and reports exactly the
+// pinned engine version and commit.
+func verifyEngineBinary(ctx context.Context, path string) (string, error) {
+	path, err := verifyExecutable(path)
+	if err != nil {
+		return "", err
+	}
+	output, err := exec.CommandContext(ctx, path, "--version").CombinedOutput()
+	if err != nil {
+		return "", fmt.Errorf("%s --version: %w: %s", path, err, tail(output, 5))
+	}
+	text := string(output)
+	if !strings.Contains(text, engineVersion) {
+		return "", fmt.Errorf("%s reports %q, want version %s", path, strings.TrimSpace(text), engineVersion)
+	}
+	if !strings.Contains(text, engineCommit) {
+		return "", fmt.Errorf("%s reports %q, want commit %s", path, strings.TrimSpace(text), engineCommit)
+	}
+	return path, nil
 }

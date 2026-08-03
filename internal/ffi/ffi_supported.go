@@ -80,6 +80,7 @@ type Runner struct {
 
 // Error is an owned structured native error handle.
 type Error struct {
+	mu   sync.RWMutex
 	ptr  *cError
 	once sync.Once
 }
@@ -258,6 +259,9 @@ func (r *Runner) Poll(timeout time.Duration) ([]byte, error) {
 	}
 	result := api.runnerPoll(r.ptr, durationMillis(timeout))
 	runtime.KeepAlive(r)
+	if result.payload.ptr != nil {
+		defer api.bytesFree(result.payload)
+	}
 	if result.err != nil {
 		return nil, consumeNativeError(result.err)
 	}
@@ -267,7 +271,6 @@ func (r *Runner) Poll(timeout time.Duration) ([]byte, error) {
 		}
 		return nil, errors.New("native poll returned a nil pointer with non-zero length")
 	}
-	defer api.bytesFree(result.payload)
 	return append([]byte(nil), unsafe.Slice(result.payload.ptr, result.payload.len)...), nil
 }
 
@@ -336,7 +339,12 @@ func consumeNativeError(ptr *cError) error {
 
 // JSON copies the native error's JSON representation into Go memory.
 func (e *Error) JSON() ([]byte, error) {
-	if e == nil || e.ptr == nil {
+	if e == nil {
+		return nil, errors.New("native error is closed")
+	}
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	if e.ptr == nil {
 		return nil, errors.New("native error is closed")
 	}
 	bytes := api.errorJSON(e.ptr)
@@ -371,6 +379,8 @@ func (e *Error) Close() {
 	}
 	e.once.Do(func() {
 		runtime.SetFinalizer(e, nil)
+		e.mu.Lock()
+		defer e.mu.Unlock()
 		if e.ptr != nil {
 			api.errorFree(e.ptr)
 			e.ptr = nil

@@ -2,6 +2,7 @@ package pump
 
 import (
 	"context"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -19,6 +20,9 @@ type fakeRunner struct {
 	polls        atomic.Int32
 	maxPolls     atomic.Int32
 	commandCount atomic.Int64
+	nextSeq      atomic.Uint64
+	stoppedPoll  atomic.Bool
+	closeEarly   atomic.Bool
 }
 
 func newFakeRunner() *fakeRunner {
@@ -39,9 +43,17 @@ func (r *fakeRunner) Poll(timeout time.Duration) ([]byte, error) {
 	}
 	select {
 	case event := <-r.events:
+		var batch wire.EventBatch
+		if err := decodeEventBatch(event, &batch); err == nil {
+			for _, item := range batch.Events {
+				if item.Kind == wire.EventRunnerStopped {
+					r.stoppedPoll.Store(true)
+				}
+			}
+		}
 		return event, nil
 	case <-time.After(timeout):
-		return encodeEventBatch(0), nil
+		return encodeEventBatch(r.nextSeq.Add(1)), nil
 	}
 }
 
@@ -55,7 +67,7 @@ func (r *fakeRunner) Submit(data []byte) error {
 }
 
 func (r *fakeRunner) Shutdown(time.Duration) error {
-	r.events <- encodeEventBatch(1, wire.Event{
+	r.events <- encodeEventBatch(r.nextSeq.Add(1), wire.Event{
 		Kind: wire.EventRunnerStopped,
 		DrainReport: &wire.DrainReport{
 			Graceful: true,
@@ -65,6 +77,9 @@ func (r *fakeRunner) Shutdown(time.Duration) error {
 }
 
 func (r *fakeRunner) Close() {
+	if !r.stoppedPoll.Load() {
+		r.closeEarly.Store(true)
+	}
 	r.closeOnce.Do(func() { close(r.closed) })
 }
 
@@ -109,6 +124,9 @@ func TestConcurrentSubmittersAndCleanShutdown(t *testing.T) {
 	}
 	if runner.maxPolls.Load() != 1 {
 		t.Fatalf("maximum concurrent polls = %d, want 1", runner.maxPolls.Load())
+	}
+	if runner.closeEarly.Load() {
+		t.Fatal("runner closed before the pump polled RunnerStopped")
 	}
 	select {
 	case <-runner.closed:
@@ -159,6 +177,18 @@ func TestRunRejectsSecondStart(t *testing.T) {
 	}
 }
 
+func TestRejectsNonMonotonicSequence(t *testing.T) {
+	runner := newFakeRunner()
+	p := New(runner)
+	runner.events <- encodeEventBatch(2)
+	runner.events <- encodeEventBatch(2)
+
+	result := p.Run(context.Background())
+	if result == nil || !strings.Contains(result.Error(), "non-monotonic event batch sequence") {
+		t.Fatalf("Run error = %v, want non-monotonic sequence error", result)
+	}
+}
+
 func encodeEventBatch(seq uint64, events ...wire.Event) []byte {
 	data, err := msgpack.Marshal(wire.EventBatch{Seq: seq, Events: events})
 	if err != nil {
@@ -168,5 +198,9 @@ func encodeEventBatch(seq uint64, events ...wire.Event) []byte {
 }
 
 func decodeCommandBatch(data []byte, batch *wire.CommandBatch) error {
+	return msgpack.Unmarshal(data, batch)
+}
+
+func decodeEventBatch(data []byte, batch *wire.EventBatch) error {
 	return msgpack.Unmarshal(data, batch)
 }
