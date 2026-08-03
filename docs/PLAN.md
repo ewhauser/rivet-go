@@ -196,7 +196,7 @@ returns a clear error at `rivet.Serve`.
 |---|---|---|---|
 | M0 | Skeleton: FFI crate builds against pinned rivet tag; purego loader loads it; `runner_version()` round-trip; CI matrix green | `go test ./internal/ffi` passes on all 6 targets | 1 wk |
 | M1 | Pump + registration: `runner_new` dials local engine, `ToServerInit` sent, runner visible to engine; poll/submit loop with correlation | Conformance: engine lists the runner | 1 wk |
-| M2 | Actor lifecycle: start/stop events → Go handlers; state load/save via core KV; actor survives restart with state intact | Conformance: counter actor persists across engine restart | 1–2 wk |
+| M2 | Actor lifecycle: start/stop events → Go handlers; explicit state load/save via core; actor survives restart with state intact | Conformance: counter actor persists across engine restart | 1–2 wk |
 | M3 | Actions + HTTP tunnel: `http.Handler` bridge, request/response streaming | Conformance: client curl → actor action round-trip | 1–2 wk |
 | M4 | WebSockets + events: connection objects, broadcast, message acks | Conformance: two WS clients see each other's broadcasts | 1–2 wk |
 | M5 | Scheduling + sleep: alarms, sleep/wake, hibernating WS (`canHibernate`) | Conformance: alarm fires after actor slept; WS survives hibernation | 2 wk |
@@ -268,7 +268,9 @@ M2 resolves the state-persistence question against the pinned core source.
 and `ActorStart.snapshot` supplies the last persisted actor-state bytes.
 Accordingly, the Go API exposes `Context.Save(ctx)` rather than an implicit
 save-on-hook-return policy. The FFI keeps the planned `SaveState` command and
-`StatePersisted` completion event.
+`StatePersisted` completion event. A missing snapshot and a persisted
+zero-length snapshot remain distinct across the boundary, so a custom
+`encoding.BinaryUnmarshaler` can handle an intentionally empty state.
 
 Core stores actor state and its public actor KV surface in the actor's internal
 SQLite database. The Go adapter selects core's supported `sqlite-remote`
@@ -278,13 +280,24 @@ build and is not part of the Go SDK's prebuilt-library contract. This remains
 core-backed persistence and is verified across an actual engine process
 restart using the same filesystem data directory.
 
-The restart conformance drains the first runner generation, waits for the Go
-`OnStop` observation, kills and restarts the pinned engine, then registers a
-fresh runner in the same pool. The persisted `GoingAway` transition reallocates
-the same actor ID with a new generation; its `OnStart` observes the saved
-counter value. Fresh registration attempts are bounded because the pinned
-filesystem engine performs asynchronous workflow failover after process
-restart. Assertions use management API state and Go hook observations only.
+The restart conformance kills the engine process while the actor is live and
+keeps the runner transport reconnecting. With the engine still unavailable it
+requires the old actor generation's `OnStop`, proving that the first Go actor
+worker and its in-memory typed state are gone. It then launches a distinct
+engine process against the same filesystem data directory, waits for the
+persisted actor workflow to enter its sleeping/lost state, and wakes it through
+the public gateway path. A higher-generation `ActorStart` must deliver the
+saved counter to a custom `encoding.BinaryUnmarshaler`; no Go-side cache or
+pre-restart observation can satisfy that assertion.
+
+Accepted state saves are fenced ahead of `ActorStopResult` on both sides of the
+boundary. Go stops admitting actor-scoped work and waits for accepted saves;
+Rust reserves each state operation before dispatch and does not resolve the
+stop lifecycle reply until those operations finish. Core state saves time out
+after 30 seconds with a structured completion, while the Go acknowledgement
+backstop is 35 seconds. A caller cancellation leaves the save correlation
+poisoned only until its late acknowledgement is consumed, preventing ID/result
+misassociation without permanently disabling later saves.
 
 The remaining pin-specific lifecycle mappings are documented in
 [FFI-BOUNDARY.md](FFI-BOUNDARY.md). Actions, HTTP, WebSockets, alarms, and sleep

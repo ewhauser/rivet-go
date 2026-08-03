@@ -98,7 +98,7 @@ instance ID, `gen` = generation; both assigned by core.
 | `RunnerConnected` | runner_id, engine metadata | — |
 | `RunnerDisconnected` | reason; core auto-reconnects | — |
 | `RunnerStopped` | drain report | — (pump exits) |
-| `ActorStart` | aid, gen, name, key, create_ts, input, persisted_state | `ActorStartResult { aid, gen, ok / error }` |
+| `ActorStart` | aid, gen, name, key, create_ts, input, persisted_state (optional; absent differs from present-empty) | `ActorStartResult { aid, gen, ok / error }` |
 | `ActorStop` | aid, gen, reason (stop cmd / sleep intent / drain) | `ActorStopResult { aid, gen }` after handler cleanup |
 | `ActorAlarm` | aid, gen, alarm_ts | `AlarmHandled { aid, gen }` |
 | `ActionCall` | aid, gen, call_id, action name, args (raw bytes: JSON/CBOR per client encoding), conn_id | `ActionResult { call_id, output / error }` |
@@ -197,6 +197,11 @@ batch is rejected as `unknown_command` before enqueue.
 
 ## M2 pin-specific notes — 2026-08-03
 
+M2 expands the event and command unions and therefore bumps the boundary ABI
+to 2. `RK_ABI_VERSION` in Rust is the source of truth; cbindgen writes it to the
+committed header, and `scripts/build-ffi.sh` derives Go's generated
+`ExpectedABIVersion` from that header. The loader rejects every other value.
+
 Open question 1 is resolved: core supports explicit state persistence. The
 adapter maps `SaveState { aid, gen, state }` to
 `ActorContext::save_state(vec![StateDelta::ActorState(state)])` and emits
@@ -222,16 +227,35 @@ at `v2.3.10` is:
   recoverable at this trait boundary.
 
 `ActorStopResult` has an optional structured error arm. A Go `OnStop` error or
-panic is returned through core's lifecycle reply and reaches the engine's
-`StopCode::Error` path; a successful result retains the cataloged no-payload
-shape. The same structured-error convention applies to `ActorStartResult`.
+panic is returned through core's lifecycle reply and the actor factory's
+structured failure path; a successful result retains the cataloged no-payload
+shape. At `v2.3.10`, a destroy already requested through the management API
+still completes as destroyed even when the graceful-cleanup hook fails, so the
+engine-visible assertion is the stopped/destroyed actor plus continued runner
+health. The precise `handler_panic` arm is asserted at the FFI command boundary.
+The same structured-error convention applies to `ActorStartResult`, whose
+startup failure is retained by the engine as the actor error.
+
+State-save completion is bounded and ordered. Rust reserves a save before
+spawning its core future, rejects new saves once stop acknowledgement begins,
+times the core future out after 30 seconds, and waits for every reserved save
+before resolving `ActorStopResult`. Go waits up to 35 seconds for
+`StatePersisted`, returns context cancellation/deadline as a structured actor
+error, and consumes a late completion before allowing another save for that
+actor generation. Pending KV callers are woken on actor stop and runner free.
+
+`ActorStart.persisted_state` is encoded as an optional byte string. `None`
+means the actor has no prior state; `Some([])` means a zero-length state was
+persisted and must be passed to a custom decoder. Go's copy helpers preserve
+that distinction.
 
 The public actor KV methods at this pin are deprecated in name but still
 supported and backed by the actor SQLite database. `KvGet`, `KvList`, `KvPut`,
 and `KvDelete` therefore map directly to `ActorContext::kv()`. KV list requests
 and results are capped at 1024 entries. The Go MessagePack shape scanner uses
 the same 1024-entry array ceiling; its remaining-bytes rule remains the primary
-allocation guard.
+allocation guard. KV correlation IDs start at 1, skip zero and every live ID on
+wrap, and may be reused only after completion.
 
 State and KV use core's `sqlite-remote` feature with
 `ActorConfig.remote_sqlite = true`, which executes storage through the
