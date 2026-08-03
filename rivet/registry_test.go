@@ -22,7 +22,10 @@ func TestConfigDefaults(t *testing.T) {
 
 func TestRegisterBuildsSortedManifestAndRejectsDuplicates(t *testing.T) {
 	registry := NewRegistry()
-	if err := Register(registry, "zeta", Actor[struct{}]{}); err != nil {
+	if err := Register(registry, "zeta", Actor[struct{}]{Actions: Actions[struct{}]{
+		"z": Action(func(*Context[struct{}], struct{}) (struct{}, error) { return struct{}{}, nil }),
+		"a": Action(func(*Context[struct{}], struct{}) (struct{}, error) { return struct{}{}, nil }),
+	}}); err != nil {
 		t.Fatalf("Register zeta: %v", err)
 	}
 	if err := Register(registry, "alpha", Actor[int]{}); err != nil {
@@ -31,12 +34,31 @@ func TestRegisterBuildsSortedManifestAndRejectsDuplicates(t *testing.T) {
 	if err := Register(registry, "alpha", Actor[int]{}); err == nil {
 		t.Fatal("duplicate Register succeeded")
 	}
-	names, handlers := registry.snapshotActors()
+	names, actions, handlers := registry.snapshotActors()
 	if !reflect.DeepEqual(names, []string{"alpha", "zeta"}) {
 		t.Fatalf("actor names = %#v", names)
 	}
 	if len(handlers) != 2 || handlers["alpha"] == nil || handlers["zeta"] == nil {
 		t.Fatalf("actor handlers = %#v", handlers)
+	}
+	if len(actions) != 2 || !reflect.DeepEqual(actions["zeta"], []string{"a", "z"}) {
+		t.Fatalf("actor action manifests = %#v", actions)
+	}
+}
+
+func TestRegisterRejectsInvalidActionManifest(t *testing.T) {
+	if err := Register(NewRegistry(), "counter", Actor[struct{}]{
+		Actions: Actions[struct{}]{" ": Action(func(*Context[struct{}], struct{}) (struct{}, error) {
+			return struct{}{}, nil
+		})},
+	}); err == nil || !strings.Contains(err.Error(), "action names must not be empty") {
+		t.Fatalf("empty action name error = %v", err)
+	}
+
+	if err := Register(NewRegistry(), "counter", Actor[struct{}]{
+		Actions: Actions[struct{}]{"increment": nil},
+	}); err == nil || !strings.Contains(err.Error(), "nil handler") {
+		t.Fatalf("nil action handler error = %v", err)
 	}
 }
 

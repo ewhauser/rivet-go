@@ -6,17 +6,20 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
+	"strings"
 	"sync"
 
 	"github.com/ewhauser/rivet-go/internal/pump"
 	"github.com/ewhauser/rivet-go/internal/wire"
 )
 
-// Actor defines the M2 lifecycle hooks for typed actor state. Actions and
-// transports are added in later milestones.
+// Actor defines typed state, lifecycle hooks, actions, and raw HTTP handling.
 type Actor[T any] struct {
 	OnStart func(*Context[T]) error
 	OnStop  func(*Context[T]) error
+	Actions Actions[T]
+	OnFetch func(*Context[T], http.ResponseWriter, *http.Request)
 }
 
 // Context is one live actor generation. State returns the generation-local
@@ -81,6 +84,14 @@ type actorAdapter[T any] struct {
 	definition Actor[T]
 }
 
+func (a *actorAdapter[T]) actionNames() []string {
+	names := make([]string, 0, len(a.definition.Actions))
+	for name := range a.definition.Actions {
+		names = append(names, name)
+	}
+	return names
+}
+
 func (a *actorAdapter[T]) Start(
 	_ context.Context,
 	session *pump.ActorSession,
@@ -113,6 +124,75 @@ func (a *actorAdapter[T]) Stop(
 		return nil
 	}
 	return a.definition.OnStop(actorContext)
+}
+
+func (a *actorAdapter[T]) Action(
+	ctx context.Context,
+	_ *pump.ActorSession,
+	event wire.Event,
+	state any,
+) ([]byte, error) {
+	actorContext, ok := state.(*Context[T])
+	if !ok || actorContext == nil {
+		return nil, errors.New("typed actor context is unavailable during action")
+	}
+	action := a.definition.Actions[event.Action]
+	if action == nil {
+		return nil, pump.HandlerError{
+			Code:    "action_not_found",
+			Message: fmt.Sprintf("action %q is not registered", event.Action),
+		}
+	}
+	output, err := action.invoke(ctx, actorContext, event.Args)
+	if err != nil {
+		return nil, err
+	}
+	if err := actorContext.Save(ctx); err != nil {
+		return nil, pump.HandlerError{
+			Code:    "action_state_persist_failed",
+			Message: err.Error(),
+		}
+	}
+	return output, nil
+}
+
+func (a *actorAdapter[T]) Fetch(
+	_ context.Context,
+	session *pump.ActorSession,
+	event wire.Event,
+	state any,
+) error {
+	actorContext, ok := state.(*Context[T])
+	if !ok || actorContext == nil {
+		return errors.New("typed actor context is unavailable during fetch")
+	}
+	if a.definition.OnFetch == nil {
+		return pump.HandlerError{Code: "callback_not_found", Message: "actor has no OnFetch handler"}
+	}
+	incoming, err := session.HTTPRequest(event)
+	if err != nil {
+		return err
+	}
+	request, err := http.NewRequestWithContext(
+		incoming.Context,
+		incoming.Method,
+		incoming.Path,
+		incoming.Body,
+	)
+	if err != nil {
+		return fmt.Errorf("build actor HTTP request: %w", err)
+	}
+	request.RequestURI = incoming.Path
+	for name, value := range incoming.Headers {
+		if strings.EqualFold(name, "host") {
+			request.Host = value
+			continue
+		}
+		request.Header.Set(name, value)
+	}
+	writer := newResponseWriter(session, event.RequestID, incoming.Context)
+	a.definition.OnFetch(actorContext, writer, request)
+	return writer.finish()
 }
 
 func decodeState[T any](data []byte) (T, error) {

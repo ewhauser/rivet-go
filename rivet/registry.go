@@ -46,7 +46,7 @@ func NewRegistry() *Registry {
 
 // Register adds one typed actor definition to registry. Registrations are
 // immutable while Serve is running so the engine manifest and Go dispatcher
-// always describe the same set of actor names.
+// always describe the same actor names and actions.
 func Register[T any](registry *Registry, name string, actor Actor[T]) error {
 	if registry == nil {
 		return errors.New("rivet registry is nil")
@@ -56,6 +56,17 @@ func Register[T any](registry *Registry, name string, actor Actor[T]) error {
 	}
 	if registry.serving.Load() {
 		return errors.New("cannot register an actor while registry is serving")
+	}
+	if len(actor.Actions) > 1_024 {
+		return fmt.Errorf("actor %q must contain at most 1024 actions", name)
+	}
+	for actionName, handler := range actor.Actions {
+		if strings.TrimSpace(actionName) == "" {
+			return fmt.Errorf("actor %q action names must not be empty", name)
+		}
+		if handler == nil {
+			return fmt.Errorf("actor %q action %q has a nil handler", name, actionName)
+		}
 	}
 	registry.mu.Lock()
 	defer registry.mu.Unlock()
@@ -84,7 +95,7 @@ func (r *Registry) Serve(ctx context.Context, config Config) error {
 	}
 	defer r.serving.Store(false)
 
-	actorNames, handlers := r.snapshotActors()
+	actorNames, actorActions, handlers := r.snapshotActors()
 	config = withDefaults(config)
 	encoded, err := wire.EncodeRunnerConfig(wire.RunnerConfig{
 		EngineEndpoint: config.Endpoint,
@@ -93,6 +104,7 @@ func (r *Registry) Serve(ctx context.Context, config Config) error {
 		Version:        config.Version,
 		TotalSlots:     config.TotalSlots,
 		ActorNames:     actorNames,
+		ActorActions:   actorActions,
 		LogLevel:       config.LogLevel,
 	})
 	if err != nil {
@@ -117,17 +129,27 @@ func (r *Registry) Serve(ctx context.Context, config Config) error {
 	return pump.NewWithHandlers(result.Runner, handlers).Run(ctx)
 }
 
-func (r *Registry) snapshotActors() ([]string, map[string]pump.ActorHandler) {
+func (r *Registry) snapshotActors() (
+	[]string,
+	map[string][]string,
+	map[string]pump.ActorHandler,
+) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	names := make([]string, 0, len(r.actors))
 	handlers := make(map[string]pump.ActorHandler, len(r.actors))
+	actions := make(map[string][]string, len(r.actors))
 	for name, handler := range r.actors {
 		names = append(names, name)
 		handlers[name] = handler
+		if definition, ok := handler.(interface{ actionNames() []string }); ok {
+			actionNames := definition.actionNames()
+			sort.Strings(actionNames)
+			actions[name] = actionNames
+		}
 	}
 	sort.Strings(names)
-	return names, handlers
+	return names, actions, handlers
 }
 
 func withDefaults(config Config) Config {

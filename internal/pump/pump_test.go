@@ -3,6 +3,7 @@ package pump
 import (
 	"context"
 	"errors"
+	"io"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -25,6 +26,32 @@ type fakeRunner struct {
 	stoppedPoll  atomic.Bool
 	closeEarly   atomic.Bool
 	submitted    chan wire.Command
+}
+
+type retryRunner struct {
+	*fakeRunner
+	remaining atomic.Int32
+	attempts  atomic.Int32
+}
+
+type codedTestError struct {
+	code string
+}
+
+func (e codedTestError) Error() string     { return e.code }
+func (e codedTestError) ErrorCode() string { return e.code }
+
+func (r *retryRunner) Submit(data []byte) error {
+	r.attempts.Add(1)
+	for {
+		remaining := r.remaining.Load()
+		if remaining == 0 {
+			return r.fakeRunner.Submit(data)
+		}
+		if r.remaining.CompareAndSwap(remaining, remaining-1) {
+			return codedTestError{code: "backpressure"}
+		}
+	}
 }
 
 func newFakeRunner() *fakeRunner {
@@ -202,6 +229,30 @@ func TestRejectsNonMonotonicSequence(t *testing.T) {
 type lifecycleHandler struct {
 	start func(context.Context, *ActorSession, wire.Event) (any, error)
 	stop  func(context.Context, *ActorSession, wire.Event, any) error
+}
+
+type dispatchHandler struct {
+	lifecycleHandler
+	action func(context.Context, *ActorSession, wire.Event, any) ([]byte, error)
+	fetch  func(context.Context, *ActorSession, wire.Event, any) error
+}
+
+func (h dispatchHandler) Action(
+	ctx context.Context,
+	session *ActorSession,
+	event wire.Event,
+	state any,
+) ([]byte, error) {
+	return h.action(ctx, session, event, state)
+}
+
+func (h dispatchHandler) Fetch(
+	ctx context.Context,
+	session *ActorSession,
+	event wire.Event,
+	state any,
+) error {
+	return h.fetch(ctx, session, event, state)
 }
 
 func (h lifecycleHandler) Start(ctx context.Context, session *ActorSession, event wire.Event) (any, error) {
@@ -875,6 +926,307 @@ func TestKVIDSkipsZeroAndReusesOnlyCompletedID(t *testing.T) {
 	cancel()
 	if err := <-result; err != nil {
 		t.Fatalf("Run: %v", err)
+	}
+}
+
+func TestActionsAreActorLocalOrderedAndPanicContained(t *testing.T) {
+	runner := newFakeRunner()
+	slowRelease := make(chan struct{})
+	seenSlow := make(chan string, 2)
+	handlers := map[string]ActorHandler{
+		"slow": dispatchHandler{
+			action: func(_ context.Context, _ *ActorSession, event wire.Event, _ any) ([]byte, error) {
+				seenSlow <- event.Action
+				if event.Action == "first" {
+					<-slowRelease
+				}
+				return []byte(event.Action), nil
+			},
+		},
+		"fast": dispatchHandler{
+			action: func(_ context.Context, _ *ActorSession, event wire.Event, _ any) ([]byte, error) {
+				return []byte(event.Action), nil
+			},
+		},
+		"panic": dispatchHandler{
+			action: func(context.Context, *ActorSession, wire.Event, any) ([]byte, error) {
+				panic("action boom")
+			},
+		},
+	}
+	p := NewWithHandlers(runner, handlers)
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() { result <- p.Run(ctx) }()
+	waitPumpStarted(t, p)
+
+	runner.emit(
+		wire.Event{Kind: wire.EventActorStart, AID: "slow-aid", Generation: 1, Name: "slow"},
+		wire.Event{Kind: wire.EventActorStart, AID: "fast-aid", Generation: 1, Name: "fast"},
+		wire.Event{Kind: wire.EventActorStart, AID: "panic-aid", Generation: 1, Name: "panic"},
+	)
+	for range 3 {
+		if command := nextCommand(t, runner); command.Kind != wire.CommandActorStartResult {
+			t.Fatalf("start command kind = %q", command.Kind)
+		}
+	}
+	runner.emit(
+		wire.Event{Kind: wire.EventActionCall, AID: "slow-aid", Generation: 1, CallID: 1, Action: "first"},
+		wire.Event{Kind: wire.EventActionCall, AID: "slow-aid", Generation: 1, CallID: 2, Action: "second"},
+		wire.Event{Kind: wire.EventActionCall, AID: "fast-aid", Generation: 1, CallID: 3, Action: "fast"},
+		wire.Event{Kind: wire.EventActionCall, AID: "panic-aid", Generation: 1, CallID: 4, Action: "panic"},
+	)
+
+	first := nextCommand(t, runner)
+	second := nextCommand(t, runner)
+	commands := map[uint64]wire.Command{first.CallID: first, second.CallID: second}
+	if command := commands[3]; command.Kind != wire.CommandActionResult || string(command.Output) != "fast" {
+		t.Fatalf("fast action result = %#v", command)
+	}
+	if command := commands[4]; command.Error == nil || command.Error.Code != "handler_panic" {
+		t.Fatalf("panic action result = %#v", command)
+	}
+	select {
+	case action := <-seenSlow:
+		if action != "first" {
+			t.Fatalf("first slow action = %q", action)
+		}
+	default:
+		t.Fatal("slow action did not start")
+	}
+	select {
+	case action := <-seenSlow:
+		t.Fatalf("second slow action ran before first completed: %q", action)
+	default:
+	}
+	close(slowRelease)
+	if command := nextCommand(t, runner); command.CallID != 1 {
+		t.Fatalf("first slow result = %#v", command)
+	}
+	if action := <-seenSlow; action != "second" {
+		t.Fatalf("second slow action = %q", action)
+	}
+	if command := nextCommand(t, runner); command.CallID != 2 {
+		t.Fatalf("second slow result = %#v", command)
+	}
+
+	cancel()
+	if err := <-result; err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+}
+
+func TestHTTPRequestChunksFeedBodyAndResponsesSubmitFromHandler(t *testing.T) {
+	runner := newFakeRunner()
+	requestObserved := make(chan string, 1)
+	handler := dispatchHandler{
+		fetch: func(_ context.Context, session *ActorSession, event wire.Event, _ any) error {
+			request, err := session.HTTPRequest(event)
+			if err != nil {
+				return err
+			}
+			body, err := io.ReadAll(request.Body)
+			if err != nil {
+				return err
+			}
+			requestObserved <- request.Method + " " + request.Path + " " + string(body)
+			if err := session.StartHTTPResponse(
+				request.Context,
+				event.RequestID,
+				201,
+				map[string]string{"content-type": "text/plain"},
+				nil,
+				true,
+			); err != nil {
+				return err
+			}
+			if err := session.WriteHTTPResponseChunk(request.Context, event.RequestID, []byte("one"), false); err != nil {
+				return err
+			}
+			return session.WriteHTTPResponseChunk(request.Context, event.RequestID, []byte("two"), true)
+		},
+	}
+	p := NewWithHandlers(runner, map[string]ActorHandler{"fetch": handler})
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() { result <- p.Run(ctx) }()
+	waitPumpStarted(t, p)
+	runner.emit(wire.Event{Kind: wire.EventActorStart, AID: "fetch-aid", Generation: 1, Name: "fetch"})
+	if command := nextCommand(t, runner); command.Kind != wire.CommandActorStartResult {
+		t.Fatalf("start command kind = %q", command.Kind)
+	}
+	runner.emit(
+		wire.Event{
+			Kind: wire.EventHTTPRequest, AID: "fetch-aid", Generation: 1,
+			RequestID: 8, Method: "POST", Path: "/upload?part=1", Body: []byte("first-"), Stream: true,
+		},
+		wire.Event{Kind: wire.EventHTTPRequestChunk, RequestID: 8, Body: []byte("second"), Finish: true},
+	)
+	select {
+	case got := <-requestObserved:
+		if got != "POST /upload?part=1 first-second" {
+			t.Fatalf("request observation = %q", got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("HTTP handler did not receive request chunks")
+	}
+	wantKinds := []wire.CommandKind{
+		wire.CommandHTTPResponseStart,
+		wire.CommandHTTPResponseChunk,
+		wire.CommandHTTPResponseChunk,
+	}
+	for _, want := range wantKinds {
+		if command := nextCommand(t, runner); command.Kind != want {
+			t.Fatalf("HTTP response command kind = %q, want %q", command.Kind, want)
+		}
+	}
+	cancel()
+	if err := <-result; err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+}
+
+func TestHTTPResponseRetriesNativeBackpressure(t *testing.T) {
+	base := newFakeRunner()
+	runner := &retryRunner{fakeRunner: base}
+	handler := dispatchHandler{
+		fetch: func(ctx context.Context, session *ActorSession, event wire.Event, _ any) error {
+			if err := session.StartHTTPResponse(ctx, event.RequestID, 200, nil, nil, true); err != nil {
+				return err
+			}
+			return session.WriteHTTPResponseChunk(ctx, event.RequestID, []byte("done"), true)
+		},
+	}
+	p := NewWithHandlers(runner, map[string]ActorHandler{"fetch": handler})
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() { result <- p.Run(ctx) }()
+	waitPumpStarted(t, p)
+	base.emit(wire.Event{Kind: wire.EventActorStart, AID: "fetch-retry", Generation: 1, Name: "fetch"})
+	if command := nextCommand(t, base); command.Kind != wire.CommandActorStartResult {
+		t.Fatalf("start command = %#v", command)
+	}
+	runner.remaining.Store(2)
+	base.emit(wire.Event{
+		Kind: wire.EventHTTPRequest, AID: "fetch-retry", Generation: 1,
+		RequestID: 21, Method: "GET", Path: "/retry",
+	})
+	if command := nextCommand(t, base); command.Kind != wire.CommandHTTPResponseStart {
+		t.Fatalf("HTTP response start = %#v", command)
+	}
+	if command := nextCommand(t, base); command.Kind != wire.CommandHTTPResponseChunk || !command.Finish {
+		t.Fatalf("HTTP response finish = %#v", command)
+	}
+	if attempts := runner.attempts.Load(); attempts < 5 {
+		t.Fatalf("native submit attempts = %d, want the start plus two retries and two accepted response commands", attempts)
+	}
+
+	cancel()
+	if err := <-result; err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+}
+
+func TestHTTPRequestAbortCancelsHandlerContext(t *testing.T) {
+	runner := newFakeRunner()
+	handlerStarted := make(chan struct{})
+	observed := make(chan error, 1)
+	handler := dispatchHandler{
+		fetch: func(_ context.Context, session *ActorSession, event wire.Event, _ any) error {
+			request, err := session.HTTPRequest(event)
+			if err != nil {
+				return err
+			}
+			close(handlerStarted)
+			<-request.Context.Done()
+			observed <- context.Cause(request.Context)
+			return nil
+		},
+	}
+	p := NewWithHandlers(runner, map[string]ActorHandler{"fetch": handler})
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() { result <- p.Run(ctx) }()
+	waitPumpStarted(t, p)
+	runner.emit(wire.Event{Kind: wire.EventActorStart, AID: "fetch-abort", Generation: 1, Name: "fetch"})
+	if command := nextCommand(t, runner); command.Kind != wire.CommandActorStartResult {
+		t.Fatalf("start command = %#v", command)
+	}
+	runner.emit(wire.Event{
+		Kind: wire.EventHTTPRequest, AID: "fetch-abort", Generation: 1,
+		RequestID: 22, Method: "GET", Path: "/abort", Stream: true,
+	})
+	select {
+	case <-handlerStarted:
+	case <-time.After(time.Second):
+		t.Fatal("HTTP handler did not start")
+	}
+	runner.emit(wire.Event{Kind: wire.EventHTTPRequestAbort, RequestID: 22})
+	select {
+	case err := <-observed:
+		if err == nil || !strings.Contains(err.Error(), "aborted by engine") {
+			t.Fatalf("request cancellation cause = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("HTTP abort did not cancel the handler context")
+	}
+
+	cancel()
+	if err := <-result; err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+}
+
+func TestFetchPanicReturnsStructuredErrorWithoutStoppingPeerActor(t *testing.T) {
+	runner := newFakeRunner()
+	p := NewWithHandlers(runner, map[string]ActorHandler{
+		"panic-fetch": dispatchHandler{
+			fetch: func(context.Context, *ActorSession, wire.Event, any) error {
+				panic("fetch boom")
+			},
+		},
+		"healthy": dispatchHandler{
+			action: func(_ context.Context, _ *ActorSession, event wire.Event, _ any) ([]byte, error) {
+				return []byte(event.Action), nil
+			},
+		},
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() { result <- p.Run(ctx) }()
+	waitPumpStarted(t, p)
+	runner.emit(
+		wire.Event{Kind: wire.EventActorStart, AID: "panic-fetch-aid", Generation: 1, Name: "panic-fetch"},
+		wire.Event{Kind: wire.EventActorStart, AID: "healthy-aid", Generation: 1, Name: "healthy"},
+	)
+	for range 2 {
+		if command := nextCommand(t, runner); command.Kind != wire.CommandActorStartResult || !command.OK {
+			t.Fatalf("start command = %#v", command)
+		}
+	}
+
+	runner.emit(wire.Event{
+		Kind: wire.EventHTTPRequest, AID: "panic-fetch-aid", Generation: 1,
+		RequestID: 19, Method: "GET", Path: "/panic",
+	})
+	failed := nextCommand(t, runner)
+	if failed.Kind != wire.CommandHTTPResponseStart || failed.RequestID != 19 ||
+		failed.Error == nil || failed.Error.Code != "handler_panic" {
+		t.Fatalf("panicking fetch result = %#v", failed)
+	}
+
+	runner.emit(wire.Event{
+		Kind: wire.EventActionCall, AID: "healthy-aid", Generation: 1,
+		CallID: 20, Action: "still-healthy",
+	})
+	if command := nextCommand(t, runner); command.Kind != wire.CommandActionResult ||
+		command.CallID != 20 || string(command.Output) != "still-healthy" {
+		t.Fatalf("peer action result = %#v", command)
+	}
+
+	cancel()
+	if err := <-result; err != nil {
+		t.Fatalf("Run after fetch panic: %v", err)
 	}
 }
 

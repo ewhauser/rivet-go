@@ -6,6 +6,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
+	"math/rand/v2"
 	"runtime"
 	"sync"
 	"sync/atomic"
@@ -21,6 +23,7 @@ const (
 	defaultSubmitQueue     = 1_024
 	maxSubmitBatch         = 64
 	actorEventQueue        = 64
+	maxHTTPChunk           = 1 << 20
 )
 
 var (
@@ -43,6 +46,14 @@ type Runner interface {
 type ActorHandler interface {
 	Start(context.Context, *ActorSession, wire.Event) (any, error)
 	Stop(context.Context, *ActorSession, wire.Event, any) error
+}
+
+type actorActionHandler interface {
+	Action(context.Context, *ActorSession, wire.Event, any) ([]byte, error)
+}
+
+type actorFetchHandler interface {
+	Fetch(context.Context, *ActorSession, wire.Event, any) error
 }
 
 // HandlerError is sent to Rust as the structured actor-local error arm of a
@@ -110,6 +121,34 @@ type ActorSession struct {
 	doneClosed    bool
 }
 
+// HTTPRequest is one raw actor request delivered through the engine gateway.
+// Body receives boundary chunks without blocking the pump goroutine.
+type HTTPRequest struct {
+	Context context.Context
+	Method  string
+	Path    string
+	Headers map[string]string
+	Body    io.ReadCloser
+}
+
+type httpRequestState struct {
+	identity actorIdentity
+	request  HTTPRequest
+	cancel   context.CancelCauseFunc
+	body     *httpRequestBody
+}
+
+type httpRequestBody struct {
+	ctx      context.Context
+	mu       sync.Mutex
+	chunks   [][]byte
+	offset   int
+	finished bool
+	err      error
+	closed   bool
+	wake     chan struct{}
+}
+
 func (s *ActorSession) AID() string {
 	if s == nil {
 		return ""
@@ -136,6 +175,109 @@ func (s *ActorSession) PersistedState() []byte {
 		return nil
 	}
 	return cloneBytes(s.persistedState)
+}
+
+// HTTPRequest returns the request state prepared for an HttpRequest event.
+func (s *ActorSession) HTTPRequest(event wire.Event) (*HTTPRequest, error) {
+	if s == nil || s.pump == nil {
+		return nil, errors.New("actor session is unavailable")
+	}
+	state := s.pump.httpRequest(event.RequestID)
+	if state == nil || state.identity != s.identity {
+		return nil, fmt.Errorf("HTTP request %d is unavailable for this actor", event.RequestID)
+	}
+	request := state.request
+	request.Headers = cloneStringMap(request.Headers)
+	return &request, nil
+}
+
+// StartHTTPResponse submits response metadata. Streaming responses are
+// completed by one or more WriteHTTPResponseChunk calls.
+func (s *ActorSession) StartHTTPResponse(
+	ctx context.Context,
+	requestID uint64,
+	status uint16,
+	headers map[string]string,
+	body []byte,
+	stream bool,
+) error {
+	return s.submitHTTP(ctx, wire.Command{
+		Kind:      wire.CommandHTTPResponseStart,
+		RequestID: requestID,
+		Status:    status,
+		Headers:   cloneStringMapOrEmpty(headers),
+		Body:      cloneBytesOrEmpty(body),
+		Stream:    stream,
+	})
+}
+
+// WriteHTTPResponseChunk submits at most one 1 MiB response chunk.
+func (s *ActorSession) WriteHTTPResponseChunk(
+	ctx context.Context,
+	requestID uint64,
+	body []byte,
+	finish bool,
+) error {
+	if len(body) > maxHTTPChunk {
+		return fmt.Errorf("HTTP response chunk is %d bytes, maximum is %d", len(body), maxHTTPChunk)
+	}
+	return s.submitHTTP(ctx, wire.Command{
+		Kind:      wire.CommandHTTPResponseChunk,
+		RequestID: requestID,
+		Body:      cloneBytesOrEmpty(body),
+		Finish:    finish,
+	})
+}
+
+func (s *ActorSession) failHTTP(ctx context.Context, requestID uint64, failure *wire.WireError) error {
+	return s.submitHTTP(ctx, wire.Command{
+		Kind:      wire.CommandHTTPResponseStart,
+		RequestID: requestID,
+		Headers:   map[string]string{},
+		Body:      []byte{},
+		Error:     failure,
+	})
+}
+
+func (s *ActorSession) submitHTTP(ctx context.Context, command wire.Command) error {
+	if s == nil || s.pump == nil {
+		return errors.New("actor session is unavailable")
+	}
+	if ctx == nil {
+		return errors.New("HTTP response context is nil")
+	}
+	backoff := time.Millisecond
+	for {
+		err := s.pump.submitInternal(ctx, command)
+		if err == nil {
+			return nil
+		}
+		var coded interface{ ErrorCode() string }
+		if !errors.As(err, &coded) || coded.ErrorCode() != "backpressure" {
+			return err
+		}
+		jitter := time.Duration(rand.Int64N(int64(backoff/2) + 1))
+		timer := time.NewTimer(backoff + jitter)
+		select {
+		case <-timer.C:
+		case <-ctx.Done():
+			if !timer.Stop() {
+				<-timer.C
+			}
+			return ctx.Err()
+		case <-s.done:
+			if !timer.Stop() {
+				<-timer.C
+			}
+			return ErrShuttingDown
+		case <-s.pump.done:
+			if !timer.Stop() {
+				<-timer.C
+			}
+			return ErrShuttingDown
+		}
+		backoff = min(backoff*2, 25*time.Millisecond)
+	}
 }
 
 // Save persists one complete actor-state snapshot through rivetkit-core and
@@ -392,6 +534,9 @@ func (s *ActorSession) closeGracefully() {
 // when the whole pump is exiting and no durability acknowledgement can still
 // be required.
 func (s *ActorSession) abort() {
+	if s != nil && s.pump != nil {
+		s.pump.abortHTTPForActor(s.identity, ErrShuttingDown)
+	}
 	s.lifecycleMu.Lock()
 	s.accepting = false
 	s.closeDoneLocked()
@@ -424,6 +569,108 @@ func cloneBytes(data []byte) []byte {
 	return cloned
 }
 
+func cloneBytesOrEmpty(data []byte) []byte {
+	if data == nil {
+		return []byte{}
+	}
+	return cloneBytes(data)
+}
+
+func cloneStringMap(values map[string]string) map[string]string {
+	if values == nil {
+		return nil
+	}
+	cloned := make(map[string]string, len(values))
+	for key, value := range values {
+		cloned[key] = value
+	}
+	return cloned
+}
+
+func cloneStringMapOrEmpty(values map[string]string) map[string]string {
+	if values == nil {
+		return map[string]string{}
+	}
+	return cloneStringMap(values)
+}
+
+func newHTTPRequestBody(ctx context.Context) *httpRequestBody {
+	return &httpRequestBody{ctx: ctx, wake: make(chan struct{})}
+}
+
+func (b *httpRequestBody) Read(destination []byte) (int, error) {
+	for {
+		b.mu.Lock()
+		if len(b.chunks) != 0 {
+			chunk := b.chunks[0]
+			count := copy(destination, chunk[b.offset:])
+			b.offset += count
+			if b.offset == len(chunk) {
+				b.chunks = b.chunks[1:]
+				b.offset = 0
+			}
+			b.mu.Unlock()
+			return count, nil
+		}
+		if b.closed {
+			b.mu.Unlock()
+			return 0, io.ErrClosedPipe
+		}
+		if b.finished {
+			err := b.err
+			b.mu.Unlock()
+			if err != nil {
+				return 0, err
+			}
+			return 0, io.EOF
+		}
+		wake := b.wake
+		b.mu.Unlock()
+		select {
+		case <-wake:
+		case <-b.ctx.Done():
+			return 0, context.Cause(b.ctx)
+		}
+	}
+}
+
+func (b *httpRequestBody) Close() error {
+	b.mu.Lock()
+	if !b.closed {
+		b.closed = true
+		b.signalLocked()
+	}
+	b.mu.Unlock()
+	return nil
+}
+
+func (b *httpRequestBody) append(chunk []byte, finish bool) {
+	b.mu.Lock()
+	if !b.closed && !b.finished && len(chunk) != 0 {
+		b.chunks = append(b.chunks, cloneBytes(chunk))
+	}
+	if finish {
+		b.finished = true
+	}
+	b.signalLocked()
+	b.mu.Unlock()
+}
+
+func (b *httpRequestBody) abort(err error) {
+	b.mu.Lock()
+	if !b.finished {
+		b.finished = true
+		b.err = err
+	}
+	b.signalLocked()
+	b.mu.Unlock()
+}
+
+func (b *httpRequestBody) signalLocked() {
+	close(b.wake)
+	b.wake = make(chan struct{})
+}
+
 type actorWorker struct {
 	pump    *Pump
 	handler ActorHandler
@@ -454,10 +701,12 @@ type Pump struct {
 	actors   map[actorIdentity]*actorWorker
 	actorWG  sync.WaitGroup
 
-	nextKVID  atomic.Uint64
-	kvMu      sync.Mutex
-	kvPending map[uint64]chan wire.Event
-	lateSaves map[actorIdentity]struct{}
+	nextKVID    atomic.Uint64
+	kvMu        sync.Mutex
+	kvPending   map[uint64]chan wire.Event
+	lateSaves   map[actorIdentity]struct{}
+	httpMu      sync.Mutex
+	httpPending map[uint64]*httpRequestState
 
 	subsMu    sync.Mutex
 	subs      map[uint64]*subscriber
@@ -490,6 +739,7 @@ func NewWithHandlers(runner Runner, handlers map[string]ActorHandler) *Pump {
 		actors:          make(map[actorIdentity]*actorWorker),
 		kvPending:       make(map[uint64]chan wire.Event),
 		lateSaves:       make(map[actorIdentity]struct{}),
+		httpPending:     make(map[uint64]*httpRequestState),
 		subs:            make(map[uint64]*subscriber),
 	}
 }
@@ -728,6 +978,55 @@ func (p *Pump) handleInternalEvent(event wire.Event) error {
 			return fmt.Errorf("ActorStop for unknown actor %s generation %d", event.AID, event.Generation)
 		}
 		worker.events <- event
+	case wire.EventActionCall:
+		worker := p.actor(event.AID, event.Generation)
+		if worker == nil {
+			return fmt.Errorf("ActionCall for unknown actor %s generation %d", event.AID, event.Generation)
+		}
+		worker.events <- event
+	case wire.EventHTTPRequest:
+		worker := p.actor(event.AID, event.Generation)
+		if worker == nil {
+			return fmt.Errorf("HttpRequest for unknown actor %s generation %d", event.AID, event.Generation)
+		}
+		requestContext, cancel := context.WithCancelCause(worker.ctx)
+		body := newHTTPRequestBody(requestContext)
+		body.append(event.Body, !event.Stream)
+		state := &httpRequestState{
+			identity: worker.session.identity,
+			request: HTTPRequest{
+				Context: requestContext,
+				Method:  event.Method,
+				Path:    event.Path,
+				Headers: cloneStringMap(event.Headers),
+				Body:    body,
+			},
+			cancel: cancel,
+			body:   body,
+		}
+		p.httpMu.Lock()
+		if _, exists := p.httpPending[event.RequestID]; exists {
+			p.httpMu.Unlock()
+			cancel(errors.New("duplicate HTTP request ID"))
+			return fmt.Errorf("duplicate HttpRequest req_id %d", event.RequestID)
+		}
+		p.httpPending[event.RequestID] = state
+		p.httpMu.Unlock()
+		worker.events <- event
+	case wire.EventHTTPRequestChunk:
+		state := p.httpRequest(event.RequestID)
+		if state == nil {
+			return fmt.Errorf("HttpRequestChunk for unknown req_id %d", event.RequestID)
+		}
+		state.body.append(event.Body, event.Finish)
+	case wire.EventHTTPRequestAbort:
+		state := p.httpRequest(event.RequestID)
+		if state == nil {
+			return nil
+		}
+		abortErr := errors.New("HTTP request aborted by engine")
+		state.cancel(abortErr)
+		state.body.abort(abortErr)
 	case wire.EventStatePersisted:
 		worker := p.actor(event.AID, event.Generation)
 		if worker == nil {
@@ -786,7 +1085,49 @@ func (w *actorWorker) run(start wire.Event) {
 			return
 		case event = <-w.events:
 		}
-		if event.Kind != wire.EventActorStop {
+		switch event.Kind {
+		case wire.EventActionCall:
+			output, actionError := invokeAction(w.ctx, w.handler, w.session, event, state)
+			if actionError == nil && output == nil {
+				output = []byte{}
+			}
+			if err := w.pump.submitInternal(w.ctx, wire.Command{
+				Kind:   wire.CommandActionResult,
+				CallID: event.CallID,
+				Output: output,
+				Error:  actionError,
+			}); err != nil {
+				w.pump.reportWorkerError(fmt.Errorf("submit ActionResult: %w", err))
+				return
+			}
+			if actionError != nil && actionError.Code == "handler_panic" {
+				return
+			}
+		case wire.EventHTTPRequest:
+			fetchError := invokeFetch(w.ctx, w.handler, w.session, event, state)
+			if fetchError != nil {
+				if err := w.session.failHTTP(w.ctx, event.RequestID, fetchError); err != nil {
+					w.pump.reportWorkerError(fmt.Errorf("submit HTTP handler error: %w", err))
+					return
+				}
+			}
+			w.pump.finishHTTPRequest(event.RequestID)
+			if fetchError != nil && fetchError.Code == "handler_panic" {
+				return
+			}
+		case wire.EventActorStop:
+			lifecycleError = invokeStop(w.ctx, w.handler, w.session, event, state)
+			w.session.closeGracefully()
+			if err := w.pump.submitInternal(w.ctx, wire.Command{
+				Kind:       wire.CommandActorStopResult,
+				AID:        w.session.identity.aid,
+				Generation: w.session.identity.generation,
+				Error:      lifecycleError,
+			}); err != nil {
+				w.pump.reportWorkerError(fmt.Errorf("submit ActorStopResult: %w", err))
+			}
+			return
+		default:
 			w.pump.reportWorkerError(fmt.Errorf(
 				"unexpected %s on actor worker %s generation %d",
 				event.Kind,
@@ -795,17 +1136,6 @@ func (w *actorWorker) run(start wire.Event) {
 			))
 			return
 		}
-		lifecycleError = invokeStop(w.ctx, w.handler, w.session, event, state)
-		w.session.closeGracefully()
-		if err := w.pump.submitInternal(w.ctx, wire.Command{
-			Kind:       wire.CommandActorStopResult,
-			AID:        w.session.identity.aid,
-			Generation: w.session.identity.generation,
-			Error:      lifecycleError,
-		}); err != nil {
-			w.pump.reportWorkerError(fmt.Errorf("submit ActorStopResult: %w", err))
-		}
-		return
 	}
 }
 
@@ -864,6 +1194,64 @@ func invokeStop(
 	return nil
 }
 
+func invokeAction(
+	ctx context.Context,
+	handler ActorHandler,
+	session *ActorSession,
+	event wire.Event,
+	state any,
+) (output []byte, actionError *wire.WireError) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			output = nil
+			actionError = &wire.WireError{
+				Code:    "handler_panic",
+				Message: fmt.Sprintf("action %q panicked: %v", event.Action, recovered),
+			}
+		}
+	}()
+	actionHandler, ok := handler.(actorActionHandler)
+	if !ok {
+		return nil, &wire.WireError{
+			Code:    "action_not_found",
+			Message: fmt.Sprintf("action %q is not registered", event.Action),
+		}
+	}
+	output, err := actionHandler.Action(ctx, session, event, state)
+	if err != nil {
+		return nil, handlerWireError("action "+event.Action, err)
+	}
+	return cloneBytes(output), nil
+}
+
+func invokeFetch(
+	ctx context.Context,
+	handler ActorHandler,
+	session *ActorSession,
+	event wire.Event,
+	state any,
+) (fetchError *wire.WireError) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			fetchError = &wire.WireError{
+				Code:    "handler_panic",
+				Message: fmt.Sprintf("OnFetch panicked: %v", recovered),
+			}
+		}
+	}()
+	fetchHandler, ok := handler.(actorFetchHandler)
+	if !ok {
+		return &wire.WireError{
+			Code:    "handler_error",
+			Message: "actor has no OnFetch handler",
+		}
+	}
+	if err := fetchHandler.Fetch(ctx, session, event, state); err != nil {
+		return handlerWireError("OnFetch", err)
+	}
+	return nil
+}
+
 func handlerWireError(operation string, err error) *wire.WireError {
 	var structured HandlerError
 	if errors.As(err, &structured) {
@@ -879,6 +1267,39 @@ func (p *Pump) actor(aid string, generation uint64) *actorWorker {
 	p.actorsMu.Lock()
 	defer p.actorsMu.Unlock()
 	return p.actors[actorIdentity{aid: aid, generation: generation}]
+}
+
+func (p *Pump) httpRequest(requestID uint64) *httpRequestState {
+	p.httpMu.Lock()
+	defer p.httpMu.Unlock()
+	return p.httpPending[requestID]
+}
+
+func (p *Pump) finishHTTPRequest(requestID uint64) {
+	p.httpMu.Lock()
+	state := p.httpPending[requestID]
+	delete(p.httpPending, requestID)
+	p.httpMu.Unlock()
+	if state != nil {
+		_ = state.request.Body.Close()
+		state.cancel(nil)
+	}
+}
+
+func (p *Pump) abortHTTPForActor(identity actorIdentity, cause error) {
+	p.httpMu.Lock()
+	requests := make([]*httpRequestState, 0)
+	for requestID, state := range p.httpPending {
+		if state.identity == identity {
+			delete(p.httpPending, requestID)
+			requests = append(requests, state)
+		}
+	}
+	p.httpMu.Unlock()
+	for _, state := range requests {
+		state.cancel(cause)
+		state.body.abort(cause)
+	}
 }
 
 func (p *Pump) removeActor(identity actorIdentity, worker *actorWorker) {
