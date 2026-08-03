@@ -1197,7 +1197,7 @@ func TestActionsAreActorLocalOrderedAndPanicContained(t *testing.T) {
 		if action != "first" {
 			t.Fatalf("first slow action = %q", action)
 		}
-	default:
+	case <-time.After(2 * time.Second):
 		t.Fatal("slow action did not start")
 	}
 	select {

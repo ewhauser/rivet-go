@@ -446,9 +446,13 @@ action/HTTP/WebSocket handler returns, successful action or alarm state is
 persisted, the action/HTTP result or WebSocket acknowledgement is submitted,
 and then `OnStop` runs. Explicit state and alarm mutations already accepted by
 Rust are also drained before `ActorStopResult`. Handler deadlines, engine HTTP
-aborts, and runner shutdown retain their earlier cancellation behavior. The
-real-engine mid-flight case observes the action-complete marker before the stop
-hook and actor eviction.
+aborts, and forced runner-shutdown cancellation retain their earlier behavior.
+Graceful runner shutdown reaches core actors as sleep: eligible WebSockets are
+hibernated, `OnStop` completes, and neither a transport close nor
+`OnDisconnect` is exposed. This supersedes M4's runner-close expectation; the
+shutdown fallback still closes any transport left after the grace deadline.
+The real-engine mid-flight case observes the action-complete marker before the
+stop hook and actor eviction.
 
 Core hides hibernating gateway/request IDs, persists both message indexes and
 request metadata, restores `CommandStartActor.hibernatingRequests`, and drops

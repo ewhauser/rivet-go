@@ -495,6 +495,10 @@ Open question 3 is resolved at v2.3.10 as follows:
 
 Hibernation itself does not emit `WsClose` and does not invoke `OnDisconnect`.
 A real close observed while the actor is awake still invokes `OnDisconnect`.
+Graceful runner cancellation is also a core sleep at this pin, so it follows
+the same hibernation rule; if the shutdown grace deadline forces the runtime to
+abort, the FFI closes any transport still attached to that runtime with code
+1001 and reason `runner shutting down`.
 At this pin a client that disappears while the actor is fully asleep can be
 removed by core's startup settlement before the foreign run handler starts, so
 there is no Go disconnect callback for that already-dead restored transport.

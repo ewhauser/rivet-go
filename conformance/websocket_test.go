@@ -620,11 +620,21 @@ func TestWebSocketLifecycleRacesAndHookBroadcasts(t *testing.T) {
 	shutdownClient := openGatewayWebSocket(t, engine.endpoint, shutdownActor.ActorID, "runner-shutdown", true)
 	waitWebSocketHook(t, opened, "runner-shutdown")
 	served.stop(t)
-	assertOnStopBroadcastAndClose(t, shutdownClient, "lifecycle", "stopping", "actor stopped")
-	waitWebSocketHook(t, disconnected, "runner-shutdown")
+	select {
+	case err := <-stopBroadcast:
+		if err != nil {
+			t.Fatalf("runner-shutdown actor OnStop broadcast: %v", err)
+		}
+	case <-time.After(websocketTestTimeout):
+		t.Fatal("runner-shutdown actor OnStop broadcast did not return")
+	}
+	waitForActor(t, engine.endpoint, shutdownActor.ActorID, false, func(actor actorRecord) bool {
+		return actor.ConnectableTS == nil && actor.SleepTS != nil && actor.DestroyTS == nil
+	})
+	assertNoWebSocketFrame(t, shutdownClient, 500*time.Millisecond)
 	countMu.Lock()
-	if disconnectCounts["runner-shutdown"] != 1 {
-		t.Fatalf("runner shutdown OnDisconnect count = %d, want 1", disconnectCounts["runner-shutdown"])
+	if disconnectCounts["runner-shutdown"] != 0 {
+		t.Fatalf("runner shutdown OnDisconnect count = %d, want 0", disconnectCounts["runner-shutdown"])
 	}
 	countMu.Unlock()
 }
