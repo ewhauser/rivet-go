@@ -101,7 +101,7 @@ instance ID, `gen` = generation; both assigned by core.
 | `ActorStart` | aid, gen, name, key, create_ts, input, persisted_state (optional; absent differs from present-empty) | `ActorStartResult { aid, gen, ok / error }` |
 | `ActorStop` | aid, gen, reason (stop cmd / sleep intent / drain) | `ActorStopResult { aid, gen }` after handler cleanup |
 | `ActorAlarm` | aid, gen, alarm_ts | `AlarmHandled { aid, gen }` |
-| `ActionCall` | aid, gen, call_id, action name, args (raw bytes: JSON/CBOR per client encoding), conn_id | `ActionResult { call_id, output / error }` |
+| `ActionCall` | aid, gen, call_id, action name, timeout_ms, args (raw bytes: JSON/CBOR per client encoding), conn_id | `ActionResult { call_id, output / error }` |
 | `HttpRequest` | aid, req_id, method, path, headers, body?, stream flag | `HttpResponseStart` (+ chunks) |
 | `HttpRequestChunk` | req_id, body, finish | — (feeds request body reader) |
 | `HttpRequestAbort` | req_id | abort handler ctx |
@@ -297,6 +297,14 @@ action saves the complete actor state before releasing its output. Ordinary
 handler errors remain actor-local; `handler_panic` is returned to the client
 and then ends that actor factory future without ending the runner pump.
 
+`ActionCall.timeout_ms` is sourced from the same Rust duration installed in
+`ActorConfig.action_timeout` (60 seconds at this pin). Go applies it to the
+context passed to `ActionWithContext` and `RawActionWithContext`. Cancellation
+is cooperative because Go cannot preempt a handler that ignores its context.
+Core still returns the structured `actor/action_timed_out` response at the
+deadline; a late `ActionResult` is ignored without consuming another call's
+correlation, and the actor can serve later work after the handler exits.
+
 The HTTP mapping has two limitations imposed by the pinned core trait. Core
 buffers the incoming body before creating `ActorEvent::HttpRequest`, and the
 reply channel accepts only `Response<Vec<u8>>`. The FFI divides the buffered
@@ -307,15 +315,32 @@ deadline applies because this callback exposes no separate core deadline.
 Deadline expiry emits `HttpRequestAbort`; actor or runner shutdown cancels the
 Go request context directly. Client socket aborts are not visible through this
 v2.3.10 embedder callback and therefore cannot produce their own abort event.
+Core serializes an actor stop behind its active request callback. Runner
+shutdown remains bounded by the runner drain deadline; when `RunnerStopped`
+arrives, Go cancels every actor worker, wakes request-body reads, and removes
+the corresponding request entries. Expired Rust request correlations are
+removed before `HttpRequestAbort` is emitted.
 
 Go's `ResponseWriter.Write` splits large writes and calls `rk_runner_submit`
 from the handler goroutine. Native `backpressure` responses are retried with
-jitter there, leaving the sole poll goroutine free to dispatch other actors.
+jitter there for at most 30 seconds, leaving the sole poll goroutine free to
+dispatch other actors. The writer locks status and headers at the first write,
+serializes concurrent `Write` calls, rejects writes after `OnFetch` returns,
+and checks an explicit `Content-Length` against the bytes written. It does not
+implement `http.Flusher`: core cannot expose incremental response arrival at
+this pin because the complete body is assembled before reply.
+
 The pinned core request and response types use `HashMap<String, String>`, so
-the boundary preserves one value per header name; multiple Go response values
-are joined with a comma and space before crossing the boundary. This includes
-the known limitation that independently repeated response fields cannot be
-represented at this pin.
+the boundary preserves one value per header name. Repeated request fields are
+reduced by v2.3.10 to the last value before Go receives them. Go joins repeated
+response values with a comma and space when that representation is valid, but
+rejects multiple `Set-Cookie` values with the structured
+`http_response_repeated_header_unsupported` error instead of corrupting them.
+Maps that reach the boundary with over 256 names fail structurally. The public
+v2.3.10 gateway rejects an over-limit incoming request earlier with HTTP 431,
+before an actor event exists. Header values are not subject to that entry-count
+limit; a large Cookie value remains one entry. Header names and values retain
+the envelope's 1 MiB per-blob ceiling and fail structurally before crossing it.
 
 WebSockets, event broadcast, alarm delivery, sleep scheduling, and the
 standalone client package remain outside M3.

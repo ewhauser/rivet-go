@@ -971,10 +971,10 @@ func TestActionsAreActorLocalOrderedAndPanicContained(t *testing.T) {
 		}
 	}
 	runner.emit(
-		wire.Event{Kind: wire.EventActionCall, AID: "slow-aid", Generation: 1, CallID: 1, Action: "first"},
-		wire.Event{Kind: wire.EventActionCall, AID: "slow-aid", Generation: 1, CallID: 2, Action: "second"},
-		wire.Event{Kind: wire.EventActionCall, AID: "fast-aid", Generation: 1, CallID: 3, Action: "fast"},
-		wire.Event{Kind: wire.EventActionCall, AID: "panic-aid", Generation: 1, CallID: 4, Action: "panic"},
+		wire.Event{Kind: wire.EventActionCall, AID: "slow-aid", Generation: 1, CallID: 1, Action: "first", ActionTimeoutMS: 1_000},
+		wire.Event{Kind: wire.EventActionCall, AID: "slow-aid", Generation: 1, CallID: 2, Action: "second", ActionTimeoutMS: 1_000},
+		wire.Event{Kind: wire.EventActionCall, AID: "fast-aid", Generation: 1, CallID: 3, Action: "fast", ActionTimeoutMS: 1_000},
+		wire.Event{Kind: wire.EventActionCall, AID: "panic-aid", Generation: 1, CallID: 4, Action: "panic", ActionTimeoutMS: 1_000},
 	)
 
 	first := nextCommand(t, runner)
@@ -1010,6 +1010,46 @@ func TestActionsAreActorLocalOrderedAndPanicContained(t *testing.T) {
 		t.Fatalf("second slow result = %#v", command)
 	}
 
+	cancel()
+	if err := <-result; err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+}
+
+func TestActionDeadlineIsPropagatedAndActorRecovers(t *testing.T) {
+	defer goleak.VerifyNone(t)
+	runner := newFakeRunner()
+	handler := dispatchHandler{
+		action: func(ctx context.Context, _ *ActorSession, event wire.Event, _ any) ([]byte, error) {
+			if event.Action == "slow" {
+				if _, ok := ctx.Deadline(); !ok {
+					return nil, errors.New("action context has no deadline")
+				}
+				<-ctx.Done()
+				return nil, HandlerError{Code: "action_timed_out", Message: ctx.Err().Error()}
+			}
+			return []byte("healthy"), nil
+		},
+	}
+	p := NewWithHandlers(runner, map[string]ActorHandler{"deadline": handler})
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() { result <- p.Run(ctx) }()
+	waitPumpStarted(t, p)
+	runner.emit(wire.Event{Kind: wire.EventActorStart, AID: "deadline-aid", Generation: 1, Name: "deadline"})
+	if command := nextCommand(t, runner); command.Kind != wire.CommandActorStartResult {
+		t.Fatalf("start command = %#v", command)
+	}
+	runner.emit(wire.Event{Kind: wire.EventActionCall, AID: "deadline-aid", Generation: 1, CallID: 40, Action: "slow", ActionTimeoutMS: 40})
+	if command := nextCommand(t, runner); command.Kind != wire.CommandActionResult ||
+		command.Error == nil || command.Error.Code != "action_timed_out" {
+		t.Fatalf("timed-out action result = %#v", command)
+	}
+	runner.emit(wire.Event{Kind: wire.EventActionCall, AID: "deadline-aid", Generation: 1, CallID: 41, Action: "after", ActionTimeoutMS: 1_000})
+	if command := nextCommand(t, runner); command.Kind != wire.CommandActionResult ||
+		command.CallID != 41 || string(command.Output) != "healthy" {
+		t.Fatalf("post-timeout action result = %#v", command)
+	}
 	cancel()
 	if err := <-result; err != nil {
 		t.Fatalf("Run: %v", err)
@@ -1127,7 +1167,113 @@ func TestHTTPResponseRetriesNativeBackpressure(t *testing.T) {
 	}
 }
 
+func TestHTTPResponseBackpressureRetryIsBounded(t *testing.T) {
+	defer goleak.VerifyNone(t)
+	base := newFakeRunner()
+	runner := &retryRunner{fakeRunner: base}
+	runner.remaining.Store(1<<31 - 1)
+	p := New(runner)
+	p.httpSubmitLimit = 40 * time.Millisecond
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() { result <- p.Run(ctx) }()
+	waitPumpStarted(t, p)
+
+	session := &ActorSession{pump: p, done: make(chan struct{})}
+	started := time.Now()
+	err := session.StartHTTPResponse(context.Background(), 31, 200, nil, nil, true)
+	var structured HandlerError
+	if !errors.As(err, &structured) || structured.Code != "http_response_backpressure_timeout" {
+		t.Fatalf("bounded backpressure error = %v, want http_response_backpressure_timeout", err)
+	}
+	if elapsed := time.Since(started); elapsed > 500*time.Millisecond {
+		t.Fatalf("bounded backpressure returned after %s", elapsed)
+	}
+	if attempts := runner.attempts.Load(); attempts < 2 {
+		t.Fatalf("native submit attempts = %d, want at least one retry", attempts)
+	}
+
+	cancel()
+	if err := <-result; err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+}
+
 func TestHTTPRequestAbortCancelsHandlerContext(t *testing.T) {
+	runner := newFakeRunner()
+	handlerStarted := make(chan struct{})
+	type abortObservation struct {
+		contextCause error
+		bodyError    error
+	}
+	observed := make(chan abortObservation, 1)
+	handler := dispatchHandler{
+		fetch: func(_ context.Context, session *ActorSession, event wire.Event, _ any) error {
+			request, err := session.HTTPRequest(event)
+			if err != nil {
+				return err
+			}
+			close(handlerStarted)
+			_, bodyError := io.ReadAll(request.Body)
+			observed <- abortObservation{
+				contextCause: context.Cause(request.Context),
+				bodyError:    bodyError,
+			}
+			return nil
+		},
+	}
+	p := NewWithHandlers(runner, map[string]ActorHandler{"fetch": handler})
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() { result <- p.Run(ctx) }()
+	waitPumpStarted(t, p)
+	runner.emit(wire.Event{Kind: wire.EventActorStart, AID: "fetch-abort", Generation: 1, Name: "fetch"})
+	if command := nextCommand(t, runner); command.Kind != wire.CommandActorStartResult {
+		t.Fatalf("start command = %#v", command)
+	}
+	runner.emit(wire.Event{
+		Kind: wire.EventHTTPRequest, AID: "fetch-abort", Generation: 1,
+		RequestID: 22, Method: "POST", Path: "/abort", Body: []byte("partial"), Stream: true,
+	})
+	select {
+	case <-handlerStarted:
+	case <-time.After(time.Second):
+		t.Fatal("HTTP handler did not start")
+	}
+	runner.emit(wire.Event{Kind: wire.EventHTTPRequestAbort, RequestID: 22})
+	select {
+	case observation := <-observed:
+		if observation.contextCause == nil || !strings.Contains(observation.contextCause.Error(), "aborted by engine") {
+			t.Fatalf("request cancellation cause = %v", observation.contextCause)
+		}
+		if observation.bodyError == nil || !strings.Contains(observation.bodyError.Error(), "aborted by engine") {
+			t.Fatalf("request body error = %v", observation.bodyError)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("HTTP abort did not cancel the handler context")
+	}
+	deadline := time.Now().Add(time.Second)
+	for {
+		p.httpMu.Lock()
+		pending := len(p.httpPending)
+		p.httpMu.Unlock()
+		if pending == 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("HTTP correlations remaining after abort = %d", pending)
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	cancel()
+	if err := <-result; err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+}
+
+func TestShutdownCancelsInFlightHTTPRequestAndCleansCorrelation(t *testing.T) {
+	defer goleak.VerifyNone(t)
 	runner := newFakeRunner()
 	handlerStarted := make(chan struct{})
 	observed := make(chan error, 1)
@@ -1148,32 +1294,36 @@ func TestHTTPRequestAbortCancelsHandlerContext(t *testing.T) {
 	result := make(chan error, 1)
 	go func() { result <- p.Run(ctx) }()
 	waitPumpStarted(t, p)
-	runner.emit(wire.Event{Kind: wire.EventActorStart, AID: "fetch-abort", Generation: 1, Name: "fetch"})
+	runner.emit(wire.Event{Kind: wire.EventActorStart, AID: "fetch-shutdown", Generation: 1, Name: "fetch"})
 	if command := nextCommand(t, runner); command.Kind != wire.CommandActorStartResult {
 		t.Fatalf("start command = %#v", command)
 	}
 	runner.emit(wire.Event{
-		Kind: wire.EventHTTPRequest, AID: "fetch-abort", Generation: 1,
-		RequestID: 22, Method: "GET", Path: "/abort", Stream: true,
+		Kind: wire.EventHTTPRequest, AID: "fetch-shutdown", Generation: 1,
+		RequestID: 32, Method: "GET", Path: "/shutdown", Stream: true,
 	})
 	select {
 	case <-handlerStarted:
 	case <-time.After(time.Second):
 		t.Fatal("HTTP handler did not start")
 	}
-	runner.emit(wire.Event{Kind: wire.EventHTTPRequestAbort, RequestID: 22})
+	cancel()
 	select {
-	case err := <-observed:
-		if err == nil || !strings.Contains(err.Error(), "aborted by engine") {
-			t.Fatalf("request cancellation cause = %v", err)
+	case cause := <-observed:
+		if !errors.Is(cause, context.Canceled) {
+			t.Fatalf("request cancellation cause = %v, want context cancellation", cause)
 		}
 	case <-time.After(time.Second):
-		t.Fatal("HTTP abort did not cancel the handler context")
+		t.Fatal("runner shutdown did not cancel the HTTP request")
 	}
-
-	cancel()
 	if err := <-result; err != nil {
 		t.Fatalf("Run: %v", err)
+	}
+	p.httpMu.Lock()
+	pending := len(p.httpPending)
+	p.httpMu.Unlock()
+	if pending != 0 {
+		t.Fatalf("HTTP correlations remaining after shutdown = %d", pending)
 	}
 }
 
@@ -1217,7 +1367,7 @@ func TestFetchPanicReturnsStructuredErrorWithoutStoppingPeerActor(t *testing.T) 
 
 	runner.emit(wire.Event{
 		Kind: wire.EventActionCall, AID: "healthy-aid", Generation: 1,
-		CallID: 20, Action: "still-healthy",
+		CallID: 20, Action: "still-healthy", ActionTimeoutMS: 1_000,
 	})
 	if command := nextCommand(t, runner); command.Kind != wire.CommandActionResult ||
 		command.CallID != 20 || string(command.Output) != "still-healthy" {

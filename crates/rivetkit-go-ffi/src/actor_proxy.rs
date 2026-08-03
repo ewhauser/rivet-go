@@ -255,6 +255,7 @@ impl ActorProxy {
                 // Sleep/alarm behavior belongs to M5. Keeping M3 actors awake
                 // makes lifecycle changes engine-driven and deterministic.
                 no_sleep: true,
+                action_timeout: ACTION_RESULT_TIMEOUT,
                 actions: actor_actions
                     .get(actor_name)
                     .into_iter()
@@ -670,6 +671,10 @@ impl ActorProxy {
                 r#gen: identity.generation,
                 call_id,
                 action,
+                timeout_ms: ACTION_RESULT_TIMEOUT
+                    .as_millis()
+                    .try_into()
+                    .expect("M3 action timeout fits u32 milliseconds"),
                 args,
                 conn_id,
             })
@@ -711,6 +716,15 @@ impl ActorProxy {
             return Err(WireError::new(
                 "http_request_headers_too_large",
                 format!("HTTP request has more than {MAX_HTTP_HEADERS} headers"),
+            ));
+        }
+        if headers
+            .iter()
+            .any(|(name, value)| name.len() > MAX_BODY_CHUNK || value.len() > MAX_BODY_CHUNK)
+        {
+            return Err(WireError::new(
+                "http_request_header_too_large",
+                format!("HTTP request header exceeds the {MAX_BODY_CHUNK}-byte boundary maximum"),
             ));
         }
         let (req_id, receiver) = self.correlations.insert(HTTP_RESULT_TIMEOUT);
@@ -1210,6 +1224,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unknown_and_expired_action_results_do_not_resolve_a_live_call() {
+        let (events, _event_rx) = bounded(4);
+        let correlations = CorrelationTable::default();
+        let proxy = ActorProxy::new(events, correlations.clone());
+        let (expired_id, expired) = correlations.insert(Duration::ZERO);
+        let (live_id, live) = correlations.insert(Duration::from_secs(1));
+
+        assert_eq!(correlations.expire(Instant::now()), 1);
+        assert_eq!(
+            expired.await.expect("expired action correlation sender"),
+            Err(CorrelationError::Timeout)
+        );
+        proxy.handle_command(Command::ActionResult {
+            call_id: u64::MAX,
+            output: Some(vec![0x01]),
+            error: None,
+        });
+        proxy.handle_command(Command::ActionResult {
+            call_id: expired_id,
+            output: Some(vec![0x02]),
+            error: None,
+        });
+        assert!(correlations.contains(live_id));
+
+        proxy.handle_command(Command::ActionResult {
+            call_id: live_id,
+            output: Some(vec![0x03]),
+            error: None,
+        });
+        let payload = live
+            .await
+            .expect("live action correlation sender")
+            .expect("live action correlation result");
+        let resolution: ActionResolution =
+            rmp_serde::from_slice(&payload).expect("decode live action resolution");
+        assert_eq!(resolution.output, Some(vec![0x03]));
+        assert_eq!(correlations.len(), 0);
+    }
+
+    #[tokio::test]
     async fn streamed_http_commands_assemble_before_core_reply() {
         let (events, event_rx) = bounded(4);
         let correlations = CorrelationTable::default();
@@ -1276,6 +1330,20 @@ mod tests {
         assert_eq!(
             event_rx.recv_timeout(Duration::from_secs(1)),
             Ok(Event::HttpRequestAbort { req_id })
+        );
+        assert!(
+            proxy
+                .active_http
+                .lock()
+                .expect("active HTTP table")
+                .is_empty()
+        );
+        assert!(
+            proxy
+                .http_responses
+                .lock()
+                .expect("HTTP response table")
+                .is_empty()
         );
     }
 }

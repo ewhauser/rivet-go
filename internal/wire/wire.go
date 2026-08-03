@@ -61,34 +61,35 @@ type EventBatch struct {
 // Event is the M3 event union. Fields not selected by Kind are absent from
 // Rust's encoded map and remain zero-valued after decoding.
 type Event struct {
-	Kind           EventKind         `msgpack:"kind"`
-	RunnerID       string            `msgpack:"runner_id,omitempty"`
-	Metadata       map[string]string `msgpack:"metadata,omitempty"`
-	Reason         string            `msgpack:"reason,omitempty"`
-	DrainReport    *DrainReport      `msgpack:"drain_report,omitempty"`
-	AID            string            `msgpack:"aid,omitempty"`
-	Generation     uint64            `msgpack:"gen,omitempty"`
-	Name           string            `msgpack:"name,omitempty"`
-	Key            string            `msgpack:"key,omitempty"`
-	CreateTS       int64             `msgpack:"create_ts,omitempty"`
-	Input          []byte            `msgpack:"input,omitempty"`
-	PersistedState []byte            `msgpack:"persisted_state,omitempty"`
-	KVID           uint64            `msgpack:"kv_id,omitempty"`
-	Value          []byte            `msgpack:"value,omitempty"`
-	Entries        []KVEntry         `msgpack:"entries,omitempty"`
-	StateVersion   uint64            `msgpack:"state_version,omitempty"`
-	Error          *WireError        `msgpack:"error,omitempty"`
-	CallID         uint64            `msgpack:"call_id,omitempty"`
-	Action         string            `msgpack:"action,omitempty"`
-	Args           []byte            `msgpack:"args,omitempty"`
-	ConnID         *string           `msgpack:"conn_id,omitempty"`
-	RequestID      uint64            `msgpack:"req_id,omitempty"`
-	Method         string            `msgpack:"method,omitempty"`
-	Path           string            `msgpack:"path,omitempty"`
-	Headers        map[string]string `msgpack:"headers,omitempty"`
-	Body           []byte            `msgpack:"body,omitempty"`
-	Stream         bool              `msgpack:"stream,omitempty"`
-	Finish         bool              `msgpack:"finish,omitempty"`
+	Kind            EventKind         `msgpack:"kind"`
+	RunnerID        string            `msgpack:"runner_id,omitempty"`
+	Metadata        map[string]string `msgpack:"metadata,omitempty"`
+	Reason          string            `msgpack:"reason,omitempty"`
+	DrainReport     *DrainReport      `msgpack:"drain_report,omitempty"`
+	AID             string            `msgpack:"aid,omitempty"`
+	Generation      uint64            `msgpack:"gen,omitempty"`
+	Name            string            `msgpack:"name,omitempty"`
+	Key             string            `msgpack:"key,omitempty"`
+	CreateTS        int64             `msgpack:"create_ts,omitempty"`
+	Input           []byte            `msgpack:"input,omitempty"`
+	PersistedState  []byte            `msgpack:"persisted_state,omitempty"`
+	KVID            uint64            `msgpack:"kv_id,omitempty"`
+	Value           []byte            `msgpack:"value,omitempty"`
+	Entries         []KVEntry         `msgpack:"entries,omitempty"`
+	StateVersion    uint64            `msgpack:"state_version,omitempty"`
+	Error           *WireError        `msgpack:"error,omitempty"`
+	CallID          uint64            `msgpack:"call_id,omitempty"`
+	Action          string            `msgpack:"action,omitempty"`
+	ActionTimeoutMS uint32            `msgpack:"timeout_ms,omitempty"`
+	Args            []byte            `msgpack:"args,omitempty"`
+	ConnID          *string           `msgpack:"conn_id,omitempty"`
+	RequestID       uint64            `msgpack:"req_id,omitempty"`
+	Method          string            `msgpack:"method,omitempty"`
+	Path            string            `msgpack:"path,omitempty"`
+	Headers         map[string]string `msgpack:"headers,omitempty"`
+	Body            []byte            `msgpack:"body,omitempty"`
+	Stream          bool              `msgpack:"stream,omitempty"`
+	Finish          bool              `msgpack:"finish,omitempty"`
 }
 
 type DrainReport struct {
@@ -203,8 +204,8 @@ func validateEvent(event Event) error {
 			return fmt.Errorf("%s event requires aid and reason", event.Kind)
 		}
 	case EventActionCall:
-		if event.AID == "" || event.CallID == 0 || event.Action == "" {
-			return fmt.Errorf("%s event requires aid, call_id, and action", event.Kind)
+		if event.AID == "" || event.CallID == 0 || event.Action == "" || event.ActionTimeoutMS == 0 {
+			return fmt.Errorf("%s event requires aid, call_id, action, and timeout_ms", event.Kind)
 		}
 	case EventHTTPRequest:
 		if event.AID == "" || event.RequestID == 0 || event.Method == "" || event.Path == "" {

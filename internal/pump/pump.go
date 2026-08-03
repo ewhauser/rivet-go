@@ -20,6 +20,7 @@ const (
 	defaultPollTimeout     = 100 * time.Millisecond
 	defaultShutdownTimeout = 10 * time.Second
 	defaultSaveTimeout     = 35 * time.Second
+	defaultHTTPSubmitLimit = 30 * time.Second
 	defaultSubmitQueue     = 1_024
 	maxSubmitBatch         = 64
 	actorEventQueue        = 64
@@ -61,6 +62,7 @@ type actorFetchHandler interface {
 type HandlerError struct {
 	Code    string
 	Message string
+	Cause   error
 }
 
 func (e HandlerError) Error() string {
@@ -69,6 +71,8 @@ func (e HandlerError) Error() string {
 	}
 	return e.Code + ": " + e.Message
 }
+
+func (e HandlerError) Unwrap() error { return e.Cause }
 
 type actorIdentity struct {
 	aid        string
@@ -246,11 +250,25 @@ func (s *ActorSession) submitHTTP(ctx context.Context, command wire.Command) err
 	if ctx == nil {
 		return errors.New("HTTP response context is nil")
 	}
+	retryCtx, cancel := context.WithTimeout(ctx, s.pump.httpSubmitLimit)
+	defer cancel()
 	backoff := time.Millisecond
 	for {
-		err := s.pump.submitInternal(ctx, command)
+		err := s.pump.submitInternal(retryCtx, command)
 		if err == nil {
 			return nil
+		}
+		if retryCtx.Err() != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			return HandlerError{
+				Code: "http_response_backpressure_timeout",
+				Message: fmt.Sprintf(
+					"HTTP response submission remained backpressured for %s",
+					s.pump.httpSubmitLimit,
+				),
+			}
 		}
 		var coded interface{ ErrorCode() string }
 		if !errors.As(err, &coded) || coded.ErrorCode() != "backpressure" {
@@ -260,11 +278,20 @@ func (s *ActorSession) submitHTTP(ctx context.Context, command wire.Command) err
 		timer := time.NewTimer(backoff + jitter)
 		select {
 		case <-timer.C:
-		case <-ctx.Done():
+		case <-retryCtx.Done():
 			if !timer.Stop() {
 				<-timer.C
 			}
-			return ctx.Err()
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			return HandlerError{
+				Code: "http_response_backpressure_timeout",
+				Message: fmt.Sprintf(
+					"HTTP response submission remained backpressured for %s",
+					s.pump.httpSubmitLimit,
+				),
+			}
 		case <-s.done:
 			if !timer.Stop() {
 				<-timer.C
@@ -686,6 +713,7 @@ type Pump struct {
 	pollTimeout     time.Duration
 	shutdownTimeout time.Duration
 	saveTimeout     time.Duration
+	httpSubmitLimit time.Duration
 	handlers        map[string]ActorHandler
 
 	started      atomic.Bool
@@ -731,6 +759,7 @@ func NewWithHandlers(runner Runner, handlers map[string]ActorHandler) *Pump {
 		pollTimeout:     defaultPollTimeout,
 		shutdownTimeout: defaultShutdownTimeout,
 		saveTimeout:     defaultSaveTimeout,
+		httpSubmitLimit: defaultHTTPSubmitLimit,
 		handlers:        ownedHandlers,
 		submitQueue:     make(chan submitRequest, defaultSubmitQueue),
 		submitStop:      make(chan struct{}),
@@ -1087,7 +1116,10 @@ func (w *actorWorker) run(start wire.Event) {
 		}
 		switch event.Kind {
 		case wire.EventActionCall:
-			output, actionError := invokeAction(w.ctx, w.handler, w.session, event, state)
+			actionTimeout := time.Duration(event.ActionTimeoutMS) * time.Millisecond
+			actionContext, cancelAction := context.WithTimeout(w.ctx, actionTimeout)
+			output, actionError := invokeAction(actionContext, w.handler, w.session, event, state)
+			cancelAction()
 			if actionError == nil && output == nil {
 				output = []byte{}
 			}

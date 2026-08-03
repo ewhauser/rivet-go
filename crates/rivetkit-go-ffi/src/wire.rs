@@ -60,6 +60,7 @@ pub(crate) enum Event {
         r#gen: u64,
         call_id: u64,
         action: String,
+        timeout_ms: u32,
         #[serde(with = "serde_bytes")]
         args: Vec<u8>,
         conn_id: Option<String>,
@@ -326,6 +327,13 @@ impl CommandBatch {
                     if headers.len() > MAX_HTTP_HEADERS {
                         return Err(format!(
                             "http_response_start headers exceed boundary maximum {MAX_HTTP_HEADERS}"
+                        ));
+                    }
+                    if headers.iter().any(|(name, value)| {
+                        name.len() > MAX_BODY_CHUNK || value.len() > MAX_BODY_CHUNK
+                    }) {
+                        return Err(format!(
+                            "http_response_start header exceeds boundary maximum {MAX_BODY_CHUNK} bytes"
                         ));
                     }
                     if body.len() > MAX_BODY_CHUNK {
@@ -619,6 +627,7 @@ mod tests {
                 r#gen: 7,
                 call_id: 21,
                 action: "increment".to_owned(),
+                timeout_ms: 60_000,
                 args: vec![0x81, 0x02],
                 conn_id: Some("conn-golden".to_owned()),
             }],

@@ -1,6 +1,7 @@
 package wire
 
 import (
+	"crypto/sha256"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -42,7 +43,10 @@ func TestRustRunnerConfigGolden(t *testing.T) {
 		t.Fatal(err)
 	}
 	if !reflect.DeepEqual(encoded, data) {
-		t.Fatalf("Go RunnerConfig encoding differs from Rust golden:\n got: %x\nwant: %x", encoded, data)
+		t.Fatalf(
+			"Go RunnerConfig encoding differs from Rust golden: got len=%d sha256=%x, want len=%d sha256=%x",
+			len(encoded), sha256.Sum256(encoded), len(data), sha256.Sum256(data),
+		)
 	}
 }
 
@@ -72,6 +76,9 @@ func TestRustEventBatchGoldens(t *testing.T) {
 			}
 			if batch.Seq != test.seq || len(batch.Events) != 1 || batch.Events[0].Kind != test.kind {
 				t.Fatalf("unexpected decoded batch: %#v", batch)
+			}
+			if test.kind == EventActionCall && batch.Events[0].ActionTimeoutMS != 60_000 {
+				t.Fatalf("action timeout = %d ms, want 60000", batch.Events[0].ActionTimeoutMS)
 			}
 		})
 	}
@@ -183,7 +190,10 @@ func TestRustEmptyCommandBatchGolden(t *testing.T) {
 		t.Fatal(err)
 	}
 	if !reflect.DeepEqual(encoded, data) {
-		t.Fatalf("Go CommandBatch encoding differs from Rust golden:\n got: %x\nwant: %x", encoded, data)
+		t.Fatalf(
+			"Go CommandBatch encoding differs from Rust golden: got len=%d sha256=%x, want len=%d sha256=%x",
+			len(encoded), sha256.Sum256(encoded), len(data), sha256.Sum256(data),
+		)
 	}
 }
 

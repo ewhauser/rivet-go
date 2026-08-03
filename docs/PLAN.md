@@ -330,9 +330,28 @@ not expose a client-disconnect notification at this embedder seam, so
 shutdown cancel the request context directly. These constraints are pinned-core
 deviations, not public streaming or abort guarantees for later engine versions.
 
+The action deadline is part of each M3 `ActionCall` and comes from the same
+60-second Rust duration configured on the core actor. Context-aware Go action
+adapters receive that deadline. Cancellation is cooperative; core returns a
+structured timeout even if a handler ignores it, and a late result cannot
+resolve a different call. The actor resumes serialized work after the handler
+returns.
+
+The M3 response writer does not advertise `http.Flusher` because the pinned
+core buffers the reply. It serializes concurrent writes, rejects writes after
+the handler returns, enforces declared `Content-Length`, and bounds native
+backpressure retry to 30 seconds. Header maps remain limited to 256 names; the
+public gateway rejects an over-limit request with HTTP 431 before dispatch.
+Repeated request fields arrive as the last value at this pin; multiple
+`Set-Cookie` response values are rejected structurally rather than joined into
+an invalid field. Header names and values over the boundary's 1 MiB blob cap
+also fail structurally.
+
 The real-engine conformance test uses `net/http` against
 `/gateway/{actor_id}/action/{action}` and `/gateway/{actor_id}/request/...`.
 It asserts action results and persisted state, cross-actor isolation, a raw
 HTTP response spanning multiple boundary chunks, structured missing-action
 errors, and actor-local action/fetch panic handling exclusively from public
-HTTP and engine-observed results.
+HTTP and engine-observed results. A separate restart case mutates state only
+inside an action and proves the implicit successful-action save rehydrates in
+a higher actor generation after a real engine process replacement.
