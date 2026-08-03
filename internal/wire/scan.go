@@ -9,10 +9,11 @@ const (
 	// The envelope schema needs depth 4; 64 leaves headroom without permitting
 	// stack abuse.
 	maxScanDepth = 64
-	// A native poll returns at most 64 events. Capping every array at that same
-	// value prevents a valid-sized hostile input from amplifying into a much
-	// larger []Event allocation inside msgpack.Unmarshal.
-	maxArrayEntries = 64
+	// A native poll still returns at most 64 events, while one KvResult may
+	// contain up to the boundary's explicit 1024-entry list limit. The raw
+	// remaining-bytes check is the primary allocation guard; this cap limits
+	// container amplification while accepting every valid M2 KV response.
+	maxArrayEntries = 1_024
 	// Event maps are small, but metadata is extensible. This bound is well above
 	// the M1 schema while still preventing allocation amplification.
 	maxMapEntries = 1_024

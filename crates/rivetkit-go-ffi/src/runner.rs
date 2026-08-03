@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, Once, mpsc as std_mpsc};
 use std::thread::{self, JoinHandle};
@@ -14,6 +14,7 @@ use tokio_util::sync::CancellationToken;
 use url::Url;
 
 use crate::ErrorPayload;
+use crate::actor_proxy::ActorProxy;
 use crate::correlation::CorrelationTable;
 use crate::wire::{CommandBatch, DrainReport, Event, EventBatch, RunnerConfig};
 
@@ -131,12 +132,6 @@ impl RunnerInner {
     }
 
     pub(crate) fn submit(&self, bytes: &[u8]) -> Result<(), ErrorPayload> {
-        if self.shutdown_started.load(Ordering::Acquire) {
-            return Err(ErrorPayload::new(
-                "shutting_down",
-                "runner is shutting down",
-            ));
-        }
         let batch = CommandBatch::decode(bytes).map_err(|error| {
             ErrorPayload::new(
                 "invalid_command_batch",
@@ -146,9 +141,12 @@ impl RunnerInner {
         if batch.contains_unknown() {
             return Err(ErrorPayload::new(
                 "unknown_command",
-                "CommandBatch contains a command not supported by M1",
+                "CommandBatch contains a command not supported by M2",
             ));
         }
+        batch
+            .validate()
+            .map_err(|message| ErrorPayload::new("invalid_command_batch", message))?;
 
         self.commands.try_send(batch).map_err(|error| match error {
             mpsc::error::TrySendError::Full(_) => ErrorPayload::new(
@@ -271,11 +269,26 @@ fn validate_config(config: &RunnerConfig) -> Result<(), ErrorPayload> {
             "total_slots must be greater than zero",
         ));
     }
-    if !config.actor_names.is_empty() {
+    if config.actor_names.len() > 1_024 {
         return Err(ErrorPayload::new(
-            "unsupported_actor_manifest",
-            "M1 only supports an empty actor_names manifest",
+            "invalid_config",
+            "actor_names must contain at most 1024 entries",
         ));
+    }
+    let mut seen_actor_names = BTreeSet::new();
+    for name in &config.actor_names {
+        if name.trim().is_empty() {
+            return Err(ErrorPayload::new(
+                "invalid_config",
+                "actor_names entries must not be empty",
+            ));
+        }
+        if !seen_actor_names.insert(name) {
+            return Err(ErrorPayload::new(
+                "invalid_config",
+                format!("actor_names contains duplicate `{name}`"),
+            ));
+        }
     }
     if !matches!(
         config.log_level.as_str(),
@@ -326,14 +339,16 @@ fn runner_thread(
 async fn run_runner(
     config: RunnerConfig,
     events: Sender<Event>,
-    mut commands: mpsc::Receiver<CommandBatch>,
+    commands: mpsc::Receiver<CommandBatch>,
     mut shutdown: watch::Receiver<Option<u32>>,
     startup: std_mpsc::SyncSender<StartupResult>,
     correlations: CorrelationTable,
 ) {
     let cancellation = CancellationToken::new();
     let (handle_tx, handle_rx) = oneshot::channel();
-    let registry = CoreRegistry::new();
+    let actor_proxy = ActorProxy::new(events.clone(), correlations.clone());
+    let mut registry = CoreRegistry::new();
+    actor_proxy.register(&mut registry, &config.actor_names);
     let serve_config = ServeConfig {
         version: config.version,
         endpoint: config.engine_endpoint.clone(),
@@ -422,7 +437,12 @@ async fn run_runner(
     correlation_sweep.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut seen_healthy = handle.status().ping_healthy;
     let mut connected = true;
-    let mut commands_open = true;
+    let command_cancellation = CancellationToken::new();
+    let mut command_task = tokio::spawn(command_loop(
+        commands,
+        actor_proxy.clone(),
+        command_cancellation.clone(),
+    ));
 
     loop {
         tokio::select! {
@@ -439,6 +459,9 @@ async fn run_runner(
                     &mut serve,
                     &events,
                     &correlations,
+                    &actor_proxy,
+                    command_cancellation,
+                    &mut command_task,
                 ).await;
                 return;
             }
@@ -453,13 +476,11 @@ async fn run_runner(
                         actors_remaining: handle.status().active_actor_count as u32,
                     },
                 });
+                command_cancellation.cancel();
+                let _ = command_task.await;
+                actor_proxy.drain_shutdown();
                 correlations.drain_shutdown();
                 return;
-            }
-            batch = commands.recv(), if commands_open => {
-                if batch.is_none() {
-                    commands_open = false;
-                }
             }
             _ = health.tick() => {
                 let healthy = handle.status().ping_healthy;
@@ -478,6 +499,27 @@ async fn run_runner(
             }
             _ = correlation_sweep.tick() => {
                 correlations.expire(Instant::now());
+                actor_proxy.sweep_pending();
+            }
+        }
+    }
+}
+
+async fn command_loop(
+    mut commands: mpsc::Receiver<CommandBatch>,
+    actor_proxy: ActorProxy,
+    cancellation: CancellationToken,
+) {
+    loop {
+        tokio::select! {
+            _ = cancellation.cancelled() => return,
+            batch = commands.recv() => {
+                let Some(batch) = batch else {
+                    return;
+                };
+                for command in batch.commands {
+                    actor_proxy.handle_command(command);
+                }
             }
         }
     }
@@ -507,6 +549,7 @@ fn serve_error(
     ErrorPayload::new("connection_failed", message)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn finish_shutdown(
     deadline_ms: u32,
     handle: &CoreEnvoyHandle,
@@ -514,6 +557,9 @@ async fn finish_shutdown(
     serve: &mut tokio::task::JoinHandle<anyhow::Result<()>>,
     events: &Sender<Event>,
     correlations: &CorrelationTable,
+    actor_proxy: &ActorProxy,
+    command_cancellation: CancellationToken,
+    command_task: &mut tokio::task::JoinHandle<()>,
 ) {
     let started = Instant::now();
     let actors_before = handle.status().active_actor_count as u32;
@@ -533,6 +579,8 @@ async fn finish_shutdown(
         }
     };
     let actors_remaining = handle.status().active_actor_count as u32;
+    command_cancellation.cancel();
+    let _ = command_task.await;
     let _ = events.send(Event::RunnerStopped {
         drain_report: DrainReport {
             graceful,
@@ -541,6 +589,7 @@ async fn finish_shutdown(
             actors_remaining,
         },
     });
+    actor_proxy.drain_shutdown();
     correlations.drain_shutdown();
 }
 
@@ -634,15 +683,17 @@ mod tests {
     }
 
     #[test]
-    fn validates_m1_config() {
+    fn validates_m2_config() {
         assert!(validate_config(&valid_config()).is_ok());
         let mut config = valid_config();
         config.actor_names.push("actor".to_owned());
+        assert!(validate_config(&config).is_ok());
+        config.actor_names.push("actor".to_owned());
         assert_eq!(
             validate_config(&config)
-                .expect_err("actor manifest must fail")
+                .expect_err("duplicate actor name")
                 .code,
-            "unsupported_actor_manifest"
+            "invalid_config"
         );
     }
 

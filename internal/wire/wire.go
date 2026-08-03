@@ -15,6 +15,22 @@ const (
 	EventRunnerConnected    EventKind = "runner_connected"
 	EventRunnerDisconnected EventKind = "runner_disconnected"
 	EventRunnerStopped      EventKind = "runner_stopped"
+	EventActorStart         EventKind = "actor_start"
+	EventActorStop          EventKind = "actor_stop"
+	EventKVResult           EventKind = "kv_result"
+	EventStatePersisted     EventKind = "state_persisted"
+)
+
+type CommandKind string
+
+const (
+	CommandActorStartResult CommandKind = "actor_start_result"
+	CommandActorStopResult  CommandKind = "actor_stop_result"
+	CommandSaveState        CommandKind = "save_state"
+	CommandKVGet            CommandKind = "kv_get"
+	CommandKVList           CommandKind = "kv_list"
+	CommandKVPut            CommandKind = "kv_put"
+	CommandKVDelete         CommandKind = "kv_delete"
 )
 
 // RunnerConfig is consumed by rk_runner_new.
@@ -34,14 +50,26 @@ type EventBatch struct {
 	Events []Event `msgpack:"events"`
 }
 
-// Event is the M1 event union. Fields not selected by Kind are absent from
-// the encoded map.
+// Event is the M2 event union. Fields not selected by Kind are absent from
+// Rust's encoded map and remain zero-valued after decoding.
 type Event struct {
-	Kind        EventKind         `msgpack:"kind"`
-	RunnerID    string            `msgpack:"runner_id,omitempty"`
-	Metadata    map[string]string `msgpack:"metadata,omitempty"`
-	Reason      string            `msgpack:"reason,omitempty"`
-	DrainReport *DrainReport      `msgpack:"drain_report,omitempty"`
+	Kind           EventKind         `msgpack:"kind"`
+	RunnerID       string            `msgpack:"runner_id,omitempty"`
+	Metadata       map[string]string `msgpack:"metadata,omitempty"`
+	Reason         string            `msgpack:"reason,omitempty"`
+	DrainReport    *DrainReport      `msgpack:"drain_report,omitempty"`
+	AID            string            `msgpack:"aid,omitempty"`
+	Generation     uint64            `msgpack:"gen,omitempty"`
+	Name           string            `msgpack:"name,omitempty"`
+	Key            string            `msgpack:"key,omitempty"`
+	CreateTS       int64             `msgpack:"create_ts,omitempty"`
+	Input          []byte            `msgpack:"input,omitempty"`
+	PersistedState []byte            `msgpack:"persisted_state,omitempty"`
+	KVID           uint64            `msgpack:"kv_id,omitempty"`
+	Value          []byte            `msgpack:"value,omitempty"`
+	Entries        []KVEntry         `msgpack:"entries,omitempty"`
+	StateVersion   uint64            `msgpack:"state_version,omitempty"`
+	Error          *WireError        `msgpack:"error,omitempty"`
 }
 
 type DrainReport struct {
@@ -51,14 +79,43 @@ type DrainReport struct {
 	ActorsRemaining uint32 `msgpack:"actors_remaining"`
 }
 
-// CommandBatch is accepted by rk_runner_submit. M1 supports empty batches;
-// non-empty batches are represented so Rust can return unknown_command.
+type WireError struct {
+	Code    string `msgpack:"code"`
+	Message string `msgpack:"message"`
+}
+
+func (e WireError) Error() string {
+	if e.Code == "" {
+		return e.Message
+	}
+	return e.Code + ": " + e.Message
+}
+
+type KVEntry struct {
+	Key   []byte `msgpack:"key"`
+	Value []byte `msgpack:"value"`
+}
+
 type CommandBatch struct {
 	Commands []Command `msgpack:"commands"`
 }
 
+// Command is the M2 command union. All fields are encoded so zero-length keys,
+// values, state, and generation zero remain distinguishable from a missing
+// required field. Rust ignores fields that do not belong to the selected kind.
 type Command struct {
-	Kind string `msgpack:"kind"`
+	Kind       CommandKind `msgpack:"kind"`
+	AID        string      `msgpack:"aid"`
+	Generation uint64      `msgpack:"gen"`
+	OK         bool        `msgpack:"ok"`
+	Error      *WireError  `msgpack:"error"`
+	State      []byte      `msgpack:"state"`
+	KVID       uint64      `msgpack:"kv_id"`
+	Key        []byte      `msgpack:"key"`
+	Prefix     []byte      `msgpack:"prefix"`
+	Reverse    bool        `msgpack:"reverse"`
+	Limit      *uint32     `msgpack:"limit"`
+	Value      []byte      `msgpack:"value"`
 }
 
 func EncodeRunnerConfig(config RunnerConfig) ([]byte, error) {
@@ -110,8 +167,27 @@ func validateEvent(event Event) error {
 		if event.DrainReport == nil {
 			return fmt.Errorf("%s event has no drain_report", event.Kind)
 		}
+	case EventActorStart:
+		if event.AID == "" || event.Name == "" {
+			return fmt.Errorf("%s event requires aid and name", event.Kind)
+		}
+	case EventActorStop:
+		if event.AID == "" || event.Reason == "" {
+			return fmt.Errorf("%s event requires aid and reason", event.Kind)
+		}
+	case EventKVResult:
+		if event.KVID == 0 {
+			return fmt.Errorf("%s event has invalid kv_id", event.Kind)
+		}
+	case EventStatePersisted:
+		if event.AID == "" {
+			return fmt.Errorf("%s event has empty aid", event.Kind)
+		}
 	default:
 		return fmt.Errorf("unknown event kind %q", event.Kind)
+	}
+	if event.Error != nil && (event.Error.Code == "" || event.Error.Message == "") {
+		return fmt.Errorf("%s event has incomplete structured error", event.Kind)
 	}
 	return nil
 }

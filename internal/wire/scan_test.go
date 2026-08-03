@@ -61,6 +61,10 @@ func TestValidateShapeAcceptsGoldens(t *testing.T) {
 		"event_connected.msgpack",
 		"event_disconnected.msgpack",
 		"event_stopped.msgpack",
+		"event_actor_start.msgpack",
+		"event_actor_stop.msgpack",
+		"event_kv_result.msgpack",
+		"event_state_persisted.msgpack",
 	} {
 		data := golden(t, name)
 		if err := validateShape(data); err != nil {
@@ -179,6 +183,29 @@ func TestGoEncoderOutputsPassShapeValidation(t *testing.T) {
 			DrainReport: &DrainReport{
 				Graceful: true,
 			},
+		}}},
+		EventBatch{Seq: 4, Events: []Event{{
+			Kind:           EventActorStart,
+			AID:            "actor",
+			Name:           "counter",
+			PersistedState: []byte("state"),
+		}}},
+		EventBatch{Seq: 5, Events: []Event{{
+			Kind:   EventActorStop,
+			AID:    "actor",
+			Reason: "destroy",
+		}}},
+		EventBatch{Seq: 6, Events: []Event{{
+			Kind: EventKVResult,
+			KVID: 1,
+			Entries: []KVEntry{{
+				Key: []byte("key"), Value: []byte("value"),
+			}},
+		}}},
+		EventBatch{Seq: 7, Events: []Event{{
+			Kind:         EventStatePersisted,
+			AID:          "actor",
+			StateVersion: 1,
 		}}},
 	}
 	for _, value := range values {

@@ -37,6 +37,42 @@ pub(crate) enum Event {
     RunnerStopped {
         drain_report: DrainReport,
     },
+    ActorStart {
+        aid: String,
+        r#gen: u64,
+        name: String,
+        key: String,
+        create_ts: i64,
+        #[serde(with = "serde_bytes")]
+        input: Vec<u8>,
+        #[serde(with = "serde_bytes")]
+        persisted_state: Vec<u8>,
+    },
+    ActorStop {
+        aid: String,
+        r#gen: u64,
+        reason: String,
+    },
+    KvResult {
+        kv_id: u64,
+        #[serde(
+            default,
+            with = "optional_bytes",
+            skip_serializing_if = "Option::is_none"
+        )]
+        value: Option<Vec<u8>>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        entries: Vec<KvEntry>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        error: Option<WireError>,
+    },
+    StatePersisted {
+        aid: String,
+        r#gen: u64,
+        state_version: u64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        error: Option<WireError>,
+    },
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -48,6 +84,29 @@ pub(crate) struct DrainReport {
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub(crate) struct WireError {
+    pub code: String,
+    pub message: String,
+}
+
+impl WireError {
+    pub(crate) fn new(code: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            code: code.into(),
+            message: message.into(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub(crate) struct KvEntry {
+    #[serde(with = "serde_bytes")]
+    pub key: Vec<u8>,
+    #[serde(with = "serde_bytes")]
+    pub value: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct CommandBatch {
     pub commands: Vec<Command>,
@@ -56,8 +115,79 @@ pub(crate) struct CommandBatch {
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub(crate) enum Command {
+    ActorStartResult {
+        aid: String,
+        #[serde(default)]
+        r#gen: u64,
+        ok: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<WireError>,
+    },
+    ActorStopResult {
+        aid: String,
+        #[serde(default)]
+        r#gen: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<WireError>,
+    },
+    SaveState {
+        aid: String,
+        #[serde(default)]
+        r#gen: u64,
+        #[serde(with = "serde_bytes")]
+        state: Vec<u8>,
+    },
+    KvGet {
+        kv_id: u64,
+        aid: String,
+        #[serde(with = "serde_bytes")]
+        key: Vec<u8>,
+    },
+    KvList {
+        kv_id: u64,
+        aid: String,
+        #[serde(with = "serde_bytes")]
+        prefix: Vec<u8>,
+        #[serde(default)]
+        reverse: bool,
+        #[serde(default)]
+        limit: Option<u32>,
+    },
+    KvPut {
+        kv_id: u64,
+        aid: String,
+        #[serde(with = "serde_bytes")]
+        key: Vec<u8>,
+        #[serde(with = "serde_bytes")]
+        value: Vec<u8>,
+    },
+    KvDelete {
+        kv_id: u64,
+        aid: String,
+        #[serde(with = "serde_bytes")]
+        key: Vec<u8>,
+    },
     #[serde(other)]
     Unknown,
+}
+
+mod optional_bytes {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    use serde_bytes::{ByteBuf, Bytes};
+
+    pub(super) fn serialize<S>(value: &Option<Vec<u8>>, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        value.as_deref().map(Bytes::new).serialize(serializer)
+    }
+
+    pub(super) fn deserialize<'de, D>(deserializer: D) -> Result<Option<Vec<u8>>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Option::<ByteBuf>::deserialize(deserializer).map(|value| value.map(ByteBuf::into_vec))
+    }
 }
 
 impl EventBatch {
@@ -75,6 +205,61 @@ impl CommandBatch {
         self.commands
             .iter()
             .any(|command| matches!(command, Command::Unknown))
+    }
+
+    pub(crate) fn validate(&self) -> Result<(), String> {
+        const MAX_KV_LIST_ENTRIES: u32 = 1_024;
+
+        for command in &self.commands {
+            match command {
+                Command::ActorStartResult { aid, ok, error, .. } => {
+                    require_aid(aid)?;
+                    if *ok == error.is_some() {
+                        return Err(
+                            "actor_start_result must contain exactly one of ok=true or error"
+                                .to_owned(),
+                        );
+                    }
+                }
+                Command::ActorStopResult { aid, .. } | Command::SaveState { aid, .. } => {
+                    require_aid(aid)?;
+                }
+                Command::KvGet { kv_id, aid, .. }
+                | Command::KvPut { kv_id, aid, .. }
+                | Command::KvDelete { kv_id, aid, .. } => {
+                    require_kv(*kv_id, aid)?;
+                }
+                Command::KvList {
+                    kv_id, aid, limit, ..
+                } => {
+                    require_kv(*kv_id, aid)?;
+                    if limit.is_some_and(|limit| limit > MAX_KV_LIST_ENTRIES) {
+                        return Err(format!(
+                            "kv_list limit exceeds boundary maximum {MAX_KV_LIST_ENTRIES}"
+                        ));
+                    }
+                }
+                Command::Unknown => return Err("unknown command".to_owned()),
+            }
+        }
+        Ok(())
+    }
+}
+
+fn require_aid(aid: &str) -> Result<(), String> {
+    if aid.is_empty() {
+        Err("actor command aid must not be empty".to_owned())
+    } else {
+        Ok(())
+    }
+}
+
+fn require_kv(kv_id: u64, aid: &str) -> Result<(), String> {
+    require_aid(aid)?;
+    if kv_id == 0 {
+        Err("KV command kv_id must be greater than zero".to_owned())
+    } else {
+        Ok(())
     }
 }
 
@@ -105,7 +290,7 @@ mod tests {
             runner_name: "rivet-go-golden".to_owned(),
             version: 1,
             total_slots: 4,
-            actor_names: Vec::new(),
+            actor_names: vec!["counter".to_owned()],
             log_level: "info".to_owned(),
         };
         write_golden(
@@ -145,7 +330,7 @@ mod tests {
                 drain_report: DrainReport {
                     graceful: true,
                     elapsed_ms: 12,
-                    actors_stopped: 0,
+                    actors_stopped: 1,
                     actors_remaining: 0,
                 },
             }],
@@ -155,6 +340,69 @@ mod tests {
             &stopped.encode().expect("encode stopped event"),
         );
 
+        let actor_start = EventBatch {
+            seq: 4,
+            events: vec![Event::ActorStart {
+                aid: "actor-golden".to_owned(),
+                r#gen: 7,
+                name: "counter".to_owned(),
+                key: "tenant/counter".to_owned(),
+                create_ts: 0,
+                input: b"input".to_vec(),
+                persisted_state: b"state".to_vec(),
+            }],
+        };
+        write_golden(
+            "event_actor_start.msgpack",
+            &actor_start.encode().expect("encode actor start event"),
+        );
+
+        let actor_stop = EventBatch {
+            seq: 5,
+            events: vec![Event::ActorStop {
+                aid: "actor-golden".to_owned(),
+                r#gen: 7,
+                reason: "destroy".to_owned(),
+            }],
+        };
+        write_golden(
+            "event_actor_stop.msgpack",
+            &actor_stop.encode().expect("encode actor stop event"),
+        );
+
+        let kv_result = EventBatch {
+            seq: 6,
+            events: vec![Event::KvResult {
+                kv_id: 11,
+                value: None,
+                entries: vec![KvEntry {
+                    key: b"key".to_vec(),
+                    value: b"value".to_vec(),
+                }],
+                error: None,
+            }],
+        };
+        write_golden(
+            "event_kv_result.msgpack",
+            &kv_result.encode().expect("encode KV result event"),
+        );
+
+        let state_persisted = EventBatch {
+            seq: 7,
+            events: vec![Event::StatePersisted {
+                aid: "actor-golden".to_owned(),
+                r#gen: 7,
+                state_version: 2,
+                error: None,
+            }],
+        };
+        write_golden(
+            "event_state_persisted.msgpack",
+            &state_persisted
+                .encode()
+                .expect("encode state persisted event"),
+        );
+
         write_golden(
             "command_empty.msgpack",
             &rmp_serde::to_vec_named(&CommandBatch {
@@ -162,19 +410,81 @@ mod tests {
             })
             .expect("encode empty command batch"),
         );
+        write_golden(
+            "command_m2.msgpack",
+            &rmp_serde::to_vec_named(&CommandBatch {
+                commands: vec![
+                    Command::ActorStartResult {
+                        aid: "actor-golden".to_owned(),
+                        r#gen: 7,
+                        ok: true,
+                        error: None,
+                    },
+                    Command::ActorStopResult {
+                        aid: "actor-golden".to_owned(),
+                        r#gen: 7,
+                        error: None,
+                    },
+                    Command::SaveState {
+                        aid: "actor-golden".to_owned(),
+                        r#gen: 7,
+                        state: b"state".to_vec(),
+                    },
+                    Command::KvGet {
+                        kv_id: 11,
+                        aid: "actor-golden".to_owned(),
+                        key: b"key".to_vec(),
+                    },
+                    Command::KvList {
+                        kv_id: 12,
+                        aid: "actor-golden".to_owned(),
+                        prefix: b"prefix".to_vec(),
+                        reverse: false,
+                        limit: Some(32),
+                    },
+                    Command::KvPut {
+                        kv_id: 13,
+                        aid: "actor-golden".to_owned(),
+                        key: b"key".to_vec(),
+                        value: b"value".to_vec(),
+                    },
+                    Command::KvDelete {
+                        kv_id: 14,
+                        aid: "actor-golden".to_owned(),
+                        key: b"key".to_vec(),
+                    },
+                ],
+            })
+            .expect("encode M2 command batch"),
+        );
     }
 
     #[test]
     fn event_batch_round_trip() {
         let batch = EventBatch {
             seq: 7,
-            events: vec![Event::RunnerDisconnected {
-                reason: "test".to_owned(),
+            events: vec![Event::ActorStop {
+                aid: "actor".to_owned(),
+                r#gen: 2,
+                reason: "destroy".to_owned(),
             }],
         };
         let bytes = batch.encode().expect("encode event batch");
         let decoded: EventBatch = rmp_serde::from_slice(&bytes).expect("decode event batch");
         assert_eq!(decoded, batch);
+    }
+
+    #[test]
+    fn command_validation_rejects_inconsistent_start_result() {
+        let batch = CommandBatch {
+            commands: vec![Command::ActorStartResult {
+                aid: "actor".to_owned(),
+                r#gen: 1,
+                ok: true,
+                error: Some(WireError::new("unexpected", "both result arms")),
+            }],
+        };
+        assert!(batch.validate().is_err());
     }
 
     #[test]

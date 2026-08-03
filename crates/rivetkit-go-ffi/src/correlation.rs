@@ -113,6 +113,14 @@ impl CorrelationTable {
             .len()
     }
 
+    pub(crate) fn contains(&self, id: u64) -> bool {
+        self.inner
+            .entries
+            .lock()
+            .expect("correlation table poisoned")
+            .contains_key(&id)
+    }
+
     fn remove(&self, id: u64) -> Option<Entry> {
         self.inner
             .entries

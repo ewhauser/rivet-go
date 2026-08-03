@@ -10,6 +10,7 @@ use std::ptr;
 
 use serde::{Deserialize, Serialize};
 
+mod actor_proxy;
 mod correlation;
 mod runner;
 mod wire;
@@ -21,7 +22,7 @@ use wire::RunnerConfig;
 compile_error!("rivetkit-go-ffi requires panic=unwind for its C ABI firewall");
 
 /// The single source of truth for the native ABI version.
-pub const RK_ABI_VERSION: u32 = 1;
+pub const RK_ABI_VERSION: u32 = 2;
 
 // Keep the upstream dependency in the release dylib rather than merely in the
 // Cargo graph. Calling a small, stable core helper makes both the selected API

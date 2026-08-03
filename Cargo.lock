@@ -1655,6 +1655,7 @@ dependencies = [
  "rivetkit-core",
  "rmp-serde",
  "serde",
+ "serde_bytes",
  "serde_json",
  "tempfile",
  "tokio",

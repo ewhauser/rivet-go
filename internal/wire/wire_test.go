@@ -25,7 +25,7 @@ func TestRustRunnerConfigGolden(t *testing.T) {
 		RunnerName:     "rivet-go-golden",
 		Version:        1,
 		TotalSlots:     4,
-		ActorNames:     []string{},
+		ActorNames:     []string{"counter"},
 		LogLevel:       "info",
 	}
 	var got RunnerConfig
@@ -54,6 +54,10 @@ func TestRustEventBatchGoldens(t *testing.T) {
 		{"event_connected.msgpack", EventRunnerConnected, 1},
 		{"event_disconnected.msgpack", EventRunnerDisconnected, 2},
 		{"event_stopped.msgpack", EventRunnerStopped, 3},
+		{"event_actor_start.msgpack", EventActorStart, 4},
+		{"event_actor_stop.msgpack", EventActorStop, 5},
+		{"event_kv_result.msgpack", EventKVResult, 6},
+		{"event_state_persisted.msgpack", EventStatePersisted, 7},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -65,6 +69,37 @@ func TestRustEventBatchGoldens(t *testing.T) {
 				t.Fatalf("unexpected decoded batch: %#v", batch)
 			}
 		})
+	}
+}
+
+func TestRustM2CommandBatchGolden(t *testing.T) {
+	data := golden(t, "command_m2.msgpack")
+	var batch CommandBatch
+	if err := decode(data, &batch); err != nil {
+		t.Fatal(err)
+	}
+	want := []CommandKind{
+		CommandActorStartResult,
+		CommandActorStopResult,
+		CommandSaveState,
+		CommandKVGet,
+		CommandKVList,
+		CommandKVPut,
+		CommandKVDelete,
+	}
+	if len(batch.Commands) != len(want) {
+		t.Fatalf("command count = %d, want %d", len(batch.Commands), len(want))
+	}
+	for i, kind := range want {
+		if batch.Commands[i].Kind != kind {
+			t.Fatalf("command %d kind = %q, want %q", i, batch.Commands[i].Kind, kind)
+		}
+	}
+	if batch.Commands[0].AID != "actor-golden" || !batch.Commands[0].OK {
+		t.Fatalf("unexpected actor start result: %#v", batch.Commands[0])
+	}
+	if batch.Commands[4].Limit == nil || *batch.Commands[4].Limit != 32 {
+		t.Fatalf("unexpected KV list limit: %#v", batch.Commands[4].Limit)
 	}
 }
 

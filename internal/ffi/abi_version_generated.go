@@ -2,4 +2,4 @@
 
 package ffi
 
-const ExpectedABIVersion uint32 = 1
+const ExpectedABIVersion uint32 = 2
