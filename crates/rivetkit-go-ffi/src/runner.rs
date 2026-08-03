@@ -181,6 +181,13 @@ impl RunnerInner {
             .expect("runner thread mutex poisoned")
             .take()
         {
+            // Free is permitted without a prior shutdown/poll drain. Keep the
+            // bounded event queue moving while the runtime emits its final
+            // state so a parked sender cannot make ownership reclamation hang.
+            while !thread.is_finished() {
+                while self.events.try_recv().is_ok() {}
+                thread::sleep(Duration::from_millis(1));
+            }
             let _ = thread.join();
         }
     }
@@ -710,5 +717,37 @@ mod tests {
             STARTUP_RESULT_TIMEOUT,
             started.elapsed()
         );
+    }
+
+    #[test]
+    fn close_without_shutdown_drains_a_parked_event_sender() {
+        let (event_tx, event_rx) = bounded(1);
+        event_tx
+            .send(Event::RunnerDisconnected {
+                reason: "fill queue".to_owned(),
+            })
+            .expect("fill event queue");
+        let thread = thread::spawn(move || {
+            event_tx
+                .send(Event::RunnerDisconnected {
+                    reason: "parked sender".to_owned(),
+                })
+                .expect("send after queue drain");
+        });
+        let (command_tx, _command_rx) = mpsc::channel(1);
+        let (shutdown_tx, _shutdown_rx) = watch::channel(None);
+        let runner = RunnerInner {
+            events: event_rx,
+            commands: command_tx,
+            shutdown: shutdown_tx,
+            thread: Mutex::new(Some(thread)),
+            polling: AtomicBool::new(false),
+            shutdown_started: AtomicBool::new(false),
+            next_seq: AtomicU64::new(1),
+            correlations: CorrelationTable::default(),
+        };
+
+        runner.close();
+        assert!(runner.shutdown_started.load(Ordering::Acquire));
     }
 }
