@@ -1304,7 +1304,13 @@ impl ActorProxy {
             .map_err(|error| WireError::new("ws_open_result_invalid", error.to_string()))?;
         if let Some(error) = resolution.error {
             self.close_ws(&ws_id, Some(1008), Some(format!("actor.{}", error.code)));
-            return Err(error);
+            // The raw hibernatable WebSocket adapter in core v2.3.10 closes
+            // every failed open callback with 1011. The Go boundary has
+            // already translated the actor-authored rejection to its public
+            // 1008 close here, so report a handled callback to core and let
+            // the queued close preserve that contract. Fatal handler errors
+            // independently submit StopIntent from the Go pump.
+            return Ok(());
         }
         Ok(())
     }
