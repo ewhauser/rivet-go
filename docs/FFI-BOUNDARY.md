@@ -403,8 +403,8 @@ Incoming raw frames over 1 MiB close only their connection with code 1009 and
 reason `message.incoming_too_long`. Oversized outgoing targeted sends are
 rejected synchronously in Go and again by command validation; no partial frame
 is emitted. Empty text and binary frames are valid. Received message indexes
-and pending Go acknowledgements are ordered per connection from index zero
-with wrapping-u16 monotonicity; a receive gap closes with
+and pending Go acknowledgements establish their per-connection origin from the
+first frame and then require wrapping-u16 monotonicity; a receive gap closes with
 `ws.message_index_skip`, and an
 out-of-order acknowledgement closes with `ws.ack_out_of_order`, both using
 code 1008. This bookkeeping remains process-local until M5.

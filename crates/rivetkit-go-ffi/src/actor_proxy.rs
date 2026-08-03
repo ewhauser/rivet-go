@@ -184,7 +184,7 @@ struct ActiveWebSocket {
 
 #[derive(Default)]
 struct WsAcknowledgements {
-    next_received: u16,
+    last_received: Option<u16>,
     pending: VecDeque<u16>,
 }
 
@@ -1103,12 +1103,15 @@ impl ActorProxy {
             let mut acknowledgements = acknowledgements
                 .lock()
                 .expect("WebSocket acknowledgement table poisoned");
-            if acknowledgements.next_received != msg_index {
+            if acknowledgements
+                .last_received
+                .is_some_and(|last| last.wrapping_add(1) != msg_index)
+            {
                 drop(acknowledgements);
                 self.close_ws(ws_id, Some(1008), Some("ws.message_index_skip".to_owned()));
                 return Ok(());
             }
-            acknowledgements.next_received = msg_index.wrapping_add(1);
+            acknowledgements.last_received = Some(msg_index);
             acknowledgements.pending.push_back(msg_index);
         }
         self.events
@@ -1938,7 +1941,7 @@ mod tests {
         let proxy = ActorProxy::new(events, CorrelationTable::default());
         let (outbound, _receiver) = tokio::sync::mpsc::channel(1);
         let acknowledgements = Arc::new(Mutex::new(WsAcknowledgements {
-            next_received: 8,
+            last_received: Some(7),
             pending: VecDeque::from([7]),
         }));
         proxy.websockets.lock().expect("WebSocket table").insert(
@@ -1972,7 +1975,7 @@ mod tests {
         let proxy = ActorProxy::new(events, CorrelationTable::default());
         let (outbound, mut receiver) = tokio::sync::mpsc::channel(4);
         let acknowledgements = Arc::new(Mutex::new(WsAcknowledgements {
-            next_received: u16::MAX,
+            last_received: Some(u16::MAX - 1),
             pending: VecDeque::new(),
         }));
         proxy.websockets.lock().expect("WebSocket table").insert(
@@ -2023,36 +2026,7 @@ mod tests {
         let acknowledgement_state = acknowledgements
             .lock()
             .expect("WebSocket acknowledgement table");
-        assert_eq!(acknowledgement_state.next_received, 1);
+        assert_eq!(acknowledgement_state.last_received, Some(0));
         assert_eq!(acknowledgement_state.pending, VecDeque::from([u16::MAX, 0]));
-    }
-
-    #[test]
-    fn websocket_first_message_index_must_start_at_zero() {
-        let (events, _event_rx) = bounded(1);
-        let proxy = ActorProxy::new(events, CorrelationTable::default());
-        let (outbound, mut receiver) = tokio::sync::mpsc::channel(1);
-        proxy.websockets.lock().expect("WebSocket table").insert(
-            "ws".to_owned(),
-            ActiveWebSocket {
-                actor: ActorIdentity::new("actor", 1),
-                can_hibernate: false,
-                ws: WebSocket::new(),
-                outbound,
-                acknowledgements: Arc::new(Mutex::new(WsAcknowledgements::default())),
-            },
-        );
-
-        proxy
-            .websocket_message("ws", WsMessage::Text("skipped".to_owned()), 1)
-            .expect("gap is handled as a connection close");
-
-        assert!(matches!(
-            receiver.try_recv(),
-            Ok(WsOutbound::Close {
-                code: Some(1008),
-                ..
-            })
-        ));
     }
 }
