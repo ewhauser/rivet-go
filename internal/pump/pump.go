@@ -17,6 +17,7 @@ import (
 const (
 	defaultPollTimeout     = 100 * time.Millisecond
 	defaultShutdownTimeout = 10 * time.Second
+	defaultSaveTimeout     = 35 * time.Second
 	defaultSubmitQueue     = 1_024
 	maxSubmitBatch         = 64
 	actorEventQueue        = 64
@@ -95,11 +96,18 @@ type ActorSession struct {
 	identity       actorIdentity
 	input          []byte
 	persistedState []byte
-	done           <-chan struct{}
+	done           chan struct{}
 
-	saveMu      sync.Mutex
-	saveResult  chan error
-	saveStateMu sync.Mutex
+	saveMu       sync.Mutex
+	saveResult   chan error
+	savePoisoned bool
+	saveStateMu  sync.Mutex
+
+	lifecycleMu   sync.Mutex
+	lifecycleCond *sync.Cond
+	accepting     bool
+	activeSaves   int
+	doneClosed    bool
 }
 
 func (s *ActorSession) AID() string {
@@ -127,13 +135,13 @@ func (s *ActorSession) PersistedState() []byte {
 	if s == nil {
 		return nil
 	}
-	return append([]byte(nil), s.persistedState...)
+	return cloneBytes(s.persistedState)
 }
 
 // Save persists one complete actor-state snapshot through rivetkit-core and
-// waits for StatePersisted. Once enqueued, the save observes its native result
-// even if the caller context is canceled, preventing an uncorrelated late ack
-// from being mistaken for a later save on the same actor.
+// waits for StatePersisted. If the caller stops waiting after enqueue, the
+// session rejects another save until the late acknowledgement is consumed, so
+// it cannot be mistaken for a later save on the same actor.
 func (s *ActorSession) Save(ctx context.Context, state []byte) error {
 	if s == nil || s.pump == nil {
 		return errors.New("actor session is unavailable")
@@ -143,15 +151,26 @@ func (s *ActorSession) Save(ctx context.Context, state []byte) error {
 	}
 	s.saveMu.Lock()
 	defer s.saveMu.Unlock()
+	if err := s.beginSave(); err != nil {
+		return err
+	}
+	defer s.finishSave()
 
 	select {
 	case <-ctx.Done():
-		return ctx.Err()
+		return saveContextError(ctx.Err())
 	default:
 	}
 
 	result := make(chan error, 1)
 	s.saveStateMu.Lock()
+	if s.savePoisoned {
+		s.saveStateMu.Unlock()
+		return HandlerError{
+			Code:    "state_persist_unresolved",
+			Message: "a previous actor state save completed without its acknowledgement",
+		}
+	}
 	if s.saveResult != nil {
 		s.saveStateMu.Unlock()
 		return errors.New("actor save is already pending")
@@ -170,9 +189,20 @@ func (s *ActorSession) Save(ctx context.Context, state []byte) error {
 		return err
 	}
 
+	timer := time.NewTimer(s.pump.saveTimeout)
+	defer timer.Stop()
 	select {
 	case err := <-result:
 		return err
+	case <-ctx.Done():
+		s.abandonSave(result)
+		return saveContextError(ctx.Err())
+	case <-timer.C:
+		s.abandonSave(result)
+		return HandlerError{
+			Code:    "state_persist_timeout",
+			Message: fmt.Sprintf("actor state save was not acknowledged within %s", s.pump.saveTimeout),
+		}
 	case <-s.done:
 		return ErrShuttingDown
 	case <-s.pump.done:
@@ -246,12 +276,12 @@ func (s *ActorSession) kv(ctx context.Context, command wire.Command) (wire.Event
 	if ctx == nil {
 		return wire.Event{}, errors.New("KV context is nil")
 	}
-	kvID := s.pump.nextKVID.Add(1)
-	command.KVID = kvID
+	if !s.isAccepting() {
+		return wire.Event{}, ErrShuttingDown
+	}
 	result := make(chan wire.Event, 1)
-	s.pump.kvMu.Lock()
-	s.pump.kvPending[kvID] = result
-	s.pump.kvMu.Unlock()
+	kvID := s.pump.addKVWaiter(result)
+	command.KVID = kvID
 
 	if err := s.pump.submitInternal(ctx, command); err != nil {
 		s.pump.removeKVWaiter(kvID)
@@ -299,6 +329,101 @@ func (s *ActorSession) clearSaveResult(result chan error) {
 	s.saveStateMu.Unlock()
 }
 
+func (s *ActorSession) abandonSave(result chan error) {
+	s.saveStateMu.Lock()
+	if s.saveResult == result {
+		s.saveResult = nil
+		s.savePoisoned = true
+		s.pump.markLateSave(s.identity)
+	}
+	s.saveStateMu.Unlock()
+}
+
+func (s *ActorSession) completeAbandonedSave() bool {
+	s.saveStateMu.Lock()
+	if !s.savePoisoned {
+		s.saveStateMu.Unlock()
+		return false
+	}
+	s.savePoisoned = false
+	s.saveStateMu.Unlock()
+	return s.pump.consumeLateSave(s.identity)
+}
+
+func (s *ActorSession) beginSave() error {
+	s.lifecycleMu.Lock()
+	defer s.lifecycleMu.Unlock()
+	if !s.accepting {
+		return ErrShuttingDown
+	}
+	s.activeSaves++
+	return nil
+}
+
+func (s *ActorSession) finishSave() {
+	s.lifecycleMu.Lock()
+	s.activeSaves--
+	if s.activeSaves == 0 {
+		s.lifecycleCond.Broadcast()
+	}
+	s.lifecycleMu.Unlock()
+}
+
+func (s *ActorSession) isAccepting() bool {
+	s.lifecycleMu.Lock()
+	defer s.lifecycleMu.Unlock()
+	return s.accepting
+}
+
+// closeGracefully stops new actor-scoped work, waits for every state save
+// already accepted by the session, and then wakes pending KV callers. The
+// actor worker calls this before submitting ActorStopResult.
+func (s *ActorSession) closeGracefully() {
+	s.lifecycleMu.Lock()
+	s.accepting = false
+	for s.activeSaves != 0 {
+		s.lifecycleCond.Wait()
+	}
+	s.closeDoneLocked()
+	s.lifecycleMu.Unlock()
+}
+
+// abort wakes pending actor operations before waiting for them. It is used
+// when the whole pump is exiting and no durability acknowledgement can still
+// be required.
+func (s *ActorSession) abort() {
+	s.lifecycleMu.Lock()
+	s.accepting = false
+	s.closeDoneLocked()
+	for s.activeSaves != 0 {
+		s.lifecycleCond.Wait()
+	}
+	s.lifecycleMu.Unlock()
+}
+
+func (s *ActorSession) closeDoneLocked() {
+	if !s.doneClosed {
+		close(s.done)
+		s.doneClosed = true
+	}
+}
+
+func saveContextError(err error) error {
+	if errors.Is(err, context.DeadlineExceeded) {
+		return HandlerError{Code: "state_persist_timeout", Message: err.Error()}
+	}
+	return HandlerError{Code: "state_persist_canceled", Message: err.Error()}
+}
+
+func cloneBytes(data []byte) []byte {
+	if data == nil {
+		return nil
+	}
+	cloned := make([]byte, len(data))
+	copy(cloned, data)
+	return cloned
+}
+
 type actorWorker struct {
 	pump    *Pump
 	handler ActorHandler
@@ -313,6 +438,7 @@ type Pump struct {
 	runner          Runner
 	pollTimeout     time.Duration
 	shutdownTimeout time.Duration
+	saveTimeout     time.Duration
 	handlers        map[string]ActorHandler
 
 	started      atomic.Bool
@@ -331,6 +457,7 @@ type Pump struct {
 	nextKVID  atomic.Uint64
 	kvMu      sync.Mutex
 	kvPending map[uint64]chan wire.Event
+	lateSaves map[actorIdentity]struct{}
 
 	subsMu    sync.Mutex
 	subs      map[uint64]*subscriber
@@ -354,6 +481,7 @@ func NewWithHandlers(runner Runner, handlers map[string]ActorHandler) *Pump {
 		runner:          runner,
 		pollTimeout:     defaultPollTimeout,
 		shutdownTimeout: defaultShutdownTimeout,
+		saveTimeout:     defaultSaveTimeout,
 		handlers:        ownedHandlers,
 		submitQueue:     make(chan submitRequest, defaultSubmitQueue),
 		submitStop:      make(chan struct{}),
@@ -361,6 +489,7 @@ func NewWithHandlers(runner Runner, handlers map[string]ActorHandler) *Pump {
 		workerErrors:    make(chan error, 1),
 		actors:          make(map[actorIdentity]*actorWorker),
 		kvPending:       make(map[uint64]chan wire.Event),
+		lateSaves:       make(map[actorIdentity]struct{}),
 		subs:            make(map[uint64]*subscriber),
 	}
 }
@@ -566,19 +695,22 @@ func (p *Pump) handleInternalEvent(event wire.Event) error {
 	case wire.EventActorStart:
 		identity := actorIdentity{aid: event.AID, generation: event.Generation}
 		workerCtx, cancel := context.WithCancel(context.Background())
+		session := &ActorSession{
+			pump:           p,
+			identity:       identity,
+			input:          cloneBytes(event.Input),
+			persistedState: cloneBytes(event.PersistedState),
+			done:           make(chan struct{}),
+			accepting:      true,
+		}
+		session.lifecycleCond = sync.NewCond(&session.lifecycleMu)
 		worker := &actorWorker{
 			pump:    p,
 			handler: p.handlers[event.Name],
-			session: &ActorSession{
-				pump:           p,
-				identity:       identity,
-				input:          append([]byte(nil), event.Input...),
-				persistedState: append([]byte(nil), event.PersistedState...),
-				done:           workerCtx.Done(),
-			},
-			ctx:    workerCtx,
-			cancel: cancel,
-			events: make(chan wire.Event, actorEventQueue),
+			session: session,
+			ctx:     workerCtx,
+			cancel:  cancel,
+			events:  make(chan wire.Event, actorEventQueue),
 		}
 		p.actorsMu.Lock()
 		if _, exists := p.actors[identity]; exists {
@@ -599,9 +731,18 @@ func (p *Pump) handleInternalEvent(event wire.Event) error {
 	case wire.EventStatePersisted:
 		worker := p.actor(event.AID, event.Generation)
 		if worker == nil {
+			if p.consumeLateSave(actorIdentity{aid: event.AID, generation: event.Generation}) {
+				return nil
+			}
 			return fmt.Errorf("StatePersisted for unknown actor %s generation %d", event.AID, event.Generation)
 		}
 		if !worker.session.completeSave(event) {
+			if worker.session.completeAbandonedSave() {
+				return nil
+			}
+			if p.consumeLateSave(actorIdentity{aid: event.AID, generation: event.Generation}) {
+				return nil
+			}
 			return fmt.Errorf("StatePersisted without a pending save for %s generation %d", event.AID, event.Generation)
 		}
 	case wire.EventKVResult:
@@ -621,6 +762,7 @@ func (w *actorWorker) run(start wire.Event) {
 	defer w.pump.actorWG.Done()
 	defer w.cancel()
 	defer w.pump.removeActor(w.session.identity, w)
+	defer w.session.abort()
 
 	state, lifecycleError := invokeStart(w.ctx, w.handler, w.session, start)
 	if err := w.pump.submitInternal(w.ctx, wire.Command{
@@ -654,6 +796,7 @@ func (w *actorWorker) run(start wire.Event) {
 			return
 		}
 		lifecycleError = invokeStop(w.ctx, w.handler, w.session, event, state)
+		w.session.closeGracefully()
 		if err := w.pump.submitInternal(w.ctx, wire.Command{
 			Kind:       wire.CommandActorStopResult,
 			AID:        w.session.identity.aid,
@@ -755,7 +898,24 @@ func (p *Pump) cancelActorWorkers() {
 	p.actorsMu.Unlock()
 	for _, worker := range workers {
 		worker.cancel()
+		worker.session.abort()
 	}
+}
+
+func (p *Pump) markLateSave(identity actorIdentity) {
+	p.actorsMu.Lock()
+	p.lateSaves[identity] = struct{}{}
+	p.actorsMu.Unlock()
+}
+
+func (p *Pump) consumeLateSave(identity actorIdentity) bool {
+	p.actorsMu.Lock()
+	defer p.actorsMu.Unlock()
+	if _, exists := p.lateSaves[identity]; !exists {
+		return false
+	}
+	delete(p.lateSaves, identity)
+	return true
 }
 
 func (p *Pump) reportWorkerError(err error) {
@@ -769,6 +929,22 @@ func (p *Pump) removeKVWaiter(kvID uint64) {
 	p.kvMu.Lock()
 	delete(p.kvPending, kvID)
 	p.kvMu.Unlock()
+}
+
+func (p *Pump) addKVWaiter(result chan wire.Event) uint64 {
+	p.kvMu.Lock()
+	defer p.kvMu.Unlock()
+	for {
+		kvID := p.nextKVID.Add(1)
+		if kvID == 0 {
+			continue
+		}
+		if _, pending := p.kvPending[kvID]; pending {
+			continue
+		}
+		p.kvPending[kvID] = result
+		return kvID
+	}
 }
 
 func (p *Pump) failKVWaiters() {

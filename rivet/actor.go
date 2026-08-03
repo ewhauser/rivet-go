@@ -117,7 +117,9 @@ func (a *actorAdapter[T]) Stop(
 
 func decodeState[T any](data []byte) (T, error) {
 	var state T
-	if len(data) == 0 {
+	// A nil snapshot means core reported a first start. A non-nil, zero-length
+	// snapshot is persisted data and must still reach a custom binary decoder.
+	if data == nil {
 		return state, nil
 	}
 	if unmarshaler, ok := any(&state).(encoding.BinaryUnmarshaler); ok {

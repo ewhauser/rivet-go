@@ -101,6 +101,30 @@ func TestRustM2CommandBatchGolden(t *testing.T) {
 	if batch.Commands[4].Limit == nil || *batch.Commands[4].Limit != 32 {
 		t.Fatalf("unexpected KV list limit: %#v", batch.Commands[4].Limit)
 	}
+	encoded, err := EncodeCommandBatch(batch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(encoded, data) {
+		t.Fatal("Go CommandBatch encoding differs from the Rust-generated M2 golden")
+	}
+}
+
+func TestRustActorStartGoldenPreservesStatePresence(t *testing.T) {
+	fresh, err := DecodeEventBatch(golden(t, "event_actor_start_fresh.msgpack"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	empty, err := DecodeEventBatch(golden(t, "event_actor_start_empty_state.msgpack"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fresh.Events[0].PersistedState != nil {
+		t.Fatal("fresh ActorStart decoded with persisted state present")
+	}
+	if empty.Events[0].PersistedState == nil || len(empty.Events[0].PersistedState) != 0 {
+		t.Fatal("persisted empty ActorStart did not retain zero-length state presence")
+	}
 }
 
 func TestRustEmptyCommandBatchGolden(t *testing.T) {

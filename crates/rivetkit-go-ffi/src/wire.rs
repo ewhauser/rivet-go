@@ -45,8 +45,8 @@ pub(crate) enum Event {
         create_ts: i64,
         #[serde(with = "serde_bytes")]
         input: Vec<u8>,
-        #[serde(with = "serde_bytes")]
-        persisted_state: Vec<u8>,
+        #[serde(default, with = "optional_bytes")]
+        persisted_state: Option<Vec<u8>>,
     },
     ActorStop {
         aid: String,
@@ -270,6 +270,48 @@ mod tests {
 
     use super::*;
 
+    #[derive(Serialize)]
+    struct GoldenCommand {
+        kind: &'static str,
+        aid: &'static str,
+        r#gen: u64,
+        ok: bool,
+        error: Option<WireError>,
+        #[serde(with = "optional_bytes")]
+        state: Option<Vec<u8>>,
+        kv_id: u64,
+        #[serde(with = "optional_bytes")]
+        key: Option<Vec<u8>>,
+        #[serde(with = "optional_bytes")]
+        prefix: Option<Vec<u8>>,
+        reverse: bool,
+        limit: Option<u32>,
+        #[serde(with = "optional_bytes")]
+        value: Option<Vec<u8>>,
+    }
+
+    #[derive(Serialize)]
+    struct GoldenCommandBatch {
+        commands: Vec<GoldenCommand>,
+    }
+
+    fn golden_command(kind: &'static str) -> GoldenCommand {
+        GoldenCommand {
+            kind,
+            aid: "actor-golden",
+            r#gen: 0,
+            ok: false,
+            error: None,
+            state: None,
+            kv_id: 0,
+            key: None,
+            prefix: None,
+            reverse: false,
+            limit: None,
+            value: None,
+        }
+    }
+
     fn golden_dir() -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../..")
@@ -349,12 +391,50 @@ mod tests {
                 key: "tenant/counter".to_owned(),
                 create_ts: 0,
                 input: b"input".to_vec(),
-                persisted_state: b"state".to_vec(),
+                persisted_state: Some(b"state".to_vec()),
             }],
         };
         write_golden(
             "event_actor_start.msgpack",
             &actor_start.encode().expect("encode actor start event"),
+        );
+
+        let fresh_actor_start = EventBatch {
+            seq: 8,
+            events: vec![Event::ActorStart {
+                aid: "actor-fresh".to_owned(),
+                r#gen: 1,
+                name: "counter".to_owned(),
+                key: "fresh".to_owned(),
+                create_ts: 0,
+                input: Vec::new(),
+                persisted_state: None,
+            }],
+        };
+        write_golden(
+            "event_actor_start_fresh.msgpack",
+            &fresh_actor_start
+                .encode()
+                .expect("encode fresh actor start event"),
+        );
+
+        let empty_actor_start = EventBatch {
+            seq: 9,
+            events: vec![Event::ActorStart {
+                aid: "actor-empty".to_owned(),
+                r#gen: 2,
+                name: "counter".to_owned(),
+                key: "empty".to_owned(),
+                create_ts: 0,
+                input: Vec::new(),
+                persisted_state: Some(Vec::new()),
+            }],
+        };
+        write_golden(
+            "event_actor_start_empty_state.msgpack",
+            &empty_actor_start
+                .encode()
+                .expect("encode empty-state actor start event"),
         );
 
         let actor_stop = EventBatch {
@@ -410,53 +490,36 @@ mod tests {
             })
             .expect("encode empty command batch"),
         );
-        write_golden(
-            "command_m2.msgpack",
-            &rmp_serde::to_vec_named(&CommandBatch {
-                commands: vec![
-                    Command::ActorStartResult {
-                        aid: "actor-golden".to_owned(),
-                        r#gen: 7,
-                        ok: true,
-                        error: None,
-                    },
-                    Command::ActorStopResult {
-                        aid: "actor-golden".to_owned(),
-                        r#gen: 7,
-                        error: None,
-                    },
-                    Command::SaveState {
-                        aid: "actor-golden".to_owned(),
-                        r#gen: 7,
-                        state: b"state".to_vec(),
-                    },
-                    Command::KvGet {
-                        kv_id: 11,
-                        aid: "actor-golden".to_owned(),
-                        key: b"key".to_vec(),
-                    },
-                    Command::KvList {
-                        kv_id: 12,
-                        aid: "actor-golden".to_owned(),
-                        prefix: b"prefix".to_vec(),
-                        reverse: false,
-                        limit: Some(32),
-                    },
-                    Command::KvPut {
-                        kv_id: 13,
-                        aid: "actor-golden".to_owned(),
-                        key: b"key".to_vec(),
-                        value: b"value".to_vec(),
-                    },
-                    Command::KvDelete {
-                        kv_id: 14,
-                        aid: "actor-golden".to_owned(),
-                        key: b"key".to_vec(),
-                    },
-                ],
-            })
-            .expect("encode M2 command batch"),
-        );
+        let mut start = golden_command("actor_start_result");
+        start.r#gen = 7;
+        start.ok = true;
+        let mut stop = golden_command("actor_stop_result");
+        stop.r#gen = 7;
+        let mut save = golden_command("save_state");
+        save.r#gen = 7;
+        save.state = Some(b"state".to_vec());
+        let mut get = golden_command("kv_get");
+        get.kv_id = 11;
+        get.key = Some(b"key".to_vec());
+        let mut list = golden_command("kv_list");
+        list.kv_id = 12;
+        list.prefix = Some(b"prefix".to_vec());
+        list.limit = Some(32);
+        let mut put = golden_command("kv_put");
+        put.kv_id = 13;
+        put.key = Some(b"key".to_vec());
+        put.value = Some(b"value".to_vec());
+        let mut delete = golden_command("kv_delete");
+        delete.kv_id = 14;
+        delete.key = Some(b"key".to_vec());
+        let command_m2 = rmp_serde::to_vec_named(&GoldenCommandBatch {
+            commands: vec![start, stop, save, get, list, put, delete],
+        })
+        .expect("encode M2 command batch");
+        let decoded = CommandBatch::decode(&command_m2)
+            .expect("Rust command decoder accepts the full Go command shape");
+        assert_eq!(decoded.commands.len(), 7);
+        write_golden("command_m2.msgpack", &command_m2);
     }
 
     #[test]

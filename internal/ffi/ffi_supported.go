@@ -134,23 +134,33 @@ func (a *nativeAPI) load() error {
 			loadErrors = append(loadErrors, fmt.Errorf("load native library %s: %w", libraryPath, err))
 			continue
 		}
-		if err := a.register(handle); err != nil {
+		if err := a.bindAndValidate(handle); err != nil {
 			_ = closeLibrary(handle)
 			return err
-		}
-		if got := a.abiVersion(); got != ExpectedABIVersion {
-			_ = closeLibrary(handle)
-			return fmt.Errorf(
-				"native ABI version mismatch: library reports %d, Go expects %d",
-				got,
-				ExpectedABIVersion,
-			)
 		}
 		a.handle = handle
 		a.path = libraryPath
 		return nil
 	}
 	return errors.Join(loadErrors...)
+}
+
+func (a *nativeAPI) bindAndValidate(handle uintptr) error {
+	if err := a.register(handle); err != nil {
+		return err
+	}
+	return requireABIVersion(a.abiVersion())
+}
+
+func requireABIVersion(got uint32) error {
+	if got != ExpectedABIVersion {
+		return fmt.Errorf(
+			"native ABI version mismatch: library reports %d, Go expects %d",
+			got,
+			ExpectedABIVersion,
+		)
+	}
+	return nil
 }
 
 func (a *nativeAPI) register(handle uintptr) error {

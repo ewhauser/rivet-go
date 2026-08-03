@@ -62,6 +62,8 @@ func TestValidateShapeAcceptsGoldens(t *testing.T) {
 		"event_disconnected.msgpack",
 		"event_stopped.msgpack",
 		"event_actor_start.msgpack",
+		"event_actor_start_fresh.msgpack",
+		"event_actor_start_empty_state.msgpack",
 		"event_actor_stop.msgpack",
 		"event_kv_result.msgpack",
 		"event_state_persisted.msgpack",

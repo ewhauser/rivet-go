@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -89,5 +90,59 @@ func TestStateSerdeJSONAndBinaryOverride(t *testing.T) {
 	}
 	if binaryDecoded != binaryValue {
 		t.Fatalf("binary state = %#v, want %#v", binaryDecoded, binaryValue)
+	}
+}
+
+type emptyBinaryState struct {
+	Decoded bool
+}
+
+func (*emptyBinaryState) MarshalBinary() ([]byte, error) {
+	return []byte{}, nil
+}
+
+func (s *emptyBinaryState) UnmarshalBinary(data []byte) error {
+	if data == nil {
+		return errors.New("persisted empty state was reported as absent")
+	}
+	if len(data) != 0 {
+		return errors.New("empty binary state contained data")
+	}
+	s.Decoded = true
+	return nil
+}
+
+func TestStateSerdeDistinguishesAbsentFromPersistedEmpty(t *testing.T) {
+	fresh, err := decodeState[emptyBinaryState](nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fresh.Decoded {
+		t.Fatal("first start invoked the binary state decoder")
+	}
+
+	rehydrated, err := decodeState[emptyBinaryState]([]byte{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !rehydrated.Decoded {
+		t.Fatal("persisted zero-length state did not invoke the binary state decoder")
+	}
+}
+
+func TestStateSerdeErrorsAreReturned(t *testing.T) {
+	value := binaryState{Value: 0xff}
+	if _, err := encodeState(&value); err == nil || !strings.Contains(err.Error(), "sentinel encode failure") {
+		t.Fatalf("binary encode error = %v", err)
+	}
+	if _, err := decodeState[binaryState]([]byte{1, 2}); err == nil || err.Error() != "decode actor binary state: binary state must contain one byte" {
+		t.Fatalf("binary decode error = %v", err)
+	}
+	type unsupportedJSONState struct {
+		Value chan int `json:"value"`
+	}
+	unsupported := unsupportedJSONState{Value: make(chan int)}
+	if _, err := encodeState(&unsupported); err == nil {
+		t.Fatal("unsupported JSON state encoded successfully")
 	}
 }

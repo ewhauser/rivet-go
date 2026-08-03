@@ -18,6 +18,7 @@ use crate::correlation::{CorrelationError, CorrelationTable};
 use crate::wire::{Command, Event, KvEntry, WireError};
 
 const LIFECYCLE_RESULT_TIMEOUT: Duration = Duration::from_secs(30);
+const SAVE_STATE_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_KV_LIST_ENTRIES: u32 = 1_024;
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
@@ -51,6 +52,76 @@ struct LifecycleKey {
 struct ActiveActor {
     ctx: ActorContext,
     state_version: Arc<AtomicU64>,
+    operations: ActorOperations,
+}
+
+#[derive(Default)]
+struct ActorOperationState {
+    in_flight: usize,
+    stopping: bool,
+}
+
+#[derive(Clone, Default)]
+struct ActorOperations {
+    state: Arc<Mutex<ActorOperationState>>,
+    changed: Arc<tokio::sync::Notify>,
+}
+
+struct ActorOperationGuard {
+    operations: ActorOperations,
+}
+
+impl ActorOperations {
+    fn begin(&self) -> Option<ActorOperationGuard> {
+        let mut state = self.state.lock().expect("actor operations table poisoned");
+        if state.stopping {
+            return None;
+        }
+        state.in_flight += 1;
+        Some(ActorOperationGuard {
+            operations: self.clone(),
+        })
+    }
+
+    fn begin_stop(&self) {
+        self.state
+            .lock()
+            .expect("actor operations table poisoned")
+            .stopping = true;
+    }
+
+    async fn wait_idle(&self) {
+        loop {
+            let changed = self.changed.notified();
+            if self
+                .state
+                .lock()
+                .expect("actor operations table poisoned")
+                .in_flight
+                == 0
+            {
+                return;
+            }
+            changed.await;
+        }
+    }
+}
+
+impl Drop for ActorOperationGuard {
+    fn drop(&mut self) {
+        let became_idle = {
+            let mut state = self
+                .operations
+                .state
+                .lock()
+                .expect("actor operations table poisoned");
+            state.in_flight -= 1;
+            state.in_flight == 0
+        };
+        if became_idle {
+            self.operations.changed.notify_waiters();
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -182,15 +253,28 @@ impl ActorProxy {
                 r#gen: generation,
                 error,
             } => {
-                self.pending.resolve(
-                    &LifecycleKey {
-                        actor: ActorIdentity::new(aid, generation),
-                        kind: LifecycleKind::Stop,
-                    },
-                    LifecycleResolution { error },
-                    &self.correlations,
-                );
+                let key = LifecycleKey {
+                    actor: ActorIdentity::new(aid, generation),
+                    kind: LifecycleKind::Stop,
+                };
+                if let Some(actor) = self.actor_exact(&key.actor) {
+                    actor.operations.begin_stop();
+                    let pending = self.pending.clone();
+                    let correlations = self.correlations.clone();
+                    tokio::spawn(async move {
+                        actor.operations.wait_idle().await;
+                        pending.resolve(&key, LifecycleResolution { error }, &correlations);
+                    });
+                } else {
+                    self.pending
+                        .resolve(&key, LifecycleResolution { error }, &self.correlations);
+                }
             }
+            Command::SaveState {
+                aid,
+                r#gen: generation,
+                state,
+            } => self.dispatch_save_state(aid, generation, state),
             command => {
                 let proxy = self.clone();
                 tokio::spawn(async move {
@@ -232,6 +316,7 @@ impl ActorProxy {
                 ActiveActor {
                     ctx: ctx.clone(),
                     state_version: Arc::new(AtomicU64::new(0)),
+                    operations: ActorOperations::default(),
                 },
             );
 
@@ -240,7 +325,7 @@ impl ActorProxy {
                 &identity,
                 &ctx,
                 input.unwrap_or_default(),
-                snapshot.unwrap_or_default(),
+                snapshot,
                 &mut events,
                 startup_ready,
             )
@@ -257,7 +342,7 @@ impl ActorProxy {
         identity: &ActorIdentity,
         ctx: &ActorContext,
         input: Vec<u8>,
-        persisted_state: Vec<u8>,
+        persisted_state: Option<Vec<u8>>,
         events: &mut rivetkit_core::ActorEvents,
         startup_ready: Option<tokio::sync::oneshot::Sender<Result<()>>>,
     ) -> Result<()> {
@@ -320,7 +405,17 @@ impl ActorProxy {
                             Some(shutdown_deadline),
                         )
                         .await;
-                    reply.send(result);
+                    match result {
+                        Ok(()) => reply.send(Ok(())),
+                        Err(error) => {
+                            // At v2.3.10 core logs graceful-cleanup reply errors but
+                            // otherwise completes a requested destroy. Ending the
+                            // factory future with the same failure keeps the error on
+                            // core's structured run-handler path while teardown ends.
+                            reply.send(Err(anyhow!("{error:#}")));
+                            return Err(error);
+                        }
+                    }
                 }
                 ActorEvent::Action { reply, .. } => {
                     reply.send(Err(anyhow!("actions are not supported before M3")));
@@ -396,10 +491,10 @@ impl ActorProxy {
     async fn execute_actor_command(&self, command: Command) {
         match command {
             Command::SaveState {
-                aid,
-                r#gen: generation,
-                state,
-            } => self.save_state(aid, generation, state).await,
+                aid: _,
+                r#gen: _,
+                state: _,
+            } => {}
             Command::KvGet { kv_id, aid, key } => self.kv_get(kv_id, aid, key).await,
             Command::KvList {
                 kv_id,
@@ -423,26 +518,67 @@ impl ActorProxy {
         }
     }
 
-    async fn save_state(&self, aid: String, generation: u64, state: Vec<u8>) {
+    fn dispatch_save_state(&self, aid: String, generation: u64, state: Vec<u8>) {
         let identity = ActorIdentity::new(aid.clone(), generation);
-        let actor = self.actor_exact(&identity);
-        let (state_version, error) = match actor {
-            Some(actor) => match actor
-                .ctx
-                .save_state(vec![StateDelta::ActorState(state)])
-                .await
-            {
-                Ok(()) => (actor.state_version.fetch_add(1, Ordering::AcqRel) + 1, None),
-                Err(error) => (
-                    actor.state_version.load(Ordering::Acquire),
-                    Some(WireError::new("state_persist_failed", format!("{error:#}"))),
-                ),
-            },
-            None => (
-                0,
-                Some(WireError::new(
+        let Some(actor) = self.actor_exact(&identity) else {
+            let _ = self.events.send(Event::StatePersisted {
+                aid,
+                r#gen: generation,
+                state_version: 0,
+                error: Some(WireError::new(
                     "actor_not_found",
-                    format!("actor `{aid}` generation {generation} is not active"),
+                    format!("actor generation {generation} is not active"),
+                )),
+            });
+            return;
+        };
+        let Some(operation) = actor.operations.begin() else {
+            let _ = self.events.send(Event::StatePersisted {
+                aid,
+                r#gen: generation,
+                state_version: actor.state_version.load(Ordering::Acquire),
+                error: Some(WireError::new(
+                    "actor_stopping",
+                    "actor state cannot be saved after stop acknowledgement begins",
+                )),
+            });
+            return;
+        };
+        let proxy = self.clone();
+        tokio::spawn(async move {
+            proxy
+                .save_state(actor, operation, aid, generation, state)
+                .await;
+        });
+    }
+
+    async fn save_state(
+        &self,
+        actor: ActiveActor,
+        _operation: ActorOperationGuard,
+        aid: String,
+        generation: u64,
+        state: Vec<u8>,
+    ) {
+        let result = tokio::time::timeout(
+            SAVE_STATE_TIMEOUT,
+            actor.ctx.save_state(vec![StateDelta::ActorState(state)]),
+        )
+        .await;
+        let (state_version, error) = match result {
+            Ok(Ok(())) => (actor.state_version.fetch_add(1, Ordering::AcqRel) + 1, None),
+            Ok(Err(error)) => (
+                actor.state_version.load(Ordering::Acquire),
+                Some(WireError::new("state_persist_failed", format!("{error:#}"))),
+            ),
+            Err(_) => (
+                actor.state_version.load(Ordering::Acquire),
+                Some(WireError::new(
+                    "state_persist_timeout",
+                    format!(
+                        "actor state save did not complete within {} seconds",
+                        SAVE_STATE_TIMEOUT.as_secs()
+                    ),
                 )),
             ),
         };
@@ -587,5 +723,32 @@ fn shutdown_reason(reason: ShutdownKind) -> &'static str {
     match reason {
         ShutdownKind::Sleep => "sleep",
         ShutdownKind::Destroy => "destroy",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn actor_stop_waits_for_reserved_state_operations() {
+        let operations = ActorOperations::default();
+        let first = operations.begin().expect("first state operation");
+        let second = operations.begin().expect("second state operation");
+        operations.begin_stop();
+        assert!(operations.begin().is_none());
+
+        let waiting = operations.clone();
+        let waiter = tokio::spawn(async move { waiting.wait_idle().await });
+        tokio::task::yield_now().await;
+        assert!(!waiter.is_finished());
+        drop(first);
+        tokio::task::yield_now().await;
+        assert!(!waiter.is_finished());
+        drop(second);
+        tokio::time::timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("stop waiter timed out")
+            .expect("stop waiter task failed");
     }
 }

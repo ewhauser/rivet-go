@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io/fs"
 	"os"
+	"os/exec"
 	"path"
 	"path/filepath"
 	"runtime"
@@ -26,6 +27,41 @@ func TestLoadAndABIVersion(t *testing.T) {
 	}
 	if got != ExpectedABIVersion {
 		t.Fatalf("ABIVersion = %d, want %d", got, ExpectedABIVersion)
+	}
+}
+
+func TestLoaderRejectsABI1Library(t *testing.T) {
+	filename := "librivetkit_go_ffi_abi1.so"
+	switch runtime.GOOS {
+	case "darwin":
+		filename = "librivetkit_go_ffi_abi1.dylib"
+	case "windows":
+		filename = "rivetkit_go_ffi_abi1.dll"
+	}
+	libraryPath := filepath.Join(t.TempDir(), filename)
+	command := exec.Command(
+		"rustc",
+		"--crate-type=cdylib",
+		filepath.Join("testdata", "abi1_fixture.rs"),
+		"-o",
+		libraryPath,
+	)
+	if output, err := command.CombinedOutput(); err != nil {
+		t.Fatalf("build ABI-1 fixture: %v: %s", err, output)
+	}
+	handle, err := openLibrary(libraryPath)
+	if err != nil {
+		t.Fatalf("open ABI-1 fixture: %v", err)
+	}
+	defer func() {
+		if err := closeLibrary(handle); err != nil {
+			t.Errorf("close ABI-1 fixture: %v", err)
+		}
+	}()
+	var candidate nativeAPI
+	err = candidate.bindAndValidate(handle)
+	if err == nil || !strings.Contains(err.Error(), "library reports 1") {
+		t.Fatalf("ABI-1 validation error = %v", err)
 	}
 }
 

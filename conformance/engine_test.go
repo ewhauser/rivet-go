@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -36,8 +37,7 @@ const (
 	// rivet-envoy-client v2.3.10 declares a 20-second ping-health threshold;
 	// the adapter samples that status every 250 milliseconds.
 	disconnectLivenessWindow = 22 * time.Second
-	rehydrateAttemptWindow   = 45 * time.Second
-	rehydrateAttempts        = 3
+	rehydrateWindow          = 45 * time.Second
 )
 
 type runningEngine struct {
@@ -77,6 +77,24 @@ type actorRecord struct {
 	ConnectableTS *int64          `json:"connectable_ts"`
 	DestroyTS     *int64          `json:"destroy_ts"`
 	Error         json.RawMessage `json:"error"`
+}
+
+type persistentCounterState struct {
+	Count int
+}
+
+func (s *persistentCounterState) MarshalBinary() ([]byte, error) {
+	data := make([]byte, 8)
+	binary.BigEndian.PutUint64(data, uint64(s.Count))
+	return data, nil
+}
+
+func (s *persistentCounterState) UnmarshalBinary(data []byte) error {
+	if len(data) != 8 {
+		return fmt.Errorf("counter state length = %d, want 8", len(data))
+	}
+	s.Count = int(binary.BigEndian.Uint64(data))
+	return nil
 }
 
 func TestRunnerRegistersWithEngine(t *testing.T) {
@@ -303,6 +321,119 @@ func TestRunnerReportsEngineDisconnect(t *testing.T) {
 	waitForNativeEvent(t, runner, wire.EventRunnerStopped, 5*time.Second)
 }
 
+func TestNativeKVListCrossesPollBatchBoundaryAndReportsErrors(t *testing.T) {
+	if testing.Short() {
+		t.Skip("real-engine conformance is disabled by -short")
+	}
+	engineBinary, err := acquireEngine(context.Background())
+	if err != nil {
+		t.Fatalf("obtain Rivet engine %s: %v\n%s", engineTag, err, engineRemediation())
+	}
+	engine := startEngine(t, engineBinary)
+	runnerName := fmt.Sprintf("rivet-go-kv-%d", time.Now().UnixNano())
+	runner := startNativeRunnerWithActors(t, engine.endpoint, runnerName, []string{"kv-list"})
+	waitForNativeEvent(t, runner, wire.EventRunnerConnected, 5*time.Second)
+	actor := createActor(t, engine.endpoint, "kv-list", runnerName, "destroy", nil, nil)
+	_, started := waitForNativeEvent(t, runner, wire.EventActorStart, 10*time.Second)
+	if started.AID != actor.ActorID {
+		t.Fatalf("ActorStart actor ID = %s, want %s", started.AID, actor.ActorID)
+	}
+	submitNativeCommands(t, runner, wire.Command{
+		Kind:       wire.CommandActorStartResult,
+		AID:        started.AID,
+		Generation: started.Generation,
+		OK:         true,
+	})
+	listedActor := waitForActor(t, engine.endpoint, actor.ActorID, false, func(actor actorRecord) bool {
+		return actor.ConnectableTS != nil && actor.DestroyTS == nil
+	})
+	if listedActor.Name != "kv-list" {
+		t.Fatalf("engine-listed actor name = %q, want kv-list", listedActor.Name)
+	}
+
+	const entryCount = 65
+	puts := make([]wire.Command, 0, entryCount)
+	for i := uint64(1); i <= entryCount; i++ {
+		puts = append(puts, wire.Command{
+			Kind:  wire.CommandKVPut,
+			KVID:  i,
+			AID:   actor.ActorID,
+			Key:   []byte(fmt.Sprintf("entry/%03d", i)),
+			Value: []byte(fmt.Sprintf("value-%03d", i)),
+		})
+	}
+	submitNativeCommands(t, runner, puts...)
+	seen := make(map[uint64]struct{}, entryCount)
+	deadline := time.Now().Add(20 * time.Second)
+	for len(seen) < entryCount {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			t.Fatalf("received %d/%d KV put results", len(seen), entryCount)
+		}
+		data, pollErr := runner.Poll(min(remaining, time.Second))
+		if pollErr != nil {
+			t.Fatalf("poll KV put results: %v", pollErr)
+		}
+		batch, decodeErr := wire.DecodeEventBatch(data)
+		if decodeErr != nil {
+			t.Fatalf("decode KV put result batch: %v", decodeErr)
+		}
+		for _, event := range batch.Events {
+			if event.Kind != wire.EventKVResult || event.KVID > entryCount {
+				continue
+			}
+			if event.Error != nil {
+				t.Fatalf("KV put %d failed with code %s", event.KVID, event.Error.Code)
+			}
+			seen[event.KVID] = struct{}{}
+		}
+	}
+
+	limit := uint32(entryCount)
+	const listID = 1_000
+	submitNativeCommands(t, runner, wire.Command{
+		Kind:   wire.CommandKVList,
+		KVID:   listID,
+		AID:    actor.ActorID,
+		Prefix: []byte("entry/"),
+		Limit:  &limit,
+	})
+	listed := waitForNativeKVResult(t, runner, listID, 10*time.Second)
+	if listed.Error != nil {
+		t.Fatalf("KV list failed with code %s", listed.Error.Code)
+	}
+	if len(listed.Entries) != entryCount {
+		t.Fatalf("KV list entry count = %d, want %d", len(listed.Entries), entryCount)
+	}
+
+	const errorID = 1_001
+	submitNativeCommands(t, runner, wire.Command{
+		Kind: wire.CommandKVGet,
+		KVID: errorID,
+		AID:  "actor-that-is-not-active",
+		Key:  []byte("missing"),
+	})
+	failed := waitForNativeKVResult(t, runner, errorID, 10*time.Second)
+	if failed.Error == nil || failed.Error.Code != "actor_not_found" {
+		t.Fatalf("KV error code = %v, want actor_not_found", failed.Error)
+	}
+
+	deleteActor(t, engine.endpoint, actor.ActorID)
+	_, stopped := waitForNativeEvent(t, runner, wire.EventActorStop, 10*time.Second)
+	submitNativeCommands(t, runner, wire.Command{
+		Kind:       wire.CommandActorStopResult,
+		AID:        stopped.AID,
+		Generation: stopped.Generation,
+	})
+	waitForActor(t, engine.endpoint, actor.ActorID, true, func(actor actorRecord) bool {
+		return actor.DestroyTS != nil
+	})
+	if err := runner.Shutdown(3 * time.Second); err != nil {
+		t.Fatalf("shutdown KV runner: %v", err)
+	}
+	waitForNativeEvent(t, runner, wire.EventRunnerStopped, 5*time.Second)
+}
+
 func TestCounterStatePersistsAcrossEngineRestart(t *testing.T) {
 	if testing.Short() {
 		t.Skip("real-engine conformance is disabled by -short")
@@ -313,9 +444,6 @@ func TestCounterStatePersistsAcrossEngineRestart(t *testing.T) {
 	}
 	engine := startEngine(t, engineBinary)
 
-	type counterState struct {
-		Count int `json:"count"`
-	}
 	type observation struct {
 		actorID    string
 		generation uint64
@@ -326,8 +454,8 @@ func TestCounterStatePersistsAcrossEngineRestart(t *testing.T) {
 	observations := make(chan observation, 8)
 	stopped := make(chan observation, 2)
 	registry := rivet.NewRegistry()
-	if err := rivet.Register(registry, "counter", rivet.Actor[counterState]{
-		OnStart: func(ctx *rivet.Context[counterState]) error {
+	if err := rivet.Register(registry, "counter", rivet.Actor[persistentCounterState]{
+		OnStart: func(ctx *rivet.Context[persistentCounterState]) error {
 			loaded := ctx.State().Count
 			if loaded == 0 {
 				ctx.State().Count = 41
@@ -346,7 +474,7 @@ func TestCounterStatePersistsAcrossEngineRestart(t *testing.T) {
 			}
 			return nil
 		},
-		OnStop: func(ctx *rivet.Context[counterState]) error {
+		OnStop: func(ctx *rivet.Context[persistentCounterState]) error {
 			stopped <- observation{
 				actorID:    ctx.ActorID(),
 				generation: ctx.Generation(),
@@ -375,43 +503,73 @@ func TestCounterStatePersistsAcrossEngineRestart(t *testing.T) {
 		return actor.ConnectableTS != nil && actor.DestroyTS == nil
 	})
 
-	// Drain the runner first so the engine persists a GoingAway transition.
-	// After the engine restart, a fresh runner registration causes that actor
-	// workflow to allocate the next generation and rehydrate its saved state.
-	served.stop(t)
+	// Kill the engine while the actor is live and leave the runner transport
+	// reconnecting. Before restarting the engine, require the lost-connection
+	// path to stop the original Go actor worker. A later observation can then
+	// only come from a new ActorStart and a newly decoded state value, not from
+	// the first worker's in-process state.
+	engine.kill(t)
+	var firstStop observation
 	select {
-	case stoppedFirst := <-stopped:
-		if stoppedFirst.actorID != actor.ActorID || stoppedFirst.generation != first.generation || stoppedFirst.current != 41 {
-			t.Fatalf("counter stop observation = %#v, first = %#v", stoppedFirst, first)
-		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("counter did not stop during runner drain")
+	case firstStop = <-stopped:
+	case err := <-served.result:
+		served.stopOnce.Do(func() {
+			served.cancel()
+			served.stopErr = err
+		})
+		t.Fatalf("runner exited while the engine was stopped: %v", err)
+	case <-time.After(disconnectLivenessWindow + 10*time.Second):
+		t.Fatal("original actor worker did not stop after the engine process was killed")
 	}
-	engine.restart(t)
+	if firstStop.actorID != actor.ActorID || firstStop.generation != first.generation || firstStop.current != 41 {
+		t.Fatalf("pre-restart stop observation = %#v, first start = %#v", firstStop, first)
+	}
+
+	// start reuses runningEngine.storage, so this launches a distinct OS
+	// process against the exact database directory used by the killed process.
+	engine.start(t)
+	waitForActor(t, engine.endpoint, actor.ActorID, true, func(actor actorRecord) bool {
+		return actor.ConnectableTS == nil && len(actor.Error) != 0
+	})
+	// A crashed actor with restart policy sleeps after the engine detects its
+	// lost envoy. The gateway request is the public wake path; the management
+	// reschedule endpoint deliberately does not wake sleeping actors.
+	wakeResult := wakeActor(engine.endpoint, actor.ActorID, rehydrateWindow)
 	var rehydrated observation
-	var rehydratedOK bool
-	for attempt := 0; attempt < rehydrateAttempts; attempt++ {
-		resumed := startRegistry(t, engine, runnerName, registry)
-		select {
-		case rehydrated = <-observations:
-			rehydratedOK = true
-		case <-time.After(rehydrateAttemptWindow):
-			resumed.stop(t)
-		}
-		if rehydratedOK {
-			break
-		}
-	}
-	if !rehydratedOK {
+	select {
+	case rehydrated = <-observations:
+	case err := <-served.result:
+		served.stopOnce.Do(func() {
+			served.cancel()
+			served.stopErr = err
+		})
+		t.Fatalf("runner exited before post-restart ActorStart: %v", err)
+	case <-time.After(rehydrateWindow):
 		actorAfterRestart, actorErr := getActor(engine.endpoint, actor.ActorID, true)
 		envoysAfterRestart, envoyErr := listEnvoys(engine.endpoint, runnerName)
-		t.Fatalf("counter was not rehydrated after engine restart; actor=%#v actor_error=%v envoys=%#v envoy_error=%v", actorAfterRestart, actorErr, envoysAfterRestart, envoyErr)
+		var wakeErr error
+		select {
+		case wakeErr = <-wakeResult:
+		default:
+			wakeErr = errors.New("gateway wake request still pending")
+		}
+		t.Fatalf(
+			"counter was not rehydrated after engine restart; actor_id=%s connectable=%t destroyed=%t has_error=%t actor_error=%v envoys=%d envoy_error=%v wake_error=%v",
+			actorAfterRestart.ActorID,
+			actorAfterRestart.ConnectableTS != nil,
+			actorAfterRestart.DestroyTS != nil,
+			len(actorAfterRestart.Error) != 0,
+			actorErr,
+			len(envoysAfterRestart),
+			envoyErr,
+			wakeErr,
+		)
 	}
 	if rehydrated.actorID != actor.ActorID || rehydrated.loaded != 41 || rehydrated.current != 41 || rehydrated.input != "seed" {
 		t.Fatalf("rehydrated counter observation = %#v, first = %#v", rehydrated, first)
 	}
-	if rehydrated.generation == first.generation {
-		t.Fatalf("rehydrated generation = %d, want a new generation after %d", rehydrated.generation, first.generation)
+	if rehydrated.generation <= first.generation {
+		t.Fatalf("rehydrated generation = %d, want greater than prior generation %d", rehydrated.generation, first.generation)
 	}
 	waitForActor(t, engine.endpoint, actor.ActorID, false, func(actor actorRecord) bool {
 		return actor.ConnectableTS != nil && actor.DestroyTS == nil
@@ -565,6 +723,13 @@ func TestPanickingActorDoesNotKillRunner(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("register panic actor: %v", err)
 	}
+	if err := rivet.Register(registry, "panics-stop", rivet.Actor[struct{}]{
+		OnStop: func(*rivet.Context[struct{}]) error {
+			panic("intentional stop panic")
+		},
+	}); err != nil {
+		t.Fatalf("register stop-panic actor: %v", err)
+	}
 	healthyStarted := make(chan string, 1)
 	if err := rivet.Register(registry, "healthy", rivet.Actor[struct{}]{
 		OnStart: func(ctx *rivet.Context[struct{}]) error {
@@ -585,6 +750,18 @@ func TestPanickingActorDoesNotKillRunner(t *testing.T) {
 	}
 	if failed.ConnectableTS != nil {
 		t.Fatalf("panicking actor became connectable: %#v", failed)
+	}
+
+	panicsOnStop := createActor(t, engine.endpoint, "panics-stop", runnerName, "destroy", nil, nil)
+	waitForActor(t, engine.endpoint, panicsOnStop.ActorID, false, func(actor actorRecord) bool {
+		return actor.ConnectableTS != nil && actor.DestroyTS == nil
+	})
+	deleteActor(t, engine.endpoint, panicsOnStop.ActorID)
+	stoppedAfterPanic := waitForActor(t, engine.endpoint, panicsOnStop.ActorID, true, func(actor actorRecord) bool {
+		return actor.DestroyTS != nil
+	})
+	if stoppedAfterPanic.DestroyTS == nil {
+		t.Fatalf("OnStop panic actor did not reach an engine-visible stopped state: %#v", stoppedAfterPanic)
 	}
 
 	healthy := createActor(t, engine.endpoint, "healthy", runnerName, "destroy", nil, nil)
@@ -898,6 +1075,31 @@ func deleteActor(t *testing.T, endpoint, actorID string) {
 	)
 }
 
+func wakeActor(endpoint, actorID string, timeout time.Duration) <-chan error {
+	result := make(chan error, 1)
+	go func() {
+		request, err := http.NewRequest(
+			http.MethodGet,
+			endpoint+"/gateway/"+url.PathEscape(actorID)+"/m2-rehydrate",
+			nil,
+		)
+		if err != nil {
+			result <- fmt.Errorf("build gateway wake request: %w", err)
+			return
+		}
+		request.Header.Set("Authorization", "Bearer dev")
+		response, err := (&http.Client{Timeout: timeout}).Do(request)
+		if err != nil {
+			result <- fmt.Errorf("gateway wake request: %w", err)
+			return
+		}
+		defer response.Body.Close()
+		_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, 4<<10))
+		result <- nil
+	}()
+	return result
+}
+
 func getActor(endpoint, actorID string, includeDestroyed bool) (actorRecord, error) {
 	query := url.Values{}
 	query.Set("namespace", "default")
@@ -1168,6 +1370,10 @@ func expectRunnerNewError(t *testing.T, endpoint string) ffi.ErrorPayload {
 }
 
 func startNativeRunner(t *testing.T, endpoint, name string) *ffi.Runner {
+	return startNativeRunnerWithActors(t, endpoint, name, nil)
+}
+
+func startNativeRunnerWithActors(t *testing.T, endpoint, name string, actorNames []string) *ffi.Runner {
 	t.Helper()
 	config, err := wire.EncodeRunnerConfig(wire.RunnerConfig{
 		EngineEndpoint: endpoint,
@@ -1175,7 +1381,7 @@ func startNativeRunner(t *testing.T, endpoint, name string) *ffi.Runner {
 		RunnerName:     name,
 		Version:        1,
 		TotalSlots:     1,
-		ActorNames:     []string{},
+		ActorNames:     actorNames,
 		LogLevel:       "error",
 	})
 	if err != nil {
@@ -1198,6 +1404,41 @@ func startNativeRunner(t *testing.T, endpoint, name string) *ffi.Runner {
 	}
 	t.Cleanup(result.Runner.Close)
 	return result.Runner
+}
+
+func submitNativeCommands(t *testing.T, runner *ffi.Runner, commands ...wire.Command) {
+	t.Helper()
+	batch, err := wire.EncodeCommandBatch(wire.CommandBatch{Commands: commands})
+	if err != nil {
+		t.Fatalf("encode native command batch: %v", err)
+	}
+	if err := runner.Submit(batch); err != nil {
+		t.Fatalf("submit native command batch: %v", err)
+	}
+}
+
+func waitForNativeKVResult(t *testing.T, runner *ffi.Runner, kvID uint64, timeout time.Duration) wire.Event {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			t.Fatalf("timed out waiting for KV result %d", kvID)
+		}
+		data, err := runner.Poll(min(remaining, time.Second))
+		if err != nil {
+			t.Fatalf("poll KV result %d: %v", kvID, err)
+		}
+		batch, err := wire.DecodeEventBatch(data)
+		if err != nil {
+			t.Fatalf("decode KV result %d: %v", kvID, err)
+		}
+		for _, event := range batch.Events {
+			if event.Kind == wire.EventKVResult && event.KVID == kvID {
+				return event
+			}
+		}
+	}
 }
 
 // waitForNativeEvent polls until an event of the wanted kind arrives and
