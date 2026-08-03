@@ -141,7 +141,7 @@ impl RunnerInner {
         if batch.contains_unknown() {
             return Err(ErrorPayload::new(
                 "unknown_command",
-                "CommandBatch contains a command not supported by M4",
+                "CommandBatch contains a command not supported by M5",
             ));
         }
         batch
@@ -713,7 +713,7 @@ mod tests {
     }
 
     #[test]
-    fn validates_m4_config() {
+    fn validates_m5_config() {
         assert!(validate_config(&valid_config()).is_ok());
         let mut config = valid_config();
         config.actor_names.push("actor".to_owned());

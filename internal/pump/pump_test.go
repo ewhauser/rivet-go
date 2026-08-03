@@ -3,6 +3,7 @@ package pump
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"strings"
 	"sync"
@@ -234,11 +235,12 @@ type lifecycleHandler struct {
 type dispatchHandler struct {
 	lifecycleHandler
 	action     func(context.Context, *ActorSession, wire.Event, any) ([]byte, error)
+	alarm      func(context.Context, *ActorSession, wire.Event, any) error
 	fetch      func(context.Context, *ActorSession, wire.Event, any) error
 	wsOpen     func(context.Context, *ActorSession, wire.Event, any) error
 	wsMessage  func(context.Context, *ActorSession, wire.Event, any) error
 	wsClose    func(context.Context, *ActorSession, wire.Event, any) error
-	wsCloseAll func(context.Context, *ActorSession, any)
+	wsCloseAll func(context.Context, *ActorSession, any, string)
 }
 
 func (h dispatchHandler) WebSocketOpen(
@@ -277,10 +279,27 @@ func (h dispatchHandler) WebSocketClose(
 	return h.wsClose(ctx, session, event, state)
 }
 
-func (h dispatchHandler) CloseWebSockets(ctx context.Context, session *ActorSession, state any) {
+func (h dispatchHandler) CloseWebSockets(
+	ctx context.Context,
+	session *ActorSession,
+	state any,
+	reason string,
+) {
 	if h.wsCloseAll != nil {
-		h.wsCloseAll(ctx, session, state)
+		h.wsCloseAll(ctx, session, state, reason)
 	}
+}
+
+func (h dispatchHandler) Alarm(
+	ctx context.Context,
+	session *ActorSession,
+	event wire.Event,
+	state any,
+) error {
+	if h.alarm == nil {
+		return nil
+	}
+	return h.alarm(ctx, session, event, state)
 }
 
 func (h dispatchHandler) Action(
@@ -369,6 +388,147 @@ func TestActorStopWaitsForCleanupAndPreservesActorOrder(t *testing.T) {
 	stopResult := nextCommand(t, runner)
 	if stopResult.Kind != wire.CommandActorStopResult || stopResult.Error != nil {
 		t.Fatalf("ActorStopResult = %#v, want success", stopResult)
+	}
+
+	cancel()
+	if err := <-result; err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+}
+
+func TestActorAlarmIsOrderedAndAcknowledged(t *testing.T) {
+	runner := newFakeRunner()
+	seen := make(chan string, 2)
+	handler := dispatchHandler{
+		action: func(context.Context, *ActorSession, wire.Event, any) ([]byte, error) {
+			seen <- "action"
+			return []byte("done"), nil
+		},
+		alarm: func(_ context.Context, _ *ActorSession, event wire.Event, _ any) error {
+			seen <- fmt.Sprintf("alarm:%d", event.AlarmTS)
+			return nil
+		},
+	}
+	p := NewWithHandlers(runner, map[string]ActorHandler{"scheduled": handler})
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() { result <- p.Run(ctx) }()
+	waitPumpStarted(t, p)
+
+	runner.emit(wire.Event{
+		Kind: wire.EventActorStart, AID: "scheduled-aid", Generation: 2, Name: "scheduled",
+	})
+	if command := nextCommand(t, runner); command.Kind != wire.CommandActorStartResult {
+		t.Fatalf("start command = %#v", command)
+	}
+	runner.emit(
+		wire.Event{
+			Kind: wire.EventActionCall, AID: "scheduled-aid", Generation: 2,
+			CallID: 31, Action: "before-alarm", ActionTimeoutMS: 1_000,
+		},
+		wire.Event{
+			Kind: wire.EventActorAlarm, AID: "scheduled-aid", Generation: 2,
+			AlarmTS: 1_788_500_000_000,
+		},
+	)
+	if got := <-seen; got != "action" {
+		t.Fatalf("first callback = %q, want action", got)
+	}
+	if got := <-seen; got != "alarm:1788500000000" {
+		t.Fatalf("second callback = %q, want alarm", got)
+	}
+	if command := nextCommand(t, runner); command.Kind != wire.CommandActionResult {
+		t.Fatalf("action command = %#v", command)
+	}
+	if command := nextCommand(t, runner); command.Kind != wire.CommandAlarmHandled ||
+		command.AID != "scheduled-aid" || command.Generation != 2 || command.Error != nil {
+		t.Fatalf("alarm command = %#v", command)
+	}
+
+	cancel()
+	if err := <-result; err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+}
+
+func TestSleepWaitsForMidflightActionAndHibernatesWebSocket(t *testing.T) {
+	runner := newFakeRunner()
+	actionStarted := make(chan struct{})
+	actionRelease := make(chan struct{})
+	closeReason := make(chan string, 1)
+	var disconnects atomic.Int32
+	handler := dispatchHandler{
+		action: func(context.Context, *ActorSession, wire.Event, any) ([]byte, error) {
+			close(actionStarted)
+			<-actionRelease
+			return []byte("completed-before-sleep"), nil
+		},
+		wsClose: func(context.Context, *ActorSession, wire.Event, any) error {
+			disconnects.Add(1)
+			return nil
+		},
+		wsCloseAll: func(_ context.Context, _ *ActorSession, _ any, reason string) {
+			closeReason <- reason
+		},
+	}
+	p := NewWithHandlers(runner, map[string]ActorHandler{"sleeper": handler})
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() { result <- p.Run(ctx) }()
+	waitPumpStarted(t, p)
+
+	runner.emit(wire.Event{
+		Kind: wire.EventActorStart, AID: "sleeper-aid", Generation: 4, Name: "sleeper",
+	})
+	if command := nextCommand(t, runner); command.Kind != wire.CommandActorStartResult {
+		t.Fatalf("start command = %#v", command)
+	}
+	runner.emit(wire.Event{
+		Kind: wire.EventWSOpen, AID: "sleeper-aid", WSID: "ws-hibernate",
+		Path: "/chat", CanHibernate: true,
+	})
+	if command := nextCommand(t, runner); command.Kind != wire.CommandWSOpenResult {
+		t.Fatalf("open command = %#v", command)
+	}
+	runner.emit(wire.Event{
+		Kind: wire.EventActionCall, AID: "sleeper-aid", Generation: 4,
+		CallID: 51, Action: "block", ActionTimeoutMS: 5_000,
+	})
+	select {
+	case <-actionStarted:
+	case <-time.After(time.Second):
+		t.Fatal("action did not start")
+	}
+	runner.emit(wire.Event{
+		Kind: wire.EventActorStop, AID: "sleeper-aid", Generation: 4, Reason: "sleep",
+	})
+	if command := nextCommand(t, runner); command.Kind != wire.CommandWSClose ||
+		command.WSID != "ws-hibernate" || !command.Hibernate {
+		t.Fatalf("hibernate command = %#v", command)
+	}
+	select {
+	case command := <-runner.submitted:
+		t.Fatalf("actor work completed before action release: %#v", command)
+	default:
+	}
+	close(actionRelease)
+	if command := nextCommand(t, runner); command.Kind != wire.CommandActionResult ||
+		string(command.Output) != "completed-before-sleep" {
+		t.Fatalf("action command = %#v", command)
+	}
+	if command := nextCommand(t, runner); command.Kind != wire.CommandActorStopResult {
+		t.Fatalf("stop command = %#v", command)
+	}
+	select {
+	case reason := <-closeReason:
+		if reason != "sleep" {
+			t.Fatalf("close-all reason = %q, want sleep", reason)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("connection generation was not detached")
+	}
+	if disconnects.Load() != 0 {
+		t.Fatalf("OnDisconnect calls = %d, want 0 for hibernation", disconnects.Load())
 	}
 
 	cancel()

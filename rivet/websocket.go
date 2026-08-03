@@ -75,8 +75,8 @@ func (c *Connection) Headers() map[string]string {
 	return cloneStringMap(c.headers)
 }
 
-// CanHibernate reports the core preflight value. M4 always returns false;
-// hibernation semantics are reserved for M5.
+// CanHibernate reports whether core can preserve this gateway connection
+// while the actor sleeps. Hibernation is otherwise transparent to handlers.
 func (c *Connection) CanHibernate() bool {
 	return c != nil && c.canHibernate
 }

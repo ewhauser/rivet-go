@@ -15,10 +15,11 @@ import (
 )
 
 const (
-	defaultEndpoint   = "http://127.0.0.1:6420"
-	defaultNamespace  = "default"
-	defaultRunnerName = "rivet-go"
-	defaultLogLevel   = "info"
+	defaultEndpoint     = "http://127.0.0.1:6420"
+	defaultNamespace    = "default"
+	defaultRunnerName   = "rivet-go"
+	defaultLogLevel     = "info"
+	internalAlarmAction = "__rivet_go_alarm"
 )
 
 // Config controls engine registration. Version is the engine-visible runner
@@ -66,6 +67,9 @@ func Register[T any](registry *Registry, name string, actor Actor[T]) error {
 		}
 		if handler == nil {
 			return fmt.Errorf("actor %q action %q has a nil handler", name, actionName)
+		}
+		if actionName == internalAlarmAction {
+			return fmt.Errorf("actor %q action %q is reserved for durable alarms", name, actionName)
 		}
 	}
 	registry.mu.Lock()

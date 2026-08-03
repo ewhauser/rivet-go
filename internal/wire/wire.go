@@ -18,6 +18,7 @@ const (
 	EventRunnerStopped      EventKind = "runner_stopped"
 	EventActorStart         EventKind = "actor_start"
 	EventActorStop          EventKind = "actor_stop"
+	EventActorAlarm         EventKind = "actor_alarm"
 	EventActionCall         EventKind = "action_call"
 	EventHTTPRequest        EventKind = "http_request"
 	EventHTTPRequestChunk   EventKind = "http_request_chunk"
@@ -34,6 +35,7 @@ type CommandKind string
 const (
 	CommandActorStartResult  CommandKind = "actor_start_result"
 	CommandActorStopResult   CommandKind = "actor_stop_result"
+	CommandAlarmHandled      CommandKind = "alarm_handled"
 	CommandActionResult      CommandKind = "action_result"
 	CommandHTTPResponseStart CommandKind = "http_response_start"
 	CommandHTTPResponseChunk CommandKind = "http_response_chunk"
@@ -43,6 +45,8 @@ const (
 	CommandWSClose           CommandKind = "ws_close_cmd"
 	CommandBroadcast         CommandKind = "broadcast"
 	CommandStopIntent        CommandKind = "stop_intent"
+	CommandSetAlarm          CommandKind = "set_alarm"
+	CommandSleepIntent       CommandKind = "sleep_intent"
 	CommandSaveState         CommandKind = "save_state"
 	CommandKVGet             CommandKind = "kv_get"
 	CommandKVList            CommandKind = "kv_list"
@@ -68,7 +72,7 @@ type EventBatch struct {
 	Events []Event `msgpack:"events"`
 }
 
-// Event is the M4 event union. Fields not selected by Kind are absent from
+// Event is the M5 event union. Fields not selected by Kind are absent from
 // Rust's encoded map and remain zero-valued after decoding.
 type Event struct {
 	Kind            EventKind         `msgpack:"kind"`
@@ -102,10 +106,12 @@ type Event struct {
 	Finish          bool              `msgpack:"finish,omitempty"`
 	WSID            string            `msgpack:"ws_id,omitempty"`
 	CanHibernate    bool              `msgpack:"can_hibernate,omitempty"`
+	Resumed         bool              `msgpack:"resumed,omitempty"`
 	Data            []byte            `msgpack:"data,omitempty"`
 	Binary          bool              `msgpack:"binary,omitempty"`
 	MessageIndex    uint16            `msgpack:"msg_index,omitempty"`
 	CloseCode       *uint16           `msgpack:"code,omitempty"`
+	AlarmTS         int64             `msgpack:"alarm_ts,omitempty"`
 }
 
 type DrainReport struct {
@@ -136,7 +142,7 @@ type CommandBatch struct {
 	Commands []Command `msgpack:"commands"`
 }
 
-// Command is the M4 command union. All fields are encoded so zero-length keys,
+// Command is the M5 command union. All fields are encoded so zero-length keys,
 // values, state, and generation zero remain distinguishable from a missing
 // required field. Rust ignores fields that do not belong to the selected kind.
 type Command struct {
@@ -171,6 +177,7 @@ type Command struct {
 	Event        string            `msgpack:"event"`
 	Payload      []byte            `msgpack:"payload"`
 	ExcludeConn  *string           `msgpack:"exclude_conn"`
+	AlarmTS      *int64            `msgpack:"alarm_ts"`
 }
 
 func EncodeRunnerConfig(config RunnerConfig) ([]byte, error) {
@@ -229,6 +236,10 @@ func validateEvent(event Event) error {
 	case EventActorStop:
 		if event.AID == "" || event.Reason == "" {
 			return fmt.Errorf("%s event requires aid and reason", event.Kind)
+		}
+	case EventActorAlarm:
+		if event.AID == "" {
+			return fmt.Errorf("%s event has empty aid", event.Kind)
 		}
 	case EventActionCall:
 		if event.AID == "" || event.CallID == 0 || event.Action == "" || event.ActionTimeoutMS == 0 {

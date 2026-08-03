@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/ewhauser/rivet-go/internal/pump"
 	"github.com/ewhauser/rivet-go/internal/wire"
@@ -19,15 +20,18 @@ import (
 type Actor[T any] struct {
 	OnStart func(*Context[T]) error
 	OnStop  func(*Context[T]) error
+	OnAlarm func(*Context[T]) error
 	Actions Actions[T]
 	// OnFetch handles buffered HTTP requests from the pinned core. Response
 	// headers lock on the first WriteHeader or Write, concurrent Write calls are
 	// serialized, and writes after OnFetch returns fail. Header must not be
 	// mutated concurrently with a write. The M3 writer intentionally does not
 	// implement http.Flusher because v2.3.10 buffers the complete response.
-	OnFetch      func(*Context[T], http.ResponseWriter, *http.Request)
-	OnConnect    func(*Context[T], *Connection) error
-	OnMessage    func(*Context[T], *Connection, Message)
+	OnFetch   func(*Context[T], http.ResponseWriter, *http.Request)
+	OnConnect func(*Context[T], *Connection) error
+	OnMessage func(*Context[T], *Connection, Message)
+	// OnDisconnect runs for a connection close observed while the actor is
+	// live. Hibernation itself is transparent and does not invoke this hook.
 	OnDisconnect func(*Context[T], *Connection)
 }
 
@@ -67,6 +71,38 @@ func (c *Context[T]) Generation() uint64 {
 		return 0
 	}
 	return c.session.Generation()
+}
+
+// Schedule replaces this actor's one durable alarm. The engine wakes a
+// sleeping actor before invoking OnAlarm.
+func (c *Context[T]) Schedule(at time.Time) error {
+	if c == nil || c.session == nil {
+		return errors.New("actor context is unavailable")
+	}
+	timestamp := at.UnixMilli()
+	return c.session.SetAlarm(&timestamp)
+}
+
+// ScheduleAfter replaces this actor's one durable alarm relative to now.
+func (c *Context[T]) ScheduleAfter(delay time.Duration) error {
+	return c.Schedule(time.Now().Add(delay))
+}
+
+// ClearSchedule removes this actor's pending alarm, if any.
+func (c *Context[T]) ClearSchedule() error {
+	if c == nil || c.session == nil {
+		return errors.New("actor context is unavailable")
+	}
+	return c.session.SetAlarm(nil)
+}
+
+// Sleep requests engine-managed eviction after the current handler and
+// already accepted actor work complete. Hibernatable WebSockets stay open.
+func (c *Context[T]) Sleep() error {
+	if c == nil || c.session == nil {
+		return errors.New("actor context is unavailable")
+	}
+	return c.session.Sleep()
 }
 
 // Save serializes the current complete state and waits until rivetkit-core has
@@ -171,6 +207,31 @@ func (a *actorAdapter[T]) Action(
 	return output, nil
 }
 
+func (a *actorAdapter[T]) Alarm(
+	ctx context.Context,
+	_ *pump.ActorSession,
+	_ wire.Event,
+	state any,
+) error {
+	actorContext, ok := state.(*Context[T])
+	if !ok || actorContext == nil {
+		return errors.New("typed actor context is unavailable during alarm")
+	}
+	if a.definition.OnAlarm == nil {
+		return pump.HandlerError{Code: "callback_not_found", Message: "actor has no OnAlarm handler"}
+	}
+	if err := a.definition.OnAlarm(actorContext); err != nil {
+		return err
+	}
+	if err := actorContext.Save(ctx); err != nil {
+		return pump.HandlerError{
+			Code:    "alarm_state_persist_failed",
+			Message: err.Error(),
+		}
+	}
+	return nil
+}
+
 func (a *actorAdapter[T]) Fetch(
 	_ context.Context,
 	session *pump.ActorSession,
@@ -228,6 +289,9 @@ func (a *actorAdapter[T]) WebSocketOpen(
 	}
 	actorContext.connections[event.WSID] = connection
 	actorContext.connectionsMu.Unlock()
+	if event.Resumed {
+		return nil
+	}
 	if a.definition.OnConnect == nil {
 		return nil
 	}
@@ -295,6 +359,7 @@ func (a *actorAdapter[T]) CloseWebSockets(
 	_ context.Context,
 	_ *pump.ActorSession,
 	state any,
+	reason string,
 ) {
 	actorContext, ok := state.(*Context[T])
 	if !ok || actorContext == nil {
@@ -304,10 +369,13 @@ func (a *actorAdapter[T]) CloseWebSockets(
 	connections := make([]*Connection, 0, len(actorContext.connections))
 	for id, connection := range actorContext.connections {
 		delete(actorContext.connections, id)
-		connection.setClose(nil, "actor stopped")
+		connection.setClose(nil, reason)
 		connections = append(connections, connection)
 	}
 	actorContext.connectionsMu.Unlock()
+	if reason == "sleep" {
+		return
+	}
 	if a.definition.OnDisconnect != nil {
 		for _, connection := range connections {
 			func() {

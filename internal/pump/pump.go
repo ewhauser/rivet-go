@@ -55,6 +55,10 @@ type actorActionHandler interface {
 	Action(context.Context, *ActorSession, wire.Event, any) ([]byte, error)
 }
 
+type actorAlarmHandler interface {
+	Alarm(context.Context, *ActorSession, wire.Event, any) error
+}
+
 type actorFetchHandler interface {
 	Fetch(context.Context, *ActorSession, wire.Event, any) error
 }
@@ -63,7 +67,7 @@ type actorWebSocketHandler interface {
 	WebSocketOpen(context.Context, *ActorSession, wire.Event, any) error
 	WebSocketMessage(context.Context, *ActorSession, wire.Event, any) error
 	WebSocketClose(context.Context, *ActorSession, wire.Event, any) error
-	CloseWebSockets(context.Context, *ActorSession, any)
+	CloseWebSockets(context.Context, *ActorSession, any, string)
 }
 
 // HandlerError is sent to Rust as the structured actor-local error arm of a
@@ -265,8 +269,8 @@ func (s *ActorSession) SendWebSocket(
 	})
 }
 
-// CloseWebSocket asks core to close one connection. Hibernation is wired on
-// the command but intentionally false until M5.
+// CloseWebSocket asks core to close one connection. Actor-managed hibernation
+// is driven by Sleep rather than exposed as a connection close option.
 func (s *ActorSession) CloseWebSocket(
 	ctx context.Context,
 	wsID string,
@@ -305,6 +309,44 @@ func (s *ActorSession) Broadcast(
 		Event:       event,
 		Payload:     cloneBytesOrEmpty(payload),
 		ExcludeConn: excludeConn,
+	})
+}
+
+// SetAlarm replaces the actor's one durable Go alarm. A nil timestamp clears
+// the schedule. The core schedule table and engine alarm transport own
+// durability and wake-up delivery.
+func (s *ActorSession) SetAlarm(alarmTS *int64) error {
+	if s == nil || s.pump == nil {
+		return errors.New("actor session is unavailable")
+	}
+	if !s.isAccepting() {
+		return ErrShuttingDown
+	}
+	var timestamp *int64
+	if alarmTS != nil {
+		value := *alarmTS
+		timestamp = &value
+	}
+	return s.pump.submitInternal(context.Background(), wire.Command{
+		Kind:    wire.CommandSetAlarm,
+		AID:     s.AID(),
+		AlarmTS: timestamp,
+	})
+}
+
+// Sleep requests engine-managed eviction after already accepted actor work
+// has drained. Hibernatable gateway WebSockets are detached without a
+// disconnect and restored by core in the next generation.
+func (s *ActorSession) Sleep() error {
+	if s == nil || s.pump == nil {
+		return errors.New("actor session is unavailable")
+	}
+	if !s.isAccepting() {
+		return ErrShuttingDown
+	}
+	return s.pump.submitInternal(context.Background(), wire.Command{
+		Kind: wire.CommandSleepIntent,
+		AID:  s.AID(),
 	})
 }
 
@@ -840,6 +882,11 @@ type actorWorker struct {
 	events  chan wire.Event
 }
 
+type websocketOwner struct {
+	identity     actorIdentity
+	canHibernate bool
+}
+
 // Pump owns runner and closes it after RunnerStopped has been dispatched.
 type Pump struct {
 	runner          Runner
@@ -870,7 +917,7 @@ type Pump struct {
 	httpMu      sync.Mutex
 	httpPending map[uint64]*httpRequestState
 	wsMu        sync.Mutex
-	websockets  map[string]actorIdentity
+	websockets  map[string]websocketOwner
 
 	subsMu    sync.Mutex
 	subs      map[uint64]*subscriber
@@ -906,7 +953,7 @@ func NewWithHandlers(runner Runner, handlers map[string]ActorHandler) *Pump {
 		kvPending:       make(map[uint64]chan wire.Event),
 		lateSaves:       make(map[actorIdentity]struct{}),
 		httpPending:     make(map[uint64]*httpRequestState),
-		websockets:      make(map[string]actorIdentity),
+		websockets:      make(map[string]websocketOwner),
 		subs:            make(map[uint64]*subscriber),
 	}
 }
@@ -1144,8 +1191,27 @@ func (p *Pump) handleInternalEvent(event wire.Event) error {
 		if worker == nil {
 			return fmt.Errorf("ActorStop for unknown actor %s generation %d", event.AID, event.Generation)
 		}
-		for _, closeEvent := range p.detachActorWebSockets(worker.session.identity, "actor stopped") {
+		closeEvents, hibernateCommands := p.detachActorWebSockets(
+			worker.session.identity,
+			event.Reason == "sleep",
+			"actor stopped",
+		)
+		if len(hibernateCommands) != 0 {
+			submitCtx, cancel := context.WithTimeout(context.Background(), p.wsSubmitLimit)
+			err := p.submitInternal(submitCtx, hibernateCommands...)
+			cancel()
+			if err != nil {
+				return fmt.Errorf("hibernate actor WebSockets: %w", err)
+			}
+		}
+		for _, closeEvent := range closeEvents {
 			worker.events <- closeEvent
+		}
+		worker.events <- event
+	case wire.EventActorAlarm:
+		worker := p.actor(event.AID, event.Generation)
+		if worker == nil {
+			return fmt.Errorf("ActorAlarm for unknown actor %s generation %d", event.AID, event.Generation)
 		}
 		worker.events <- event
 	case wire.EventActionCall:
@@ -1207,7 +1273,10 @@ func (p *Pump) handleInternalEvent(event wire.Event) error {
 			p.wsMu.Unlock()
 			return fmt.Errorf("duplicate WsOpen ws_id %s", event.WSID)
 		}
-		p.websockets[event.WSID] = worker.session.identity
+		p.websockets[event.WSID] = websocketOwner{
+			identity:     worker.session.identity,
+			canHibernate: event.CanHibernate,
+		}
 		p.wsMu.Unlock()
 		worker.events <- event
 	case wire.EventWSMessage:
@@ -1272,9 +1341,10 @@ func (w *actorWorker) run(start wire.Event) {
 	if lifecycleError != nil {
 		return
 	}
+	stopReason := "actor worker stopped"
 	defer func() {
 		if wsHandler, ok := w.handler.(actorWebSocketHandler); ok {
-			wsHandler.CloseWebSockets(context.Background(), w.session, state)
+			wsHandler.CloseWebSockets(context.Background(), w.session, state, stopReason)
 		}
 	}()
 
@@ -1305,6 +1375,20 @@ func (w *actorWorker) run(start wire.Event) {
 			}
 			if actionError != nil && actionError.Code == "handler_panic" {
 				return
+			}
+		case wire.EventActorAlarm:
+			alarmError := invokeAlarm(w.ctx, w.handler, w.session, event, state)
+			if err := w.pump.submitInternal(w.ctx, wire.Command{
+				Kind:       wire.CommandAlarmHandled,
+				AID:        w.session.identity.aid,
+				Generation: w.session.identity.generation,
+				Error:      alarmError,
+			}); err != nil {
+				w.pump.reportWorkerError(fmt.Errorf("submit AlarmHandled: %w", err))
+				return
+			}
+			if alarmError != nil && alarmError.Code == "handler_panic" {
+				w.requestErrorStop()
 			}
 		case wire.EventHTTPRequest:
 			fetchError := invokeFetch(w.ctx, w.handler, w.session, event, state)
@@ -1354,6 +1438,7 @@ func (w *actorWorker) run(start wire.Event) {
 				w.requestErrorStop()
 			}
 		case wire.EventActorStop:
+			stopReason = event.Reason
 			lifecycleError = invokeStop(w.ctx, w.handler, w.session, event, state)
 			w.session.closeGracefully()
 			if err := w.pump.submitInternal(w.ctx, wire.Command{
@@ -1437,6 +1522,31 @@ func invokeStop(
 	}
 	if err := handler.Stop(ctx, session, event, state); err != nil {
 		return handlerWireError("OnStop", err)
+	}
+	return nil
+}
+
+func invokeAlarm(
+	ctx context.Context,
+	handler ActorHandler,
+	session *ActorSession,
+	event wire.Event,
+	state any,
+) (handlerError *wire.WireError) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			handlerError = &wire.WireError{
+				Code:    "handler_panic",
+				Message: fmt.Sprintf("OnAlarm panicked: %v", recovered),
+			}
+		}
+	}()
+	alarmHandler, ok := handler.(actorAlarmHandler)
+	if !ok {
+		return &wire.WireError{Code: "callback_not_found", Message: "actor has no OnAlarm handler"}
+	}
+	if err := alarmHandler.Alarm(ctx, session, event, state); err != nil {
+		return handlerWireError("OnAlarm", err)
 	}
 	return nil
 }
@@ -1607,34 +1717,47 @@ func (p *Pump) currentActor(aid string) *actorWorker {
 
 func (p *Pump) websocketActor(wsID string) *actorWorker {
 	p.wsMu.Lock()
-	identity, ok := p.websockets[wsID]
+	owner, ok := p.websockets[wsID]
 	p.wsMu.Unlock()
 	if !ok {
 		return nil
 	}
-	return p.actor(identity.aid, identity.generation)
+	return p.actor(owner.identity.aid, owner.identity.generation)
 }
 
 func (p *Pump) removeWebSocket(wsID string) *actorWorker {
 	p.wsMu.Lock()
-	identity, ok := p.websockets[wsID]
+	owner, ok := p.websockets[wsID]
 	delete(p.websockets, wsID)
 	p.wsMu.Unlock()
 	if !ok {
 		return nil
 	}
-	return p.actor(identity.aid, identity.generation)
+	return p.actor(owner.identity.aid, owner.identity.generation)
 }
 
-func (p *Pump) detachActorWebSockets(identity actorIdentity, reason string) []wire.Event {
+func (p *Pump) detachActorWebSockets(
+	identity actorIdentity,
+	hibernate bool,
+	reason string,
+) ([]wire.Event, []wire.Command) {
 	p.wsMu.Lock()
 	events := make([]wire.Event, 0)
+	commands := make([]wire.Command, 0)
 	code := uint16(1001)
 	for wsID, owner := range p.websockets {
-		if owner != identity {
+		if owner.identity != identity {
 			continue
 		}
 		delete(p.websockets, wsID)
+		if hibernate && owner.canHibernate {
+			commands = append(commands, wire.Command{
+				Kind:      wire.CommandWSClose,
+				WSID:      wsID,
+				Hibernate: true,
+			})
+			continue
+		}
 		events = append(events, wire.Event{
 			Kind:      wire.EventWSClose,
 			WSID:      wsID,
@@ -1643,7 +1766,7 @@ func (p *Pump) detachActorWebSockets(identity actorIdentity, reason string) []wi
 		})
 	}
 	p.wsMu.Unlock()
-	return events
+	return events, commands
 }
 
 func (p *Pump) httpRequest(requestID uint64) *httpRequestState {
@@ -1680,7 +1803,7 @@ func (p *Pump) abortHTTPForActor(identity actorIdentity, cause error) {
 }
 
 func (p *Pump) removeActor(identity actorIdentity, worker *actorWorker) {
-	p.detachActorWebSockets(identity, "actor worker stopped")
+	_, _ = p.detachActorWebSockets(identity, false, "actor worker stopped")
 	p.actorsMu.Lock()
 	if p.actors[identity] == worker {
 		delete(p.actors, identity)

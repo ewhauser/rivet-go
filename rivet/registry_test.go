@@ -60,6 +60,14 @@ func TestRegisterRejectsInvalidActionManifest(t *testing.T) {
 	}); err == nil || !strings.Contains(err.Error(), "nil handler") {
 		t.Fatalf("nil action handler error = %v", err)
 	}
+
+	if err := Register(NewRegistry(), "counter", Actor[struct{}]{
+		Actions: Actions[struct{}]{internalAlarmAction: Action(
+			func(*Context[struct{}], struct{}) (struct{}, error) { return struct{}{}, nil },
+		)},
+	}); err == nil || !strings.Contains(err.Error(), "reserved for durable alarms") {
+		t.Fatalf("reserved alarm action error = %v", err)
+	}
 }
 
 type binaryState struct {

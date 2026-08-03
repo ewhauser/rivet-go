@@ -14,7 +14,7 @@
 /**
  * The single source of truth for the native ABI version.
  */
-#define RK_ABI_VERSION 4
+#define RK_ABI_VERSION 5
 
 /**
  * Opaque structured error handle. Its contents are accessed as JSON.

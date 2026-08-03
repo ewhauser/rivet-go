@@ -1,5 +1,5 @@
 // Package rivet is the public Go SDK for hosting Rivet actors.
 //
-// Milestone M3 provides typed actor registration and state, explicit actions,
-// and raw HTTP handlers reached through the engine gateway.
+// The SDK provides typed actor registration and state, actions, alarms,
+// engine-managed sleep, raw HTTP, and hibernating gateway WebSockets.
 package rivet

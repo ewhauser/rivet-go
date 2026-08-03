@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
-use crossbeam_channel::Sender;
+use crossbeam_channel::{Sender, bounded};
 use rivet_error::{RivetError, RivetErrorKind};
 use rivetkit_core::actor::ShutdownKind;
 use rivetkit_core::{
@@ -29,6 +29,8 @@ const MAX_HTTP_HEADERS: usize = 256;
 const MAX_KV_LIST_ENTRIES: u32 = 1_024;
 const WS_OUTBOUND_QUEUE_CAPACITY: usize = 64;
 const WS_BACKPRESSURE_CLOSE_CODE: u16 = 1013;
+const WS_MESSAGE_ACK_TIMEOUT: Duration = Duration::from_secs(60);
+const INTERNAL_ALARM_ACTION: &str = "__rivet_go_alarm";
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
 struct ActorIdentity {
@@ -49,6 +51,7 @@ impl ActorIdentity {
 enum LifecycleKind {
     Start,
     Stop,
+    Alarm,
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
@@ -59,9 +62,17 @@ struct LifecycleKey {
 
 #[derive(Clone)]
 struct ActiveActor {
+    identity: ActorIdentity,
     ctx: ActorContext,
     state_version: Arc<AtomicU64>,
     operations: ActorOperations,
+    alarm_updates: ActorAlarmUpdates,
+}
+
+#[derive(Clone, Default)]
+struct ActorAlarmUpdates {
+    revision: Arc<AtomicU64>,
+    apply: Arc<tokio::sync::Mutex<()>>,
 }
 
 #[derive(Default)]
@@ -185,7 +196,12 @@ struct ActiveWebSocket {
 #[derive(Default)]
 struct WsAcknowledgements {
     last_received: Option<u16>,
-    pending: VecDeque<u16>,
+    pending: VecDeque<PendingWsAcknowledgement>,
+}
+
+struct PendingWsAcknowledgement {
+    msg_index: u16,
+    completion: Option<Sender<()>>,
 }
 
 #[derive(Clone, Default)]
@@ -309,6 +325,8 @@ pub(crate) struct ActorProxy {
     pending_ws_open: WsOpenPending,
     actors: Arc<Mutex<HashMap<ActorIdentity, ActiveActor>>>,
     websockets: Arc<Mutex<HashMap<String, ActiveWebSocket>>>,
+    restoring_websockets: Arc<Mutex<HashMap<String, ActorIdentity>>>,
+    stop_intents: Arc<Mutex<HashSet<ActorIdentity>>>,
     active_http: Arc<Mutex<HashSet<u64>>>,
     http_responses: Arc<Mutex<HashMap<u64, HttpResponseAssembly>>>,
 }
@@ -322,6 +340,8 @@ impl ActorProxy {
             pending_ws_open: WsOpenPending::default(),
             actors: Arc::new(Mutex::new(HashMap::new())),
             websockets: Arc::new(Mutex::new(HashMap::new())),
+            restoring_websockets: Arc::new(Mutex::new(HashMap::new())),
+            stop_intents: Arc::new(Mutex::new(HashSet::new())),
             active_http: Arc::new(Mutex::new(HashSet::new())),
             http_responses: Arc::new(Mutex::new(HashMap::new())),
         }
@@ -343,10 +363,8 @@ impl ActorProxy {
                 // atomic-write-enabled SQLite build that the Go SDK does not
                 // otherwise need to ship.
                 remote_sqlite: true,
-                // Sleep/alarm behavior belongs to M5. Keeping M3 actors awake
-                // makes lifecycle changes engine-driven and deterministic.
-                no_sleep: true,
-                can_hibernate_websocket: CanHibernateWebSocket::Bool(false),
+                no_sleep: false,
+                can_hibernate_websocket: CanHibernateWebSocket::Bool(true),
                 max_incoming_message_size: MAX_BODY_CHUNK as u32,
                 max_outgoing_message_size: MAX_BODY_CHUNK as u32,
                 action_timeout: ACTION_RESULT_TIMEOUT,
@@ -407,6 +425,20 @@ impl ActorProxy {
                         .resolve(&key, LifecycleResolution { error }, &self.correlations);
                 }
             }
+            Command::AlarmHandled {
+                aid,
+                r#gen: generation,
+                error,
+            } => {
+                self.pending.resolve(
+                    &LifecycleKey {
+                        actor: ActorIdentity::new(aid, generation),
+                        kind: LifecycleKind::Alarm,
+                    },
+                    LifecycleResolution { error },
+                    &self.correlations,
+                );
+            }
             Command::ActionResult {
                 call_id,
                 output,
@@ -452,8 +484,14 @@ impl ActorProxy {
                 ws_id,
                 code,
                 reason,
-                hibernate: _,
-            } => self.close_ws(&ws_id, code, reason),
+                hibernate,
+            } => {
+                if hibernate {
+                    self.hibernate_ws(&ws_id);
+                } else {
+                    self.close_ws(&ws_id, code, reason);
+                }
+            }
             Command::Broadcast {
                 aid,
                 event,
@@ -462,7 +500,20 @@ impl ActorProxy {
             } => self.broadcast(&aid, &event, payload, exclude_conn.as_deref()),
             Command::StopIntent { aid } => {
                 if let Some(actor) = self.actor_current(&aid) {
+                    self.stop_intents
+                        .lock()
+                        .expect("stop intent table poisoned")
+                        .insert(actor.identity.clone());
                     let _ = actor.ctx.stop_with_error("Go WebSocket handler panicked");
+                }
+            }
+            Command::SetAlarm { aid, alarm_ts } => self.dispatch_set_alarm(aid, alarm_ts),
+            Command::SleepIntent { aid } => {
+                if let Some(actor) = self.actor_current(&aid) {
+                    tokio::spawn(async move {
+                        actor.operations.wait_idle().await;
+                        let _ = actor.ctx.sleep();
+                    });
                 }
             }
             Command::SaveState {
@@ -523,6 +574,7 @@ impl ActorProxy {
             ctx,
             input,
             snapshot,
+            hibernated,
             mut events,
             startup_ready,
             ..
@@ -540,11 +592,22 @@ impl ActorProxy {
             .insert(
                 identity.clone(),
                 ActiveActor {
+                    identity: identity.clone(),
                     ctx: ctx.clone(),
                     state_version: Arc::new(AtomicU64::new(0)),
                     operations: ActorOperations::default(),
+                    alarm_updates: ActorAlarmUpdates::default(),
                 },
             );
+        {
+            let mut restoring = self
+                .restoring_websockets
+                .lock()
+                .expect("restoring WebSocket table poisoned");
+            for (conn, _) in hibernated {
+                restoring.insert(conn.id().to_owned(), identity.clone());
+            }
+        }
 
         let result = self
             .run_actor_inner(
@@ -556,12 +619,29 @@ impl ActorProxy {
                 startup_ready,
             )
             .await;
-        self.close_actor_websockets(&identity, Some(1001), Some("actor stopped".to_owned()));
+        match &result {
+            Ok(true) => self.hibernate_actor_websockets(&identity),
+            Ok(false) | Err(_) => {
+                self.close_actor_websockets(
+                    &identity,
+                    Some(1001),
+                    Some("actor stopped".to_owned()),
+                );
+            }
+        }
+        self.restoring_websockets
+            .lock()
+            .expect("restoring WebSocket table poisoned")
+            .retain(|_, owner| owner != &identity);
+        self.stop_intents
+            .lock()
+            .expect("stop intent table poisoned")
+            .remove(&identity);
         self.actors
             .lock()
             .expect("active actor table poisoned")
             .remove(&identity);
-        result
+        result.map(|_| ())
     }
 
     async fn run_actor_inner(
@@ -572,7 +652,8 @@ impl ActorProxy {
         persisted_state: Option<Vec<u8>>,
         events: &mut rivetkit_core::ActorEvents,
         startup_ready: Option<tokio::sync::oneshot::Sender<Result<()>>>,
-    ) -> Result<()> {
+    ) -> Result<bool> {
+        let mut slept = false;
         let start_result = self
             .request_lifecycle(
                 LifecycleKey {
@@ -617,6 +698,8 @@ impl ActorProxy {
                     reply.send(Ok(Vec::new()));
                 }
                 ActorEvent::RunGracefulCleanup { reason, reply } => {
+                    let stop_reason = self.actor_stop_reason(identity, reason);
+                    slept = matches!(reason, ShutdownKind::Sleep);
                     let shutdown_deadline = ctx.shutdown_deadline_token();
                     let result = self
                         .request_lifecycle(
@@ -627,7 +710,7 @@ impl ActorProxy {
                             Event::ActorStop {
                                 aid: identity.aid.clone(),
                                 r#gen: identity.generation,
-                                reason: shutdown_reason(reason).to_owned(),
+                                reason: stop_reason,
                             },
                             Some(shutdown_deadline),
                         )
@@ -648,9 +731,31 @@ impl ActorProxy {
                     name,
                     args,
                     conn,
+                    scheduled_fire,
                     reply,
                     ..
                 } => {
+                    if name == INTERNAL_ALARM_ACTION {
+                        let Some(fire) = scheduled_fire else {
+                            reply.send(Err(rivetkit_core::error::action_not_found(&name)));
+                            continue;
+                        };
+                        let resolution = self.request_alarm(identity, fire.scheduled_at).await;
+                        match resolution {
+                            Ok(()) => reply.send(Ok(cbor_null())),
+                            Err(error) => {
+                                let fatal = error.code == "handler_panic";
+                                reply.send(Err(actor_wire_error(&error)));
+                                if fatal {
+                                    return Err(anyhow!(
+                                        "Go alarm handler panicked: {}",
+                                        error.message
+                                    ));
+                                }
+                            }
+                        }
+                        continue;
+                    }
                     let resolution = self
                         .request_action(
                             identity,
@@ -687,7 +792,7 @@ impl ActorProxy {
                     }
                 }
                 ActorEvent::QueueSend { reply, .. } => {
-                    reply.send(Err(anyhow!("queue requests are outside the M4 surface")));
+                    reply.send(Err(anyhow!("queue requests are outside the M5 surface")));
                 }
                 ActorEvent::ConnectionPreflight { reply, .. }
                 | ActorEvent::ConnectionOpen { reply, .. } => reply.send(Ok(())),
@@ -711,7 +816,7 @@ impl ActorProxy {
                 | ActorEvent::WorkflowReplayRequested { reply, .. } => reply.send(Ok(None)),
             }
         }
-        Ok(())
+        Ok(slept)
     }
 
     async fn request_lifecycle(
@@ -761,6 +866,59 @@ impl ActorProxy {
         Ok(())
     }
 
+    async fn request_alarm(
+        &self,
+        identity: &ActorIdentity,
+        alarm_ts: i64,
+    ) -> Result<(), WireError> {
+        let key = LifecycleKey {
+            actor: identity.clone(),
+            kind: LifecycleKind::Alarm,
+        };
+        let (id, receiver) = self.correlations.insert(LIFECYCLE_RESULT_TIMEOUT);
+        self.pending
+            .insert(key.clone(), id)
+            .map_err(|error| WireError::new("alarm_correlation_failed", error.to_string()))?;
+        if self
+            .events
+            .send(Event::ActorAlarm {
+                aid: identity.aid.clone(),
+                r#gen: identity.generation,
+                alarm_ts,
+            })
+            .is_err()
+        {
+            self.pending.remove(&key);
+            self.correlations.resolve(
+                id,
+                rmp_serde::to_vec_named(&LifecycleResolution {
+                    error: Some(WireError::new("runner_stopped", "Go event queue is closed")),
+                })
+                .expect("encode alarm queue error"),
+            );
+        }
+
+        let payload = receiver
+            .await
+            .map_err(|_| WireError::new("runner_stopped", "alarm correlation sender dropped"))?
+            .map_err(|error| match error {
+                CorrelationError::Timeout => WireError::new(
+                    "alarm_handler_timed_out",
+                    "Go OnAlarm did not complete before the boundary deadline",
+                ),
+                CorrelationError::Shutdown => {
+                    WireError::new("runner_stopped", "runner stopped during OnAlarm")
+                }
+            })?;
+        self.pending.remove(&key);
+        let resolution: LifecycleResolution = rmp_serde::from_slice(&payload)
+            .map_err(|error| WireError::new("alarm_result_invalid", error.to_string()))?;
+        if let Some(error) = resolution.error {
+            return Err(error);
+        }
+        Ok(())
+    }
+
     async fn execute_actor_command(&self, command: Command) {
         match command {
             Command::SaveState {
@@ -787,6 +945,7 @@ impl ActorProxy {
             Command::KvDelete { kv_id, aid, key } => self.kv_delete(kv_id, aid, key).await,
             Command::ActorStartResult { .. }
             | Command::ActorStopResult { .. }
+            | Command::AlarmHandled { .. }
             | Command::ActionResult { .. }
             | Command::HttpResponseStart { .. }
             | Command::HttpResponseChunk { .. }
@@ -796,8 +955,72 @@ impl ActorProxy {
             | Command::WsCloseCmd { .. }
             | Command::Broadcast { .. }
             | Command::StopIntent { .. }
+            | Command::SetAlarm { .. }
+            | Command::SleepIntent { .. }
             | Command::Unknown => {}
         }
+    }
+
+    fn dispatch_set_alarm(&self, aid: String, alarm_ts: Option<i64>) {
+        let Some(actor) = self.actor_current(&aid) else {
+            return;
+        };
+        let Some(operation) = actor.operations.begin() else {
+            return;
+        };
+        let revision = actor.alarm_updates.revision.fetch_add(1, Ordering::AcqRel) + 1;
+        tokio::spawn(async move {
+            let _operation = operation;
+            let _apply = actor.alarm_updates.apply.lock().await;
+            if actor.alarm_updates.revision.load(Ordering::Acquire) != revision {
+                return;
+            }
+            let scheduled = match actor.ctx.list_scheduled_events().await {
+                Ok(scheduled) => scheduled,
+                Err(error) => {
+                    tracing::error!(?error, actor_id = aid, "failed to list Go actor alarms");
+                    return;
+                }
+            };
+            for event in scheduled {
+                if event.action != INTERNAL_ALARM_ACTION {
+                    continue;
+                }
+                if let Err(error) = actor.ctx.cancel_schedule(&event.id).await {
+                    tracing::error!(?error, actor_id = aid, "failed to clear Go actor alarm");
+                    return;
+                }
+            }
+            if actor.alarm_updates.revision.load(Ordering::Acquire) != revision {
+                return;
+            }
+            if let Some(alarm_ts) = alarm_ts
+                && let Err(error) = actor
+                    .ctx
+                    .at(alarm_ts, INTERNAL_ALARM_ACTION, &cbor_empty_args())
+                    .await
+            {
+                tracing::error!(
+                    ?error,
+                    actor_id = aid,
+                    alarm_ts,
+                    "failed to schedule Go actor alarm"
+                );
+            }
+        });
+    }
+
+    fn actor_stop_reason(&self, identity: &ActorIdentity, reason: ShutdownKind) -> String {
+        if matches!(reason, ShutdownKind::Destroy)
+            && self
+                .stop_intents
+                .lock()
+                .expect("stop intent table poisoned")
+                .remove(identity)
+        {
+            return "stop".to_owned();
+        }
+        shutdown_reason(reason).to_owned()
     }
 
     async fn request_action(
@@ -990,6 +1213,12 @@ impl ActorProxy {
                 format!("WebSocket header exceeds the {MAX_BODY_CHUNK}-byte boundary maximum"),
             ));
         }
+        let resumed = self
+            .restoring_websockets
+            .lock()
+            .expect("restoring WebSocket table poisoned")
+            .remove(&ws_id)
+            .is_some_and(|owner| owner == *identity);
 
         let (outbound, receiver) = tokio::sync::mpsc::channel(WS_OUTBOUND_QUEUE_CAPACITY);
         tokio::spawn(websocket_outbound_loop(ws.clone(), receiver));
@@ -1039,6 +1268,7 @@ impl ActorProxy {
                 path,
                 headers,
                 can_hibernate: conn.is_hibernatable(),
+                resumed,
             })
             .is_err()
         {
@@ -1092,12 +1322,18 @@ impl ActorProxy {
             );
             return Ok(());
         }
-        let acknowledgements = {
+        let (acknowledgements, can_hibernate) = {
             let websockets = self.websockets.lock().expect("WebSocket table poisoned");
             let Some(active) = websockets.get(ws_id) else {
                 return Ok(());
             };
-            active.acknowledgements.clone()
+            (active.acknowledgements.clone(), active.can_hibernate)
+        };
+        let (completion, completed) = if can_hibernate {
+            let (tx, rx) = bounded(1);
+            (Some(tx), Some(rx))
+        } else {
+            (None, None)
         };
         {
             let mut acknowledgements = acknowledgements
@@ -1112,7 +1348,12 @@ impl ActorProxy {
                 return Ok(());
             }
             acknowledgements.last_received = Some(msg_index);
-            acknowledgements.pending.push_back(msg_index);
+            acknowledgements
+                .pending
+                .push_back(PendingWsAcknowledgement {
+                    msg_index,
+                    completion,
+                });
         }
         self.events
             .send(Event::WsMessage {
@@ -1121,7 +1362,20 @@ impl ActorProxy {
                 binary,
                 msg_index,
             })
-            .map_err(|_| anyhow!("Go event queue is closed"))
+            .map_err(|_| anyhow!("Go event queue is closed"))?;
+        if let Some(completed) = completed {
+            let waited =
+                tokio::task::block_in_place(|| completed.recv_timeout(WS_MESSAGE_ACK_TIMEOUT));
+            if waited.is_err() {
+                self.close_ws(
+                    ws_id,
+                    Some(1011),
+                    Some("ws.handler_ack_timed_out".to_owned()),
+                );
+                return Err(anyhow!("Go WebSocket handler acknowledgement timed out"));
+            }
+        }
+        Ok(())
     }
 
     fn websocket_closed(&self, ws_id: &str, code: Option<u16>, reason: Option<String>) {
@@ -1130,9 +1384,10 @@ impl ActorProxy {
             .lock()
             .expect("WebSocket table poisoned")
             .remove(ws_id);
-        if removed.is_none() {
+        let Some(removed) = removed else {
             return;
-        }
+        };
+        clear_ws_acknowledgements(&removed);
         if let Some(correlation_id) = self.pending_ws_open.remove(ws_id) {
             self.correlations.resolve(
                 correlation_id,
@@ -1162,26 +1417,28 @@ impl ActorProxy {
         let Some(active) = active else {
             return;
         };
-        let valid = {
+        let acknowledged = {
             let mut acknowledgements = active
                 .acknowledgements
                 .lock()
                 .expect("WebSocket acknowledgement table poisoned");
-            if acknowledgements.pending.front().copied() == Some(msg_index) {
-                acknowledgements.pending.pop_front();
-                true
+            if acknowledgements
+                .pending
+                .front()
+                .is_some_and(|pending| pending.msg_index == msg_index)
+            {
+                acknowledgements.pending.pop_front()
             } else {
-                false
+                None
             }
         };
-        if !valid {
+        let Some(acknowledged) = acknowledged else {
             self.close_ws(ws_id, Some(1008), Some("ws.ack_out_of_order".to_owned()));
             return;
+        };
+        if let Some(completion) = acknowledged.completion {
+            let _ = completion.send(());
         }
-        // M4 configures every raw WebSocket as non-hibernating. The index is
-        // still tracked and acknowledged across the FFI so M5 can attach the
-        // persisted gateway/request metadata without changing this surface.
-        let _ = active.can_hibernate;
     }
 
     fn send_ws(&self, ws_id: &str, data: Vec<u8>, binary: bool) {
@@ -1228,6 +1485,7 @@ impl ActorProxy {
         let Some(active) = active else {
             return;
         };
+        clear_ws_acknowledgements(&active);
         if let Some(correlation_id) = self.pending_ws_open.remove(ws_id) {
             self.correlations.resolve(
                 correlation_id,
@@ -1254,6 +1512,41 @@ impl ActorProxy {
             code,
             reason,
         });
+    }
+
+    fn hibernate_ws(&self, ws_id: &str) {
+        let active = self
+            .websockets
+            .lock()
+            .expect("WebSocket table poisoned")
+            .remove(ws_id);
+        let Some(active) = active else {
+            return;
+        };
+        if !active.can_hibernate {
+            self.websockets
+                .lock()
+                .expect("WebSocket table poisoned")
+                .insert(ws_id.to_owned(), active);
+            self.close_ws(ws_id, Some(1001), Some("actor sleeping".to_owned()));
+            return;
+        }
+        clear_ws_acknowledgements(&active);
+        if let Some(correlation_id) = self.pending_ws_open.remove(ws_id) {
+            self.correlations.resolve(
+                correlation_id,
+                rmp_serde::to_vec_named(&WsOpenResolution {
+                    error: Some(WireError::new(
+                        "ws_hibernated_during_open",
+                        "WebSocket hibernated before OnConnect completed",
+                    )),
+                })
+                .expect("encode WebSocket hibernation during open"),
+            );
+        }
+        // Dropping the outbound sender detaches this generation's callbacks.
+        // Core and the engine retain the hibernating gateway request and build
+        // a fresh WebSocket transport when the actor wakes.
     }
 
     fn broadcast(&self, aid: &str, event: &str, payload: Vec<u8>, exclude_conn: Option<&str>) {
@@ -1296,6 +1589,24 @@ impl ActorProxy {
             .collect::<Vec<_>>();
         for ws_id in ids {
             self.close_ws(&ws_id, code, reason.clone());
+        }
+    }
+
+    fn hibernate_actor_websockets(&self, identity: &ActorIdentity) {
+        let sockets = self
+            .websockets
+            .lock()
+            .expect("WebSocket table poisoned")
+            .iter()
+            .filter(|(_, active)| active.actor == *identity)
+            .map(|(ws_id, active)| (ws_id.clone(), active.can_hibernate))
+            .collect::<Vec<_>>();
+        for (ws_id, can_hibernate) in sockets {
+            if can_hibernate {
+                self.hibernate_ws(&ws_id);
+            } else {
+                self.close_ws(&ws_id, Some(1001), Some("actor sleeping".to_owned()));
+            }
         }
     }
 
@@ -1636,6 +1947,29 @@ fn shutdown_reason(reason: ShutdownKind) -> &'static str {
     }
 }
 
+fn clear_ws_acknowledgements(active: &ActiveWebSocket) {
+    active
+        .acknowledgements
+        .lock()
+        .expect("WebSocket acknowledgement table poisoned")
+        .pending
+        .clear();
+}
+
+fn cbor_empty_args() -> Vec<u8> {
+    let mut encoded = Vec::new();
+    ciborium::into_writer(&Vec::<ciborium::Value>::new(), &mut encoded)
+        .expect("empty CBOR argument encoding is infallible");
+    encoded
+}
+
+fn cbor_null() -> Vec<u8> {
+    let mut encoded = Vec::new();
+    ciborium::into_writer(&ciborium::Value::Null, &mut encoded)
+        .expect("CBOR null encoding is infallible");
+    encoded
+}
+
 fn correlation_wire_error(error: CorrelationError) -> WireError {
     match error {
         CorrelationError::Timeout => WireError::new(
@@ -1942,7 +2276,10 @@ mod tests {
         let (outbound, _receiver) = tokio::sync::mpsc::channel(1);
         let acknowledgements = Arc::new(Mutex::new(WsAcknowledgements {
             last_received: Some(7),
-            pending: VecDeque::from([7]),
+            pending: VecDeque::from([PendingWsAcknowledgement {
+                msg_index: 7,
+                completion: None,
+            }]),
         }));
         proxy.websockets.lock().expect("WebSocket table").insert(
             "ws".to_owned(),
@@ -1966,6 +2303,46 @@ mod tests {
                 .expect("WebSocket acknowledgement table")
                 .pending
                 .is_empty()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn hibernating_message_waits_for_go_acknowledgement() {
+        let (events, event_rx) = bounded(4);
+        let proxy = ActorProxy::new(events, CorrelationTable::default());
+        let (outbound, _receiver) = tokio::sync::mpsc::channel(1);
+        proxy.websockets.lock().expect("WebSocket table").insert(
+            "ws".to_owned(),
+            ActiveWebSocket {
+                actor: ActorIdentity::new("actor", 1),
+                can_hibernate: true,
+                ws: WebSocket::new(),
+                outbound,
+                acknowledgements: Arc::new(Mutex::new(WsAcknowledgements::default())),
+            },
+        );
+
+        let callback_proxy = proxy.clone();
+        let callback = tokio::spawn(async move {
+            callback_proxy.websocket_message(
+                "ws",
+                WsMessage::Text("persist before ack".to_owned()),
+                1,
+            )
+        });
+
+        assert!(matches!(
+            event_rx.recv_timeout(Duration::from_secs(1)),
+            Ok(Event::WsMessage { msg_index: 1, .. })
+        ));
+        assert!(!callback.is_finished());
+        proxy.ack_ws_message("ws", 1);
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), callback)
+                .await
+                .expect("callback completed after acknowledgement")
+                .expect("message callback task")
+                .is_ok()
         );
     }
 
@@ -2027,6 +2404,6 @@ mod tests {
             .lock()
             .expect("WebSocket acknowledgement table");
         assert_eq!(acknowledgement_state.last_received, Some(0));
-        assert_eq!(acknowledgement_state.pending, VecDeque::from([u16::MAX, 0]));
+        assert!(acknowledgement_state.pending.is_empty());
     }
 }

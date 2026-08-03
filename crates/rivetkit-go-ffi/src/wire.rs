@@ -102,6 +102,11 @@ pub(crate) enum Event {
         r#gen: u64,
         reason: String,
     },
+    ActorAlarm {
+        aid: String,
+        r#gen: u64,
+        alarm_ts: i64,
+    },
     ActionCall {
         aid: String,
         r#gen: u64,
@@ -138,6 +143,8 @@ pub(crate) enum Event {
         path: String,
         headers: BTreeMap<String, String>,
         can_hibernate: bool,
+        #[serde(default)]
+        resumed: bool,
     },
     WsMessage {
         ws_id: String,
@@ -228,6 +235,13 @@ pub(crate) enum Command {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         error: Option<WireError>,
     },
+    AlarmHandled {
+        aid: String,
+        #[serde(default)]
+        r#gen: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<WireError>,
+    },
     ActionResult {
         call_id: u64,
         #[serde(default, with = "optional_bytes")]
@@ -284,6 +298,13 @@ pub(crate) enum Command {
         exclude_conn: Option<String>,
     },
     StopIntent {
+        aid: String,
+    },
+    SetAlarm {
+        aid: String,
+        alarm_ts: Option<i64>,
+    },
+    SleepIntent {
         aid: String,
     },
     SaveState {
@@ -379,6 +400,10 @@ impl CommandBatch {
                     require_wire_error(error.as_ref())?;
                 }
                 Command::ActorStopResult { aid, error, .. } => {
+                    require_aid(aid)?;
+                    require_wire_error(error.as_ref())?;
+                }
+                Command::AlarmHandled { aid, error, .. } => {
                     require_aid(aid)?;
                     require_wire_error(error.as_ref())?;
                 }
@@ -515,7 +540,9 @@ impl CommandBatch {
                         return Err("broadcast exclude_conn must not be empty".to_owned());
                     }
                 }
-                Command::StopIntent { aid } => require_aid(aid)?,
+                Command::StopIntent { aid }
+                | Command::SetAlarm { aid, .. }
+                | Command::SleepIntent { aid } => require_aid(aid)?,
                 Command::KvGet { kv_id, aid, .. }
                 | Command::KvPut { kv_id, aid, .. }
                 | Command::KvDelete { kv_id, aid, .. } => {
@@ -643,6 +670,7 @@ mod tests {
         #[serde(with = "optional_bytes")]
         payload: Option<Vec<u8>>,
         exclude_conn: Option<&'static str>,
+        alarm_ts: Option<i64>,
     }
 
     #[derive(Serialize)]
@@ -683,6 +711,7 @@ mod tests {
             event: "",
             payload: None,
             exclude_conn: None,
+            alarm_ts: None,
         }
     }
 
@@ -825,6 +854,19 @@ mod tests {
             &actor_stop.encode().expect("encode actor stop event"),
         );
 
+        let actor_alarm = EventBatch {
+            seq: 17,
+            events: vec![Event::ActorAlarm {
+                aid: "actor-golden".to_owned(),
+                r#gen: 8,
+                alarm_ts: 1_788_500_000_000,
+            }],
+        };
+        write_golden(
+            "event_actor_alarm.msgpack",
+            &actor_alarm.encode().expect("encode actor alarm event"),
+        );
+
         let action_call = EventBatch {
             seq: 10,
             events: vec![Event::ActionCall {
@@ -892,6 +934,7 @@ mod tests {
                 path: "/chat?room=golden".to_owned(),
                 headers: BTreeMap::from([("x-test".to_owned(), "one".to_owned())]),
                 can_hibernate: true,
+                resumed: true,
             }],
         };
         write_golden(
@@ -1055,6 +1098,22 @@ mod tests {
             .expect("Rust command decoder accepts the full Go M4 command shape");
         assert_eq!(decoded.commands.len(), 6);
         write_golden("command_m4.msgpack", &command_m4);
+
+        let mut alarm_handled = golden_command("alarm_handled");
+        alarm_handled.r#gen = 8;
+        let mut set_alarm = golden_command("set_alarm");
+        set_alarm.alarm_ts = Some(1_788_500_000_000);
+        let mut clear_alarm = golden_command("set_alarm");
+        clear_alarm.alarm_ts = None;
+        let sleep_intent = golden_command("sleep_intent");
+        let command_m5 = rmp_serde::to_vec_named(&GoldenCommandBatch {
+            commands: vec![alarm_handled, set_alarm, clear_alarm, sleep_intent],
+        })
+        .expect("encode M5 command batch");
+        let decoded = CommandBatch::decode(&command_m5)
+            .expect("Rust command decoder accepts the full Go M5 command shape");
+        assert_eq!(decoded.commands.len(), 4);
+        write_golden("command_m5.msgpack", &command_m5);
     }
 
     #[test]

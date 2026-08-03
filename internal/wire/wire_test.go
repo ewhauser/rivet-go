@@ -61,6 +61,7 @@ func TestRustEventBatchGoldens(t *testing.T) {
 		{"event_stopped.msgpack", EventRunnerStopped, 3},
 		{"event_actor_start.msgpack", EventActorStart, 4},
 		{"event_actor_stop.msgpack", EventActorStop, 5},
+		{"event_actor_alarm.msgpack", EventActorAlarm, 17},
 		{"event_kv_result.msgpack", EventKVResult, 6},
 		{"event_state_persisted.msgpack", EventStatePersisted, 7},
 		{"event_action_call.msgpack", EventActionCall, 10},
@@ -86,7 +87,48 @@ func TestRustEventBatchGoldens(t *testing.T) {
 			if test.kind == EventWSOpen && !batch.Events[0].CanHibernate {
 				t.Fatal("WebSocket open golden does not carry the M5 hibernation marker")
 			}
+			if test.kind == EventWSOpen && !batch.Events[0].Resumed {
+				t.Fatal("WebSocket open golden does not carry the M5 resume marker")
+			}
 		})
+	}
+}
+
+func TestRustM5CommandBatchGolden(t *testing.T) {
+	data := golden(t, "command_m5.msgpack")
+	var batch CommandBatch
+	if err := decode(data, &batch); err != nil {
+		t.Fatal(err)
+	}
+	want := []CommandKind{
+		CommandAlarmHandled,
+		CommandSetAlarm,
+		CommandSetAlarm,
+		CommandSleepIntent,
+	}
+	if len(batch.Commands) != len(want) {
+		t.Fatalf("command count = %d, want %d", len(batch.Commands), len(want))
+	}
+	for index, kind := range want {
+		if batch.Commands[index].Kind != kind {
+			t.Fatalf("command %d kind = %q, want %q", index, batch.Commands[index].Kind, kind)
+		}
+	}
+	if batch.Commands[0].Generation != 8 {
+		t.Fatalf("alarm handled generation = %d, want 8", batch.Commands[0].Generation)
+	}
+	if batch.Commands[1].AlarmTS == nil || *batch.Commands[1].AlarmTS != 1_788_500_000_000 {
+		t.Fatalf("set alarm command = %#v", batch.Commands[1])
+	}
+	if batch.Commands[2].AlarmTS != nil {
+		t.Fatalf("clear alarm command = %#v", batch.Commands[2])
+	}
+	encoded, err := EncodeCommandBatch(batch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(encoded, data) {
+		t.Fatal("Go CommandBatch encoding differs from the Rust-generated M5 golden")
 	}
 }
 

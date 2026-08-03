@@ -118,6 +118,43 @@ func TestRejectedWebSocketDoesNotRunLaterHooks(t *testing.T) {
 	}
 }
 
+func TestHibernatedWebSocketSkipsConnectionLifecycleHooks(t *testing.T) {
+	type state struct{}
+	connects := 0
+	disconnects := 0
+	adapter := &actorAdapter[state]{definition: Actor[state]{
+		OnConnect: func(*Context[state], *Connection) error {
+			connects++
+			return nil
+		},
+		OnDisconnect: func(*Context[state], *Connection) {
+			disconnects++
+		},
+	}}
+	actorContext := &Context[state]{connections: make(map[string]*Connection)}
+	event := wire.Event{
+		Kind: wire.EventWSOpen, AID: "actor", WSID: "hibernated", Path: "/chat",
+		CanHibernate: true, Resumed: true,
+	}
+	if err := adapter.WebSocketOpen(context.Background(), nil, event, actorContext); err != nil {
+		t.Fatal(err)
+	}
+	if connects != 0 {
+		t.Fatalf("OnConnect calls = %d, want 0 for restored connection", connects)
+	}
+	connection := actorContext.connections[event.WSID]
+	if connection == nil || !connection.CanHibernate() {
+		t.Fatalf("restored connection = %#v", connection)
+	}
+	adapter.CloseWebSockets(context.Background(), nil, actorContext, "sleep")
+	if disconnects != 0 {
+		t.Fatalf("OnDisconnect calls = %d, want 0 for hibernation", disconnects)
+	}
+	if !connection.Closed() {
+		t.Fatal("old actor-generation connection remained usable after hibernation")
+	}
+}
+
 func TestWebSocketCloseValidation(t *testing.T) {
 	for _, code := range []uint16{1000, 1001, 1007, 1013, 3000, 4999} {
 		if !validCloseCode(code) {
