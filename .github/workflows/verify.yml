@@ -19,49 +19,88 @@ jobs:
           - name: darwin-arm64
             runner: macos-14
             rust_target: aarch64-apple-darwin
+            libc: native
           - name: linux-amd64-gnu
             runner: ubuntu-latest
             rust_target: x86_64-unknown-linux-gnu
+            libc: gnu
           - name: linux-arm64-gnu
             runner: ubuntu-24.04-arm
             rust_target: aarch64-unknown-linux-gnu
+            libc: gnu
+          - name: linux-amd64-musl
+            runner: ubuntu-latest
+            rust_target: x86_64-unknown-linux-musl
+            libc: musl
+          - name: linux-arm64-musl
+            runner: ubuntu-24.04-arm
+            rust_target: aarch64-unknown-linux-musl
+            libc: musl
           - name: windows-amd64
             runner: windows-latest
             rust_target: x86_64-pc-windows-msvc
+            libc: native
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
           cache: true
 
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: 1.97.0
-          targets: ${{ matrix.rust_target }}
+      - name: Install Rust toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install 1.97.0 --profile minimal --target "${{ matrix.rust_target }}"
+          rustup default 1.97.0
 
       - uses: Swatinem/rust-cache@v2
         with:
           cache-on-failure: true
 
+      - name: Install Zig
+        if: matrix.libc == 'gnu' || matrix.libc == 'musl'
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29
+        with:
+          version: 0.16.0
+
+      - name: Install cargo-zigbuild
+        if: matrix.libc == 'gnu' || matrix.libc == 'musl'
+        run: cargo install cargo-zigbuild --version 0.23.0 --locked
+
       - name: Install cbindgen
         run: cargo install cbindgen --version 0.29.4 --locked
+
+      - name: Test committed native library
+        if: matrix.libc != 'musl'
+        run: go test -count=1 -v ./...
+
+      - name: Test committed musl library
+        if: matrix.libc == 'musl'
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run --rm --volume "$PWD:/src" --workdir /src golang:1.26-alpine \
+            go test -count=1 -v ./...
 
       - name: Build native FFI library
         shell: bash
         run: scripts/build-ffi.sh "${{ matrix.rust_target }}"
 
       - name: Test Rust crate
+        if: matrix.libc != 'musl'
         run: cargo test --workspace --target "${{ matrix.rust_target }}"
 
-      - name: Test Go module
-        run: go test ./...
+      - name: Test rebuilt native library
+        if: matrix.libc != 'musl'
+        run: go test -count=1 -v ./...
 
-  musl-todo:
-    name: musl targets (TODO)
-    runs-on: ubuntu-latest
-    steps:
-      - run: |
-          echo "TODO M1+: add linux/amd64 and linux/arm64 musl cdylib builders and native smoke tests"
+      - name: Test rebuilt musl library
+        if: matrix.libc == 'musl'
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run --rm --volume "$PWD:/src" --workdir /src golang:1.26-alpine \
+            go test -count=1 -v ./...

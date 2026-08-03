@@ -4,10 +4,10 @@
 `rivetkit-core` adapter through [purego](https://github.com/ebitengine/purego).
 Applications do not need cgo or a native toolchain at Go build time.
 
-Status: **M0 skeleton**. The pinned Rust FFI crate builds, the darwin/arm64
-library is embedded and checksum-verified, and Go validates ABI version 1. The
-runner entry points intentionally return `not_implemented`; actor and pump
-semantics begin in M1.
+Status: **M0 skeleton**. The pinned Rust FFI crate builds, all six matrix
+libraries are embedded and checksum-verified, and Go validates ABI version 1.
+Linux selects the glibc or musl artifact at load time. The runner entry points
+intentionally return `not_implemented`; actor and pump semantics begin in M1.
 
 ## Build and test
 
@@ -20,6 +20,8 @@ go test ./...
 cargo test --workspace
 ```
 
+Linux builds additionally require Zig 0.16 and `cargo-zigbuild` 0.23. Cross
+compiling the Windows MSVC artifact requires `cargo-xwin` 0.23 and `lld-link`.
+
 See [the implementation plan](docs/PLAN.md), [FFI contract](docs/FFI-BOUNDARY.md),
 and [pinned Rivet version](docs/PINNED-VERSION.md) for the design and roadmap.
-
