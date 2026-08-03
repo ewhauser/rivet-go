@@ -1370,7 +1370,7 @@ func expectRunnerNewError(t *testing.T, endpoint string) ffi.ErrorPayload {
 }
 
 func startNativeRunner(t *testing.T, endpoint, name string) *ffi.Runner {
-	return startNativeRunnerWithActors(t, endpoint, name, nil)
+	return startNativeRunnerWithActors(t, endpoint, name, []string{})
 }
 
 func startNativeRunnerWithActors(t *testing.T, endpoint, name string, actorNames []string) *ffi.Runner {
