@@ -5,9 +5,21 @@ import (
 	"fmt"
 )
 
-// maxScanDepth bounds container nesting during pre-validation. The envelope
-// schema needs depth 4; 64 leaves headroom without permitting stack abuse.
-const maxScanDepth = 64
+const (
+	// The envelope schema needs depth 4; 64 leaves headroom without permitting
+	// stack abuse.
+	maxScanDepth = 64
+	// A native poll returns at most 64 events. Capping every array at that same
+	// value prevents a valid-sized hostile input from amplifying into a much
+	// larger []Event allocation inside msgpack.Unmarshal.
+	maxArrayEntries = 64
+	// Event maps are small, but metadata is extensible. This bound is well above
+	// the M1 schema while still preventing allocation amplification.
+	maxMapEntries = 1_024
+	// FFI-BOUNDARY.md fixes streaming chunks at 1 MiB. Strings, binary values,
+	// and extension payloads may not bypass that boundary limit.
+	maxBlobBytes = 1 << 20
+)
 
 // validateShape walks raw MessagePack and rejects inputs whose declared
 // container or blob lengths cannot fit in the bytes that follow. Every
@@ -107,10 +119,16 @@ func scanValue(data []byte, pos, depth int) (int, error) {
 		if err != nil {
 			return 0, err
 		}
+		if err := checkLimit("array", n, maxArrayEntries); err != nil {
+			return 0, err
+		}
 		return scanEntries(data, pos, depth, n)
 	case 0xdd: // array32
 		n, pos, err := scanLen(data, pos, 4)
 		if err != nil {
+			return 0, err
+		}
+		if err := checkLimit("array", n, maxArrayEntries); err != nil {
 			return 0, err
 		}
 		return scanEntries(data, pos, depth, n)
@@ -119,10 +137,16 @@ func scanValue(data []byte, pos, depth int) (int, error) {
 		if err != nil {
 			return 0, err
 		}
+		if err := checkLimit("map", n, maxMapEntries); err != nil {
+			return 0, err
+		}
 		return scanEntries(data, pos, depth, 2*n)
 	case 0xdf: // map32
 		n, pos, err := scanLen(data, pos, 4)
 		if err != nil {
+			return 0, err
+		}
+		if err := checkLimit("map", n, maxMapEntries); err != nil {
 			return 0, err
 		}
 		return scanEntries(data, pos, depth, 2*n)
@@ -153,10 +177,20 @@ func scanLen(data []byte, pos, width int) (int, int, error) {
 }
 
 func scanBlob(data []byte, pos, n int) (int, error) {
+	if err := checkLimit("blob", n, maxBlobBytes); err != nil {
+		return 0, err
+	}
 	if n > len(data)-pos {
 		return 0, fmt.Errorf("truncated payload: need %d bytes, have %d", n, len(data)-pos)
 	}
 	return pos + n, nil
+}
+
+func checkLimit(kind string, got, maximum int) error {
+	if got > maximum {
+		return fmt.Errorf("%s length %d exceeds limit %d", kind, got, maximum)
+	}
+	return nil
 }
 
 func scanEntries(data []byte, pos, depth, count int) (int, error) {
