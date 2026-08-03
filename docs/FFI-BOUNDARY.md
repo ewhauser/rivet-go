@@ -377,22 +377,46 @@ The raw WebSocket mapping at v2.3.10 is:
 Each raw connection has a 64-command FFI-owned outbound queue. `WsSend` and
 each raw recipient of `Broadcast` use non-blocking `try_send`; if that queue is
 full, only that connection is removed and closed with code 1013 and reason
-`outbound_backpressure`. Other connections continue. The pinned core's
-`WebSocketSender` accepts into its own unbounded envoy tunnel queue and exposes
-no write-completion or buffered-byte signal, so the FFI cannot measure a
-gateway peer's socket backlog after core accepts a send. The real-engine test
-therefore proves that an unread peer does not delay a reading peer, while the
-Rust queue test deterministically proves the close-on-overflow policy. Go uses
+`outbound_backpressure`. Other connections continue. Go batches concurrent
+submissions up to the boundary's 1024-entry container ceiling, making the
+per-connection admission bound observable under a real burst instead of
+letting the native worker drain between one-command FFI calls. The pinned
+core's `WebSocketSender` accepts admitted messages into its own unbounded envoy
+tunnel queue and exposes no peer buffered-byte signal. The real-engine test
+therefore stalls one gateway client, drives its admission queue to overflow,
+requires the documented 1013 close at that client, and proves a reading peer
+remains usable; the Rust queue test independently proves isolation. Go uses
 the same bounded native-submit retry and 30-second backpressure ceiling as the
 M3 HTTP writer, from the handler goroutine rather than the poll goroutine.
 
 `Broadcast.payload` is one CBOR argument array. Core's native
 `ActorContext::broadcast` receives those bytes directly for actor-connect
 subscriptions. Raw WebSocket clients are not part of that native subscription
-surface at this pin, so the FFI also sends them a binary CBOR map shaped as
-`{event, args}`. `exclude_conn` filters the matching raw `ws_id`; actor-connect
-delivery remains governed by core's subscription registry. Direct
+surface at this pin, so the FFI also sends them the binary CBOR actor-connect
+event envelope `{body: {tag: "Event", val: {name, args}}}` used by the pinned
+core and client. `exclude_conn` filters the matching raw `ws_id`; actor-connect
+delivery remains governed by core's subscription registry. The complete
+encoded frame, not only the argument bytes, is capped at 1 MiB. Direct
 `Connection.Send` uses `WsSend` and does not involve subscriptions.
+
+Incoming raw frames over 1 MiB close only their connection with code 1009 and
+reason `message.incoming_too_long`. Oversized outgoing targeted sends are
+rejected synchronously in Go and again by command validation; no partial frame
+is emitted. Empty text and binary frames are valid. Received message indexes
+and pending Go acknowledgements are ordered per connection from index zero
+with wrapping-u16 monotonicity; a receive gap closes with
+`ws.message_index_skip`, and an
+out-of-order acknowledgement closes with `ws.ack_out_of_order`, both using
+code 1008. This bookkeeping remains process-local until M5.
+
+Broadcast with zero live connections, including during `OnStart`, succeeds as
+a no-op. Graceful actor or runner stop delivers one `WsClose`/`OnDisconnect`
+per connection before `OnStop`. An `OnStop` broadcast is still accepted and
+submitted before `ActorStopResult`, but delivery is best-effort because the
+pinned engine can begin closing the gateway transport before graceful cleanup
+finishes. If delivered, it precedes the code-1001 `actor stopped` close; the
+client may instead observe that close directly. Shutdown fallback uses code
+1001 with reason `runner shutting down`.
 
 Hibernation remains an M5 marker, not an M4 behavior. M4 configures
 `can_hibernate_websocket = false` and `no_sleep = true`, but faithfully carries

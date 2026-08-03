@@ -186,8 +186,9 @@ func (c *Connection) setClose(code *uint16, reason string) {
 }
 
 // Broadcast emits a named event with one typed payload to every live actor
-// connection. Raw WebSocket clients receive a binary CBOR map containing
-// `event` and `args`; actor-connect clients receive the native Rivet event.
+// connection. Raw WebSocket clients receive the pinned actor-connect CBOR
+// event envelope; actor-connect clients receive the same event through core's
+// native subscription path.
 func (c *Context[T]) Broadcast(event string, payload any) error {
 	return c.broadcast(event, payload, nil)
 }

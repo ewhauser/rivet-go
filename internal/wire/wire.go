@@ -260,12 +260,21 @@ func validateEvent(event Event) error {
 		if event.WSID == "" {
 			return fmt.Errorf("%s event has empty ws_id", event.Kind)
 		}
+		if len(event.Data) > 1<<20 {
+			return fmt.Errorf("%s event exceeds the one MiB message limit", event.Kind)
+		}
 		if !event.Binary && !utf8.Valid(event.Data) {
 			return fmt.Errorf("%s text data is not valid UTF-8", event.Kind)
 		}
 	case EventWSClose:
 		if event.WSID == "" {
 			return fmt.Errorf("%s event has empty ws_id", event.Kind)
+		}
+		if event.CloseCode != nil && !validWebSocketCloseCode(*event.CloseCode) {
+			return fmt.Errorf("%s event has invalid close code %d", event.Kind, *event.CloseCode)
+		}
+		if len(event.Reason) > 123 || !utf8.ValidString(event.Reason) {
+			return fmt.Errorf("%s event has an invalid close reason", event.Kind)
 		}
 	case EventKVResult:
 		if event.KVID == 0 {
@@ -282,4 +291,8 @@ func validateEvent(event Event) error {
 		return fmt.Errorf("%s event has incomplete structured error", event.Kind)
 	}
 	return nil
+}
+
+func validWebSocketCloseCode(code uint16) bool {
+	return code >= 1000 && code <= 1003 || code >= 1007 && code <= 1014 || code >= 3000 && code <= 4999
 }

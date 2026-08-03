@@ -23,7 +23,7 @@ const (
 	defaultHTTPSubmitLimit = 30 * time.Second
 	defaultWSSubmitLimit   = 30 * time.Second
 	defaultSubmitQueue     = 1_024
-	maxSubmitBatch         = 64
+	maxSubmitBatch         = 1_024
 	actorEventQueue        = 64
 	maxHTTPChunk           = 1 << 20
 	maxWSMessage           = 1 << 20
@@ -1087,7 +1087,7 @@ func (p *Pump) submitLoop() {
 			requests := []submitRequest{first}
 			commands := append([]wire.Command(nil), first.commands...)
 		collect:
-			for len(requests) < maxSubmitBatch {
+			for len(commands) < maxSubmitBatch {
 				select {
 				case request := <-p.submitQueue:
 					requests = append(requests, request)

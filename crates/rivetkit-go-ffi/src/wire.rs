@@ -4,6 +4,53 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
+const MAX_BODY_CHUNK: usize = 1 << 20;
+
+#[derive(Serialize)]
+struct ActorConnectEnvelope<'a> {
+    body: ActorConnectBody<'a>,
+}
+
+#[derive(Serialize)]
+struct ActorConnectBody<'a> {
+    tag: &'static str,
+    val: ActorConnectEvent<'a>,
+}
+
+#[derive(Serialize)]
+struct ActorConnectEvent<'a> {
+    name: &'a str,
+    args: ciborium::Value,
+}
+
+/// Encodes the pinned client's CBOR event envelope. This mirrors
+/// rivetkit-core's ActorConnectToClient::Event shape:
+/// `{body: {tag: "Event", val: {name, args}}}`.
+pub(crate) fn encode_actor_connect_event_frame(name: &str, args: &[u8]) -> Result<Vec<u8>, String> {
+    let args: ciborium::Value = ciborium::from_reader(args)
+        .map_err(|error| format!("broadcast payload must be CBOR: {error}"))?;
+    if !matches!(args, ciborium::Value::Array(_)) {
+        return Err("broadcast payload must be a CBOR argument array".to_owned());
+    }
+    let mut frame = Vec::new();
+    ciborium::into_writer(
+        &ActorConnectEnvelope {
+            body: ActorConnectBody {
+                tag: "Event",
+                val: ActorConnectEvent { name, args },
+            },
+        },
+        &mut frame,
+    )
+    .map_err(|error| format!("encode broadcast event frame: {error}"))?;
+    if frame.len() > MAX_BODY_CHUNK {
+        return Err(format!(
+            "broadcast event frame exceeds boundary maximum {MAX_BODY_CHUNK} bytes"
+        ));
+    }
+    Ok(frame)
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct RunnerConfig {
@@ -319,8 +366,6 @@ impl CommandBatch {
     pub(crate) fn validate(&self) -> Result<(), String> {
         const MAX_KV_LIST_ENTRIES: u32 = 1_024;
         const MAX_HTTP_HEADERS: usize = 256;
-        const MAX_BODY_CHUNK: usize = 1 << 20;
-
         for command in &self.commands {
             match command {
                 Command::ActorStartResult { aid, ok, error, .. } => {
@@ -465,8 +510,7 @@ impl CommandBatch {
                             "broadcast payload exceeds boundary maximum {MAX_BODY_CHUNK} bytes"
                         ));
                     }
-                    let _: ciborium::Value = ciborium::from_reader(payload.as_slice())
-                        .map_err(|error| format!("broadcast payload must be CBOR: {error}"))?;
+                    encode_actor_connect_event_frame(event, payload)?;
                     if exclude_conn.as_ref().is_some_and(String::is_empty) {
                         return Err("broadcast exclude_conn must not be empty".to_owned());
                     }
@@ -847,7 +891,7 @@ mod tests {
                 ws_id: "ws-golden".to_owned(),
                 path: "/chat?room=golden".to_owned(),
                 headers: BTreeMap::from([("x-test".to_owned(), "one".to_owned())]),
-                can_hibernate: false,
+                can_hibernate: true,
             }],
         };
         write_golden(
@@ -989,6 +1033,7 @@ mod tests {
         ws_close_cmd.ws_id = "ws-golden";
         ws_close_cmd.code = Some(1000);
         ws_close_cmd.reason = Some("done");
+        ws_close_cmd.hibernate = true;
         let mut broadcast = golden_command("broadcast");
         broadcast.event = "countChanged";
         broadcast.payload = Some(vec![0x81, 0x18, 0x2a]);
@@ -1025,6 +1070,34 @@ mod tests {
         let bytes = batch.encode().expect("encode event batch");
         let decoded: EventBatch = rmp_serde::from_slice(&bytes).expect("decode event batch");
         assert_eq!(decoded, batch);
+    }
+
+    #[test]
+    fn broadcast_frame_uses_the_pinned_actor_connect_cbor_envelope() {
+        #[derive(Deserialize)]
+        struct Envelope {
+            body: Body,
+        }
+        #[derive(Deserialize)]
+        struct Body {
+            tag: String,
+            val: EventValue,
+        }
+        #[derive(Deserialize)]
+        struct EventValue {
+            name: String,
+            args: Vec<u32>,
+        }
+
+        let mut args = Vec::new();
+        ciborium::into_writer(&vec![42_u32], &mut args).expect("encode event arguments");
+        let frame = encode_actor_connect_event_frame("countChanged", &args)
+            .expect("encode actor-connect event frame");
+        let decoded: Envelope =
+            ciborium::from_reader(frame.as_slice()).expect("decode actor-connect event frame");
+        assert_eq!(decoded.body.tag, "Event");
+        assert_eq!(decoded.body.val.name, "countChanged");
+        assert_eq!(decoded.body.val.args, vec![42]);
     }
 
     #[test]

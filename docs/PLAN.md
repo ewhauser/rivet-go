@@ -371,20 +371,29 @@ The v2.3.10 native actor-event surface and raw WebSocket surface are distinct.
 `ActorContext::broadcast` reaches actor-connect clients that subscribed to the
 event, but it does not write raw WebSocket frames. The M4 FFI invokes that
 native method with the CBOR argument-array bytes and additionally frames raw
-client broadcasts as a binary CBOR `{event, args}` map. This keeps the public
-call shaped as `ctx.Broadcast("countChanged", value)` and gives raw clients an
-unambiguous named-event envelope without changing targeted text/binary sends.
+client broadcasts with the pin's CBOR actor-connect event envelope:
+`{body: {tag: "Event", val: {name, args}}}`. This is the shape emitted by
+`rivetkit-core/src/registry/actor_connect.rs` and decoded by
+`rivetkit-client/src/protocol/codec.rs`, rather than an SDK-specific raw frame.
+The public call remains `ctx.Broadcast("countChanged", value)`; targeted
+text/binary sends are unchanged.
 
 Raw WebSocket messages are complete frames capped at 1 MiB. They are not split
-because multiple frames are not equivalent to one WebSocket message. Native
+because multiple frames are not equivalent to one WebSocket message. An
+incoming oversized frame closes that connection with code 1009 and reason
+`message.incoming_too_long`; an oversized targeted Go send returns an error
+without emitting a partial frame or closing a healthy connection. Native
 command submission uses the M3 backpressure retry discipline on the handler
 goroutine, leaving polling available. Each connection also has a 64-command
-native outbound queue; overflow closes only that connection with WebSocket
-code 1013 and reason `outbound_backpressure`. At this pin core immediately
-accepts sends into an internal unbounded envoy queue and exposes no transport
-flush or buffered-byte metric. Conformance therefore proves that a client with
-no read loop cannot block a peer's burst, and a deterministic Rust unit test
-proves the per-connection overflow close while a peer queue remains usable.
+native outbound admission queue; overflow closes only that connection with
+WebSocket code 1013 and reason `outbound_backpressure`. Concurrent Go callers
+are batched up to the boundary's 1024-command envelope ceiling so a burst is
+presented atomically enough for that per-connection bound to be load-bearing.
+At this pin core accepts admitted sends into an internal unbounded envoy queue
+and exposes no peer buffered-byte metric. Conformance therefore stalls a real
+gateway client, overflows the admission queue through concurrent sends,
+observes the 1013 close at that client, and proves a peer remains usable; the
+Rust unit retains deterministic queue isolation coverage.
 
 Connection ownership is recorded on both sides of the boundary. Client close,
 actor-issued close, actor stop, and runner shutdown remove the Rust registry
@@ -393,13 +402,25 @@ WebSocket hook is contained by the existing handler firewall, submits the
 cataloged `StopIntent`, and stops that actor generation without ending the
 pump or peer actors.
 
-The real-engine conformance test uses the public gateway with the same Rivet
-WebSocket subprotocol metadata as the pinned official client. It proves
-two-client handler-mediated broadcast, `BroadcastExcept`, targeted send, text
-and 1 MiB binary frames, client- and actor-initiated close hooks with a live
-peer, action-originated broadcast, exactly-once delivery to 50 simultaneous
-connections, and progress for a reading client while another connection does
-not read.
+Broadcast with no live connection, including from `OnStart`, is a successful
+no-op. During a graceful actor stop, Go delivers each `OnDisconnect` exactly
+once before `OnStop`; a broadcast initiated by `OnStop` is admitted before the
+stop acknowledgement. Delivery is best-effort after shutdown begins because
+the pinned engine may already be closing the gateway transport. A delivered
+event precedes the code-1001 `actor stopped` close; otherwise the client sees
+that close directly. Graceful runner shutdown uses the same rule; the shutdown
+fallback closes any remaining connection with code 1001 and reason `runner
+shutting down`.
+
+The real-engine conformance tests use the public gateway with the same Rivet
+WebSocket subprotocol metadata as the pinned official raw client. They prove
+two-client handler-mediated broadcast, `BroadcastExcept`, targeted send,
+text/binary and empty frame fidelity, exact 1 MiB acceptance and two-sided
+oversize behavior, ordered message handling and broadcast delivery,
+client/actor close races, disconnect during `OnConnect`, rejection, actor and
+runner shutdown, every hook panic, action-originated broadcast, state save and
+restart rehydration, exactly-once delivery to 50 simultaneous connections
+under two concurrent action calls, and the real 1013 stalled-client policy.
 
 Hibernation is deliberately deferred to M5. M4 keeps `no_sleep = true` and
 configures core with `can_hibernate_websocket = false`, while still carrying

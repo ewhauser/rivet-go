@@ -1236,6 +1236,64 @@ func TestWebSocketHandlerPanicRequestsActorErrorStopAndPeerSurvives(t *testing.T
 	}
 }
 
+func TestWebSocketIDCanBeReusedAfterCloseWithoutStaleCorrelation(t *testing.T) {
+	defer goleak.VerifyNone(t)
+	runner := newFakeRunner()
+	seen := make(chan string, 8)
+	handler := dispatchHandler{
+		wsOpen: func(_ context.Context, _ *ActorSession, event wire.Event, _ any) error {
+			seen <- "open:" + event.WSID
+			return nil
+		},
+		wsMessage: func(_ context.Context, _ *ActorSession, event wire.Event, _ any) error {
+			seen <- "message:" + string(event.Data)
+			return nil
+		},
+		wsClose: func(_ context.Context, _ *ActorSession, event wire.Event, _ any) error {
+			seen <- "close:" + event.WSID
+			return nil
+		},
+	}
+	p := NewWithHandlers(runner, map[string]ActorHandler{"socket": handler})
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() { result <- p.Run(ctx) }()
+	waitPumpStarted(t, p)
+
+	runner.emit(wire.Event{Kind: wire.EventActorStart, AID: "socket-aid", Generation: 1, Name: "socket"})
+	nextCommand(t, runner)
+	code := uint16(1000)
+	for attempt := range 2 {
+		runner.emit(wire.Event{Kind: wire.EventWSOpen, AID: "socket-aid", WSID: "reused", Path: "/"})
+		if got := <-seen; got != "open:reused" {
+			t.Fatalf("attempt %d open observation = %q", attempt, got)
+		}
+		if command := nextCommand(t, runner); command.Kind != wire.CommandWSOpenResult || !command.Accept {
+			t.Fatalf("attempt %d open result = %#v", attempt, command)
+		}
+		if attempt == 1 {
+			runner.emit(wire.Event{
+				Kind: wire.EventWSMessage, WSID: "reused", Data: []byte("fresh"), MessageIndex: 2,
+			})
+			if got := <-seen; got != "message:fresh" {
+				t.Fatalf("reused connection message observation = %q", got)
+			}
+			if command := nextCommand(t, runner); command.Kind != wire.CommandWSMessageAck || command.MessageIndex != 2 {
+				t.Fatalf("reused connection acknowledgement = %#v", command)
+			}
+		}
+		runner.emit(wire.Event{Kind: wire.EventWSClose, WSID: "reused", CloseCode: &code, Reason: "done"})
+		if got := <-seen; got != "close:reused" {
+			t.Fatalf("attempt %d close observation = %q", attempt, got)
+		}
+	}
+
+	cancel()
+	if err := <-result; err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+}
+
 func TestHTTPRequestChunksFeedBodyAndResponsesSubmitFromHandler(t *testing.T) {
 	runner := newFakeRunner()
 	requestObserved := make(chan string, 1)

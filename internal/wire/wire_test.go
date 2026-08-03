@@ -83,6 +83,9 @@ func TestRustEventBatchGoldens(t *testing.T) {
 			if test.kind == EventActionCall && batch.Events[0].ActionTimeoutMS != 60_000 {
 				t.Fatalf("action timeout = %d ms, want 60000", batch.Events[0].ActionTimeoutMS)
 			}
+			if test.kind == EventWSOpen && !batch.Events[0].CanHibernate {
+				t.Fatal("WebSocket open golden does not carry the M5 hibernation marker")
+			}
 		})
 	}
 }
@@ -120,6 +123,9 @@ func TestRustM4CommandBatchGolden(t *testing.T) {
 	}
 	if batch.Commands[3].CloseCode == nil || *batch.Commands[3].CloseCode != 1000 {
 		t.Fatalf("unexpected WebSocket close command: %#v", batch.Commands[3])
+	}
+	if !batch.Commands[3].Hibernate {
+		t.Fatal("WebSocket close golden does not carry the M5 hibernation marker")
 	}
 	if batch.Commands[4].Event != "countChanged" || batch.Commands[4].ExcludeConn == nil {
 		t.Fatalf("unexpected broadcast command: %#v", batch.Commands[4])
