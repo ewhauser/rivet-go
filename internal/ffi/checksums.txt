@@ -1,0 +1,1 @@
+b2b56af7674141f97e455959625fec826d3c97b9a8b243966fa34dc354145646  lib/darwin_arm64/librivetkit_go_ffi.dylib

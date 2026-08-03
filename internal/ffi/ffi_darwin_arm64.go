@@ -1,0 +1,358 @@
+//go:build darwin && arm64
+
+package ffi
+
+import (
+	"bufio"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io/fs"
+	"log"
+	"os"
+	"path"
+	"path/filepath"
+	"runtime"
+	"strings"
+	"sync"
+	"unsafe"
+
+	"github.com/ebitengine/purego"
+)
+
+type cRunner struct{}
+type cError struct{}
+
+type cBytes struct {
+	ptr *byte
+	len uintptr
+	cap uintptr
+}
+
+type cRunnerResult struct {
+	runner *cRunner
+	err    *cError
+}
+
+type cPollResult struct {
+	payload cBytes
+	err     *cError
+}
+
+type cSubmitResult struct {
+	err *cError
+}
+
+type nativeAPI struct {
+	once    sync.Once
+	loadErr error
+	handle  uintptr
+
+	abiVersion     func() uint32
+	bytesFree      func(cBytes)
+	stringFree     func(cBytes)
+	errorJSON      func(*cError) cBytes
+	errorFree      func(*cError)
+	runnerNew      func(*byte, uintptr) cRunnerResult
+	runnerFree     func(*cRunner)
+	runnerPoll     func(*cRunner, uint32) cPollResult
+	runnerSubmit   func(*cRunner, *byte, uintptr) cSubmitResult
+	runnerShutdown func(*cRunner, uint32) cSubmitResult
+}
+
+var api nativeAPI
+
+// Runner is an owned native runner handle.
+type Runner struct {
+	ptr  *cRunner
+	once sync.Once
+}
+
+// Error is an owned structured native error handle.
+type Error struct {
+	ptr  *cError
+	once sync.Once
+}
+
+// RunnerResult is the native result of constructing a runner.
+type RunnerResult struct {
+	Runner *Runner
+	Error  *Error
+}
+
+// ErrorPayload is the stable JSON representation of an FFI error.
+type ErrorPayload struct {
+	Code    string `json:"code"`
+	Message string `json:"message"`
+}
+
+// Load extracts, verifies, opens, and binds the embedded native library.
+func Load() error {
+	api.once.Do(func() {
+		libraryPath, err := extractVerifiedLibrary(
+			embeddedFiles,
+			embeddedLibraryDir,
+			embeddedLibraryFilename,
+			"checksums.txt",
+			libraryCacheRoot(),
+		)
+		if err != nil {
+			api.loadErr = err
+			return
+		}
+
+		handle, err := purego.Dlopen(libraryPath, purego.RTLD_NOW|purego.RTLD_GLOBAL)
+		if err != nil {
+			api.loadErr = fmt.Errorf("load native library %s: %w", libraryPath, err)
+			return
+		}
+		api.handle = handle
+		if err := api.register(handle); err != nil {
+			api.loadErr = err
+			return
+		}
+		if got := api.abiVersion(); got != ExpectedABIVersion {
+			api.loadErr = fmt.Errorf(
+				"native ABI version mismatch: library reports %d, Go expects %d",
+				got,
+				ExpectedABIVersion,
+			)
+		}
+	})
+	return api.loadErr
+}
+
+func (a *nativeAPI) register(handle uintptr) error {
+	for _, binding := range []struct {
+		name string
+		dst  any
+	}{
+		{"rk_abi_version", &a.abiVersion},
+		{"rk_bytes_free", &a.bytesFree},
+		{"rk_string_free", &a.stringFree},
+		{"rk_error_json", &a.errorJSON},
+		{"rk_error_free", &a.errorFree},
+		{"rk_runner_new", &a.runnerNew},
+		{"rk_runner_free", &a.runnerFree},
+		{"rk_runner_poll", &a.runnerPoll},
+		{"rk_runner_submit", &a.runnerSubmit},
+		{"rk_runner_shutdown", &a.runnerShutdown},
+	} {
+		if err := registerLibraryFunc(handle, binding.name, binding.dst); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func registerLibraryFunc(handle uintptr, name string, dst any) (err error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			err = fmt.Errorf("register native function %s: %v", name, recovered)
+		}
+	}()
+	purego.RegisterLibFunc(dst, handle, name)
+	return nil
+}
+
+// ABIVersion returns the version reported by the loaded native library.
+func ABIVersion() (uint32, error) {
+	if err := Load(); err != nil {
+		return 0, err
+	}
+	return api.abiVersion(), nil
+}
+
+// NewRunner calls the M0 runner constructor. It currently returns a structured
+// not_implemented error from Rust.
+func NewRunner(config []byte) (RunnerResult, error) {
+	if err := Load(); err != nil {
+		return RunnerResult{}, err
+	}
+	var configPtr *byte
+	if len(config) > 0 {
+		configPtr = unsafe.SliceData(config)
+	}
+	result := api.runnerNew(configPtr, uintptr(len(config)))
+	runtime.KeepAlive(config)
+
+	var runner *Runner
+	if result.runner != nil {
+		runner = &Runner{ptr: result.runner}
+		runtime.SetFinalizer(runner, finalizeRunner)
+	}
+	var nativeError *Error
+	if result.err != nil {
+		nativeError = &Error{ptr: result.err}
+		runtime.SetFinalizer(nativeError, finalizeError)
+	}
+	return RunnerResult{Runner: runner, Error: nativeError}, nil
+}
+
+func finalizeRunner(runner *Runner) {
+	log.Printf("rivet-go: leaked native runner; releasing from finalizer")
+	runner.Close()
+}
+
+func finalizeError(nativeError *Error) {
+	log.Printf("rivet-go: leaked native error; releasing from finalizer")
+	nativeError.Close()
+}
+
+// Close releases the native runner handle exactly once.
+func (r *Runner) Close() {
+	if r == nil {
+		return
+	}
+	r.once.Do(func() {
+		runtime.SetFinalizer(r, nil)
+		if r.ptr != nil {
+			api.runnerFree(r.ptr)
+			r.ptr = nil
+		}
+	})
+}
+
+// JSON copies the native error's JSON representation into Go memory.
+func (e *Error) JSON() ([]byte, error) {
+	if e == nil || e.ptr == nil {
+		return nil, errors.New("native error is closed")
+	}
+	bytes := api.errorJSON(e.ptr)
+	if bytes.ptr == nil {
+		if bytes.len == 0 {
+			return nil, nil
+		}
+		return nil, errors.New("native error JSON returned a nil pointer with non-zero length")
+	}
+	defer api.bytesFree(bytes)
+	return append([]byte(nil), unsafe.Slice(bytes.ptr, bytes.len)...), nil
+}
+
+// Payload decodes the native error's stable JSON representation.
+func (e *Error) Payload() (ErrorPayload, error) {
+	data, err := e.JSON()
+	if err != nil {
+		return ErrorPayload{}, err
+	}
+	var payload ErrorPayload
+	if err := json.Unmarshal(data, &payload); err != nil {
+		return ErrorPayload{}, fmt.Errorf("decode native error JSON: %w", err)
+	}
+	return payload, nil
+}
+
+// Close releases the native error handle exactly once.
+func (e *Error) Close() {
+	if e == nil {
+		return
+	}
+	e.once.Do(func() {
+		runtime.SetFinalizer(e, nil)
+		if e.ptr != nil {
+			api.errorFree(e.ptr)
+			e.ptr = nil
+		}
+	})
+}
+
+func extractVerifiedLibrary(
+	files fs.FS,
+	dir string,
+	filename string,
+	checksumsPath string,
+	cacheRoot string,
+) (string, error) {
+	libraryPath := path.Join(dir, filename)
+	manifest, err := fs.ReadFile(files, checksumsPath)
+	if err != nil {
+		return "", fmt.Errorf("read embedded checksum manifest %s: %w", checksumsPath, err)
+	}
+	expected, err := checksumFor(manifest, libraryPath)
+	if err != nil {
+		return "", err
+	}
+	libraryBytes, err := fs.ReadFile(files, libraryPath)
+	if err != nil {
+		return "", fmt.Errorf("read embedded native library %s: %w", libraryPath, err)
+	}
+	actual := digestHex(libraryBytes)
+	if actual != expected {
+		return "", fmt.Errorf(
+			"embedded native library checksum mismatch for %s: got %s, want %s",
+			libraryPath,
+			actual,
+			expected,
+		)
+	}
+
+	cacheDir := filepath.Join(cacheRoot, "rivet-go", actual)
+	if err := os.MkdirAll(cacheDir, 0o755); err != nil {
+		return "", fmt.Errorf("create native cache directory %s: %w", cacheDir, err)
+	}
+	targetPath := filepath.Join(cacheDir, filename)
+	if existing, err := os.ReadFile(targetPath); err == nil {
+		if digestHex(existing) == actual {
+			return targetPath, nil
+		}
+	}
+
+	temporary, err := os.CreateTemp(cacheDir, filename+".tmp-*")
+	if err != nil {
+		return "", fmt.Errorf("create temporary native library: %w", err)
+	}
+	temporaryPath := temporary.Name()
+	defer os.Remove(temporaryPath)
+	if _, err := temporary.Write(libraryBytes); err != nil {
+		temporary.Close()
+		return "", fmt.Errorf("write temporary native library: %w", err)
+	}
+	if err := temporary.Close(); err != nil {
+		return "", fmt.Errorf("close temporary native library: %w", err)
+	}
+	if err := os.Chmod(temporaryPath, 0o755); err != nil {
+		return "", fmt.Errorf("make temporary native library executable: %w", err)
+	}
+	if err := os.Rename(temporaryPath, targetPath); err != nil {
+		if existing, readErr := os.ReadFile(targetPath); readErr == nil && digestHex(existing) == actual {
+			return targetPath, nil
+		}
+		return "", fmt.Errorf("move verified native library into cache: %w", err)
+	}
+	return targetPath, nil
+}
+
+func checksumFor(manifest []byte, libraryPath string) (string, error) {
+	scanner := bufio.NewScanner(strings.NewReader(string(manifest)))
+	for scanner.Scan() {
+		fields := strings.Fields(scanner.Text())
+		if len(fields) != 2 || strings.TrimPrefix(fields[1], "*") != libraryPath {
+			continue
+		}
+		if len(fields[0]) != sha256.Size*2 {
+			return "", fmt.Errorf("invalid SHA-256 for %s in checksum manifest", libraryPath)
+		}
+		if _, err := hex.DecodeString(fields[0]); err != nil {
+			return "", fmt.Errorf("invalid SHA-256 for %s in checksum manifest: %w", libraryPath, err)
+		}
+		return strings.ToLower(fields[0]), nil
+	}
+	if err := scanner.Err(); err != nil {
+		return "", fmt.Errorf("read checksum manifest: %w", err)
+	}
+	return "", fmt.Errorf("checksum manifest has no entry for %s", libraryPath)
+}
+
+func digestHex(data []byte) string {
+	digest := sha256.Sum256(data)
+	return hex.EncodeToString(digest[:])
+}
+
+func libraryCacheRoot() string {
+	if root, err := os.UserCacheDir(); err == nil && root != "" {
+		return root
+	}
+	return os.TempDir()
+}
