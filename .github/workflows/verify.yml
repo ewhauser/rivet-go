@@ -1,0 +1,66 @@
+name: verify
+
+on:
+  pull_request: {}
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  native:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: darwin-arm64
+            runner: macos-14
+            rust_target: aarch64-apple-darwin
+          - name: linux-amd64-gnu
+            runner: ubuntu-latest
+            rust_target: x86_64-unknown-linux-gnu
+          - name: linux-arm64-gnu
+            runner: ubuntu-24.04-arm
+            rust_target: aarch64-unknown-linux-gnu
+          - name: windows-amd64
+            runner: windows-latest
+            rust_target: x86_64-pc-windows-msvc
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.97.0
+          targets: ${{ matrix.rust_target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+
+      - name: Install cbindgen
+        run: cargo install cbindgen --version 0.29.4 --locked
+
+      - name: Build native FFI library
+        shell: bash
+        run: scripts/build-ffi.sh "${{ matrix.rust_target }}"
+
+      - name: Test Rust crate
+        run: cargo test --workspace --target "${{ matrix.rust_target }}"
+
+      - name: Test Go module
+        run: go test ./...
+
+  musl-todo:
+    name: musl targets (TODO)
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "TODO M1+: add linux/amd64 and linux/arm64 musl cdylib builders and native smoke tests"
