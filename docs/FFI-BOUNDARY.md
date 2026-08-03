@@ -156,9 +156,8 @@ most bug-prone structure in the crate; it gets dedicated loom/proptest coverage.
 
 ## Open questions (resolve during M1–M2)
 
-1. Does core's actor trait let state save be explicit per-action (our
-   `SaveState` command), or does it snapshot implicitly? Determines whether
-   `StatePersisted` exists or `ActionResult` implies persistence.
+1. **Resolved in the M2 notes below.** Core supports explicit state save, so
+   `SaveState` and `StatePersisted` remain in the boundary.
 2. Action args encoding: pass through raw client encoding (JSON/CBOR) vs
    normalize to msgpack in the FFI crate. Leaning pass-through — Go decodes
    per-request, avoiding a double transcode.
@@ -195,3 +194,47 @@ The M1 `RunnerStopped` drain report is
 `{ graceful, elapsed_ms, actors_stopped, actors_remaining }`. The M1 command
 catalog is empty: an empty `CommandBatch` is accepted, while every non-empty
 batch is rejected as `unknown_command` before enqueue.
+
+## M2 pin-specific notes — 2026-08-03
+
+Open question 1 is resolved: core supports explicit state persistence. The
+adapter maps `SaveState { aid, gen, state }` to
+`ActorContext::save_state(vec![StateDelta::ActorState(state)])` and emits
+`StatePersisted` only after that future completes. `StatePersisted` carries an
+optional structured error in addition to `state_version`, so a failed save
+completes the Go future without stopping the pump. There is no automatic
+save-on-hook-return behavior in M2.
+
+Actor factories use `ActorFactory::new_with_manual_startup_ready` and are
+created from the sorted Go registry manifest. The concrete lifecycle mapping
+at `v2.3.10` is:
+
+- `aid` comes from `ActorContext::actor_id()`;
+- `gen` comes from the actor SQLite runtime configuration and is widened from
+  core's `u32` to the boundary's `u64`;
+- `name`, formatted `key`, `input`, and `persisted_state` are available from
+  `ActorContext`/`ActorStart`;
+- `create_ts` is not exposed by `ActorStart` or `ActorContext`, so the cataloged
+  field remains present and uses `0` as a documented unknown sentinel;
+- core reduces envoy stop causes to `ShutdownKind::Sleep` or
+  `ShutdownKind::Destroy` before invoking the factory, so `ActorStop.reason`
+  is `sleep` or `destroy`; the original going-away/lost distinction is not
+  recoverable at this trait boundary.
+
+`ActorStopResult` has an optional structured error arm. A Go `OnStop` error or
+panic is returned through core's lifecycle reply and reaches the engine's
+`StopCode::Error` path; a successful result retains the cataloged no-payload
+shape. The same structured-error convention applies to `ActorStartResult`.
+
+The public actor KV methods at this pin are deprecated in name but still
+supported and backed by the actor SQLite database. `KvGet`, `KvList`, `KvPut`,
+and `KvDelete` therefore map directly to `ActorContext::kv()`. KV list requests
+and results are capped at 1024 entries. The Go MessagePack shape scanner uses
+the same 1024-entry array ceiling; its remaining-bytes rule remains the primary
+allocation guard.
+
+State and KV use core's `sqlite-remote` feature with
+`ActorConfig.remote_sqlite = true`, which executes storage through the
+engine/envoy and persists it in the engine data directory. The native-local
+backend requires an atomic-write-enabled SQLite build at this pin and is not
+used by the prebuilt Go library.

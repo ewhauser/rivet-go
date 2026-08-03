@@ -128,4 +128,4 @@ jobs:
           key: rivet-engine-v2.3.10-${{ runner.os }}-${{ runner.arch }}-957d4e482f404913ca1955d8ecc357533f6fd081
 
       - name: Run real-engine conformance
-        run: go test -count=1 -v ./conformance
+        run: go test -race -count=1 -v ./...

@@ -1,7 +1,9 @@
 package conformance
 
 import (
+	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -9,6 +11,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -33,12 +36,18 @@ const (
 	// rivet-envoy-client v2.3.10 declares a 20-second ping-health threshold;
 	// the adapter samples that status every 250 milliseconds.
 	disconnectLivenessWindow = 22 * time.Second
+	rehydrateAttemptWindow   = 45 * time.Second
+	rehydrateAttempts        = 3
 )
 
 type runningEngine struct {
-	endpoint string
-	command  *exec.Cmd
-	logPath  string
+	binary    string
+	endpoint  string
+	command   *exec.Cmd
+	logFile   *os.File
+	logPath   string
+	storage   string
+	guardPort int
 }
 
 type envoyListResponse struct {
@@ -50,6 +59,24 @@ type envoyRecord struct {
 	PoolName string `json:"pool_name"`
 	StopTS   *int64 `json:"stop_ts"`
 	Version  int    `json:"version"`
+}
+
+type actorListResponse struct {
+	Actors []actorRecord `json:"actors"`
+}
+
+type actorCreateResponse struct {
+	Actor actorRecord `json:"actor"`
+}
+
+type actorRecord struct {
+	ActorID       string          `json:"actor_id"`
+	Name          string          `json:"name"`
+	Key           *string         `json:"key"`
+	CreateTS      int64           `json:"create_ts"`
+	ConnectableTS *int64          `json:"connectable_ts"`
+	DestroyTS     *int64          `json:"destroy_ts"`
+	Error         json.RawMessage `json:"error"`
 }
 
 func TestRunnerRegistersWithEngine(t *testing.T) {
@@ -262,9 +289,7 @@ func TestRunnerReportsEngineDisconnect(t *testing.T) {
 	waitForNativeEvent(t, runner, wire.EventRunnerConnected, 5*time.Second)
 
 	started := time.Now()
-	if err := engine.command.Process.Kill(); err != nil {
-		t.Fatalf("kill engine: %v", err)
-	}
+	engine.kill(t)
 	_, disconnected := waitForNativeEvent(t, runner, wire.EventRunnerDisconnected, disconnectLivenessWindow)
 	if disconnected.Reason == "" {
 		t.Fatal("RunnerDisconnected has an empty reason")
@@ -276,6 +301,302 @@ func TestRunnerReportsEngineDisconnect(t *testing.T) {
 		t.Fatalf("Shutdown after disconnect: %v", err)
 	}
 	waitForNativeEvent(t, runner, wire.EventRunnerStopped, 5*time.Second)
+}
+
+func TestCounterStatePersistsAcrossEngineRestart(t *testing.T) {
+	if testing.Short() {
+		t.Skip("real-engine conformance is disabled by -short")
+	}
+	engineBinary, err := acquireEngine(context.Background())
+	if err != nil {
+		t.Fatalf("obtain Rivet engine %s: %v\n%s", engineTag, err, engineRemediation())
+	}
+	engine := startEngine(t, engineBinary)
+
+	type counterState struct {
+		Count int `json:"count"`
+	}
+	type observation struct {
+		actorID    string
+		generation uint64
+		loaded     int
+		current    int
+		input      string
+	}
+	observations := make(chan observation, 8)
+	stopped := make(chan observation, 2)
+	registry := rivet.NewRegistry()
+	if err := rivet.Register(registry, "counter", rivet.Actor[counterState]{
+		OnStart: func(ctx *rivet.Context[counterState]) error {
+			loaded := ctx.State().Count
+			if loaded == 0 {
+				ctx.State().Count = 41
+				saveCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+				defer cancel()
+				if err := ctx.Save(saveCtx); err != nil {
+					return err
+				}
+			}
+			observations <- observation{
+				actorID:    ctx.ActorID(),
+				generation: ctx.Generation(),
+				loaded:     loaded,
+				current:    ctx.State().Count,
+				input:      string(ctx.Input()),
+			}
+			return nil
+		},
+		OnStop: func(ctx *rivet.Context[counterState]) error {
+			stopped <- observation{
+				actorID:    ctx.ActorID(),
+				generation: ctx.Generation(),
+				current:    ctx.State().Count,
+			}
+			return nil
+		},
+	}); err != nil {
+		t.Fatalf("register counter: %v", err)
+	}
+	runnerName := fmt.Sprintf("rivet-go-counter-%d", time.Now().UnixNano())
+	served := startRegistry(t, engine, runnerName, registry)
+	key := "persistent-counter"
+	actor := createActor(t, engine.endpoint, "counter", runnerName, "restart", &key, []byte("seed"))
+
+	var first observation
+	select {
+	case first = <-observations:
+	case <-time.After(30 * time.Second):
+		t.Fatal("counter OnStart did not run before restart")
+	}
+	if first.actorID != actor.ActorID || first.loaded != 0 || first.current != 41 || first.input != "seed" {
+		t.Fatalf("first counter observation = %#v, actor = %#v", first, actor)
+	}
+	waitForActor(t, engine.endpoint, actor.ActorID, false, func(actor actorRecord) bool {
+		return actor.ConnectableTS != nil && actor.DestroyTS == nil
+	})
+
+	// Drain the runner first so the engine persists a GoingAway transition.
+	// After the engine restart, a fresh runner registration causes that actor
+	// workflow to allocate the next generation and rehydrate its saved state.
+	served.stop(t)
+	select {
+	case stoppedFirst := <-stopped:
+		if stoppedFirst.actorID != actor.ActorID || stoppedFirst.generation != first.generation || stoppedFirst.current != 41 {
+			t.Fatalf("counter stop observation = %#v, first = %#v", stoppedFirst, first)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("counter did not stop during runner drain")
+	}
+	engine.restart(t)
+	var rehydrated observation
+	var rehydratedOK bool
+	for attempt := 0; attempt < rehydrateAttempts; attempt++ {
+		resumed := startRegistry(t, engine, runnerName, registry)
+		select {
+		case rehydrated = <-observations:
+			rehydratedOK = true
+		case <-time.After(rehydrateAttemptWindow):
+			resumed.stop(t)
+		}
+		if rehydratedOK {
+			break
+		}
+	}
+	if !rehydratedOK {
+		actorAfterRestart, actorErr := getActor(engine.endpoint, actor.ActorID, true)
+		envoysAfterRestart, envoyErr := listEnvoys(engine.endpoint, runnerName)
+		t.Fatalf("counter was not rehydrated after engine restart; actor=%#v actor_error=%v envoys=%#v envoy_error=%v", actorAfterRestart, actorErr, envoysAfterRestart, envoyErr)
+	}
+	if rehydrated.actorID != actor.ActorID || rehydrated.loaded != 41 || rehydrated.current != 41 || rehydrated.input != "seed" {
+		t.Fatalf("rehydrated counter observation = %#v, first = %#v", rehydrated, first)
+	}
+	if rehydrated.generation == first.generation {
+		t.Fatalf("rehydrated generation = %d, want a new generation after %d", rehydrated.generation, first.generation)
+	}
+	waitForActor(t, engine.endpoint, actor.ActorID, false, func(actor actorRecord) bool {
+		return actor.ConnectableTS != nil && actor.DestroyTS == nil
+	})
+	deleteActor(t, engine.endpoint, actor.ActorID)
+}
+
+func TestTwoActorsOnOneRunnerHaveIsolatedState(t *testing.T) {
+	if testing.Short() {
+		t.Skip("real-engine conformance is disabled by -short")
+	}
+	engineBinary, err := acquireEngine(context.Background())
+	if err != nil {
+		t.Fatalf("obtain Rivet engine %s: %v\n%s", engineTag, err, engineRemediation())
+	}
+	engine := startEngine(t, engineBinary)
+
+	type isolatedState struct {
+		Value string `json:"value"`
+	}
+	type observation struct {
+		actorID string
+		value   string
+	}
+	observations := make(chan observation, 4)
+	registry := rivet.NewRegistry()
+	if err := rivet.Register(registry, "isolated", rivet.Actor[isolatedState]{
+		OnStart: func(ctx *rivet.Context[isolatedState]) error {
+			if ctx.State().Value == "" {
+				ctx.State().Value = string(ctx.Input())
+				saveCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+				defer cancel()
+				if err := ctx.Save(saveCtx); err != nil {
+					return err
+				}
+			}
+			observations <- observation{actorID: ctx.ActorID(), value: ctx.State().Value}
+			return nil
+		},
+	}); err != nil {
+		t.Fatalf("register isolated actor: %v", err)
+	}
+	runnerName := fmt.Sprintf("rivet-go-isolation-%d", time.Now().UnixNano())
+	startRegistry(t, engine, runnerName, registry)
+	firstActor := createActor(t, engine.endpoint, "isolated", runnerName, "restart", nil, []byte("first"))
+	secondActor := createActor(t, engine.endpoint, "isolated", runnerName, "restart", nil, []byte("second"))
+
+	seen := make(map[string]string)
+	for len(seen) < 2 {
+		select {
+		case observation := <-observations:
+			seen[observation.actorID] = observation.value
+		case <-time.After(30 * time.Second):
+			t.Fatalf("received isolated actor observations %#v", seen)
+		}
+	}
+	if firstActor.ActorID == secondActor.ActorID {
+		t.Fatal("engine returned the same ID for two actors")
+	}
+	if seen[firstActor.ActorID] != "first" || seen[secondActor.ActorID] != "second" {
+		t.Fatalf("isolated state observations = %#v", seen)
+	}
+	deleteActor(t, engine.endpoint, firstActor.ActorID)
+	deleteActor(t, engine.endpoint, secondActor.ActorID)
+}
+
+func TestActorDestroyRunsGoCleanupHook(t *testing.T) {
+	if testing.Short() {
+		t.Skip("real-engine conformance is disabled by -short")
+	}
+	engineBinary, err := acquireEngine(context.Background())
+	if err != nil {
+		t.Fatalf("obtain Rivet engine %s: %v\n%s", engineTag, err, engineRemediation())
+	}
+	engine := startEngine(t, engineBinary)
+
+	type cleanupState struct {
+		Started bool `json:"started"`
+		Stopped bool `json:"stopped"`
+	}
+	type cleanupObservation struct {
+		actorID string
+		err     error
+	}
+	started := make(chan string, 1)
+	cleaned := make(chan cleanupObservation, 1)
+	registry := rivet.NewRegistry()
+	if err := rivet.Register(registry, "cleanup", rivet.Actor[cleanupState]{
+		OnStart: func(ctx *rivet.Context[cleanupState]) error {
+			ctx.State().Started = true
+			saveCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			if err := ctx.Save(saveCtx); err != nil {
+				return err
+			}
+			started <- ctx.ActorID()
+			return nil
+		},
+		OnStop: func(ctx *rivet.Context[cleanupState]) error {
+			ctx.State().Stopped = true
+			saveCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			err := ctx.Save(saveCtx)
+			cleaned <- cleanupObservation{actorID: ctx.ActorID(), err: err}
+			return err
+		},
+	}); err != nil {
+		t.Fatalf("register cleanup actor: %v", err)
+	}
+	runnerName := fmt.Sprintf("rivet-go-cleanup-%d", time.Now().UnixNano())
+	startRegistry(t, engine, runnerName, registry)
+	actor := createActor(t, engine.endpoint, "cleanup", runnerName, "destroy", nil, nil)
+	select {
+	case actorID := <-started:
+		if actorID != actor.ActorID {
+			t.Fatalf("OnStart actor ID = %s, want %s", actorID, actor.ActorID)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("cleanup actor did not start")
+	}
+
+	deleteActor(t, engine.endpoint, actor.ActorID)
+	select {
+	case observation := <-cleaned:
+		if observation.actorID != actor.ActorID || observation.err != nil {
+			t.Fatalf("cleanup observation = %#v", observation)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("DELETE /actors did not run Go OnStop cleanup")
+	}
+	waitForActor(t, engine.endpoint, actor.ActorID, true, func(actor actorRecord) bool {
+		return actor.DestroyTS != nil
+	})
+}
+
+func TestPanickingActorDoesNotKillRunner(t *testing.T) {
+	if testing.Short() {
+		t.Skip("real-engine conformance is disabled by -short")
+	}
+	engineBinary, err := acquireEngine(context.Background())
+	if err != nil {
+		t.Fatalf("obtain Rivet engine %s: %v\n%s", engineTag, err, engineRemediation())
+	}
+	engine := startEngine(t, engineBinary)
+
+	registry := rivet.NewRegistry()
+	if err := rivet.Register(registry, "panics", rivet.Actor[struct{}]{
+		OnStart: func(*rivet.Context[struct{}]) error {
+			panic("intentional lifecycle panic")
+		},
+	}); err != nil {
+		t.Fatalf("register panic actor: %v", err)
+	}
+	healthyStarted := make(chan string, 1)
+	if err := rivet.Register(registry, "healthy", rivet.Actor[struct{}]{
+		OnStart: func(ctx *rivet.Context[struct{}]) error {
+			healthyStarted <- ctx.ActorID()
+			return nil
+		},
+	}); err != nil {
+		t.Fatalf("register healthy actor: %v", err)
+	}
+	runnerName := fmt.Sprintf("rivet-go-panic-%d", time.Now().UnixNano())
+	startRegistry(t, engine, runnerName, registry)
+	panicked := createActor(t, engine.endpoint, "panics", runnerName, "destroy", nil, nil)
+	failed := waitForActor(t, engine.endpoint, panicked.ActorID, true, func(actor actorRecord) bool {
+		return len(actor.Error) > 0 && string(actor.Error) != "null"
+	})
+	if len(failed.Error) == 0 || string(failed.Error) == "null" {
+		t.Fatalf("panicking actor has no structured engine error: %#v", failed)
+	}
+	if failed.ConnectableTS != nil {
+		t.Fatalf("panicking actor became connectable: %#v", failed)
+	}
+
+	healthy := createActor(t, engine.endpoint, "healthy", runnerName, "destroy", nil, nil)
+	select {
+	case actorID := <-healthyStarted:
+		if actorID != healthy.ActorID {
+			t.Fatalf("healthy OnStart actor ID = %s, want %s", actorID, healthy.ActorID)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("healthy actor did not start after peer panic")
+	}
+	deleteActor(t, engine.endpoint, healthy.ActorID)
 }
 
 func acquireEngine(ctx context.Context) (string, error) {
@@ -349,54 +670,103 @@ func buildPinnedEngine(ctx context.Context, cache string) (string, error) {
 
 func startEngine(t *testing.T, binary string) *runningEngine {
 	t.Helper()
-	guardPort := reservePortRange(t)
-	storage := t.TempDir()
-	logPath := filepath.Join(storage, "engine.log")
-	logFile, err := os.Create(logPath)
-	if err != nil {
-		t.Fatalf("create engine log: %v", err)
+	engine := &runningEngine{
+		binary:    binary,
+		guardPort: reservePortRange(t),
+		storage:   t.TempDir(),
 	}
-	command := exec.Command(binary, "start")
+	engine.endpoint = fmt.Sprintf("http://127.0.0.1:%d", engine.guardPort)
+	engine.logPath = filepath.Join(engine.storage, "engine.log")
+	engine.start(t)
+	t.Cleanup(func() { engine.stop() })
+	return engine
+}
+
+func (e *runningEngine) start(t *testing.T) {
+	t.Helper()
+	if e.command != nil {
+		t.Fatal("engine process is already running")
+	}
+	logFile, err := os.OpenFile(e.logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+	if err != nil {
+		t.Fatalf("open engine log: %v", err)
+	}
+	command := exec.Command(e.binary, "start")
 	command.Env = append(os.Environ(),
 		"RIVET__GUARD__HOST=127.0.0.1",
-		"RIVET__GUARD__PORT="+strconv.Itoa(guardPort),
+		"RIVET__GUARD__PORT="+strconv.Itoa(e.guardPort),
 		"RIVET__API_PEER__HOST=127.0.0.1",
-		"RIVET__API_PEER__PORT="+strconv.Itoa(guardPort+1),
+		"RIVET__API_PEER__PORT="+strconv.Itoa(e.guardPort+1),
 		"RIVET__METRICS__HOST=127.0.0.1",
-		"RIVET__METRICS__PORT="+strconv.Itoa(guardPort+10),
-		"RIVET__FILE_SYSTEM__PATH="+filepath.Join(storage, "db"),
+		"RIVET__METRICS__PORT="+strconv.Itoa(e.guardPort+10),
+		"RIVET__FILE_SYSTEM__PATH="+filepath.Join(e.storage, "db"),
 	)
 	command.Stdout = logFile
 	command.Stderr = logFile
 	if err := command.Start(); err != nil {
 		_ = logFile.Close()
-		t.Fatalf("start engine %s: %v", binary, err)
+		t.Fatalf("start engine %s: %v", e.binary, err)
 	}
-	engine := &runningEngine{
-		endpoint: fmt.Sprintf("http://127.0.0.1:%d", guardPort),
-		command:  command,
-		logPath:  logPath,
-	}
-	t.Cleanup(func() {
-		if command.Process != nil {
-			_ = command.Process.Kill()
-		}
-		_ = command.Wait()
-		_ = logFile.Close()
-	})
+	e.command = command
+	e.logFile = logFile
 
 	eventually(t, 20*time.Second, func() (bool, error) {
-		response, err := http.Get(engine.endpoint + "/health")
+		response, err := http.Get(e.endpoint + "/health")
 		if err != nil {
-			return false, fmt.Errorf("engine health request: %w\nlast engine output:\n%s", err, readLogTail(logPath))
+			return false, fmt.Errorf("engine health request: %w\nlast engine output:\n%s", err, readLogTail(e.logPath))
 		}
 		defer response.Body.Close()
 		if response.StatusCode != http.StatusOK {
-			return false, fmt.Errorf("engine health returned %s\nlast engine output:\n%s", response.Status, readLogTail(logPath))
+			return false, fmt.Errorf("engine health returned %s\nlast engine output:\n%s", response.Status, readLogTail(e.logPath))
 		}
 		return true, nil
 	})
-	return engine
+}
+
+func (e *runningEngine) kill(t *testing.T) {
+	t.Helper()
+	if e.command == nil {
+		return
+	}
+	if e.command.Process != nil {
+		if err := e.command.Process.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
+			t.Fatalf("kill engine: %v", err)
+		}
+	}
+	if err := e.command.Wait(); err != nil {
+		var exitError *exec.ExitError
+		if !errors.As(err, &exitError) {
+			t.Fatalf("wait for killed engine: %v", err)
+		}
+	}
+	if e.logFile != nil {
+		if err := e.logFile.Close(); err != nil {
+			t.Fatalf("close engine log: %v", err)
+		}
+	}
+	e.command = nil
+	e.logFile = nil
+}
+
+func (e *runningEngine) restart(t *testing.T) {
+	t.Helper()
+	e.kill(t)
+	e.start(t)
+}
+
+func (e *runningEngine) stop() {
+	if e.command == nil {
+		return
+	}
+	if e.command.Process != nil {
+		_ = e.command.Process.Kill()
+	}
+	_ = e.command.Wait()
+	if e.logFile != nil {
+		_ = e.logFile.Close()
+	}
+	e.command = nil
+	e.logFile = nil
 }
 
 func listEnvoys(endpoint, runnerName string) ([]envoyRecord, error) {
@@ -419,6 +789,194 @@ func listEnvoys(endpoint, runnerName string) ([]envoyRecord, error) {
 		return nil, err
 	}
 	return list.Envoys, nil
+}
+
+type servedRegistry struct {
+	cancel   context.CancelFunc
+	result   chan error
+	stopOnce sync.Once
+	stopErr  error
+}
+
+func startRegistry(t *testing.T, engine *runningEngine, runnerName string, registry *rivet.Registry) *servedRegistry {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	served := &servedRegistry{cancel: cancel, result: make(chan error, 1)}
+	go func() {
+		served.result <- registry.Serve(ctx, rivet.Config{
+			Endpoint:   engine.endpoint,
+			Namespace:  "default",
+			RunnerName: runnerName,
+			Version:    1,
+			TotalSlots: 16,
+			LogLevel:   "error",
+		})
+	}()
+	t.Cleanup(func() { served.stop(t) })
+
+	eventually(t, 20*time.Second, func() (bool, error) {
+		select {
+		case err := <-served.result:
+			served.stopOnce.Do(func() {
+				served.cancel()
+				served.stopErr = err
+			})
+			if err == nil {
+				return false, errors.New("runner Serve exited before registration")
+			}
+			return false, fmt.Errorf("runner Serve exited before registration: %w", err)
+		default:
+		}
+		envoys, err := listEnvoys(engine.endpoint, runnerName)
+		if err != nil {
+			return false, err
+		}
+		for _, envoy := range envoys {
+			if envoy.PoolName == runnerName && envoy.StopTS == nil {
+				return true, nil
+			}
+		}
+		return false, nil
+	})
+	return served
+}
+
+func (s *servedRegistry) stop(t *testing.T) {
+	t.Helper()
+	s.stopOnce.Do(func() {
+		s.cancel()
+		select {
+		case s.stopErr = <-s.result:
+		case <-time.After(15 * time.Second):
+			s.stopErr = errors.New("runner did not finish graceful shutdown")
+		}
+	})
+	if s.stopErr != nil {
+		t.Fatalf("runner Serve shutdown: %v", s.stopErr)
+	}
+}
+
+func createActor(
+	t *testing.T,
+	endpoint, name, runnerName, crashPolicy string,
+	key *string,
+	input []byte,
+) actorRecord {
+	t.Helper()
+	payload := struct {
+		Name               string  `json:"name"`
+		RunnerNameSelector string  `json:"runner_name_selector"`
+		CrashPolicy        string  `json:"crash_policy"`
+		Key                *string `json:"key,omitempty"`
+		Input              *string `json:"input,omitempty"`
+	}{
+		Name:               name,
+		RunnerNameSelector: runnerName,
+		CrashPolicy:        crashPolicy,
+		Key:                key,
+	}
+	if input != nil {
+		encoded := base64.StdEncoding.EncodeToString(input)
+		payload.Input = &encoded
+	}
+	var response actorCreateResponse
+	requestJSON(t, http.MethodPost, endpoint+"/actors?namespace=default", payload, &response)
+	if response.Actor.ActorID == "" {
+		t.Fatal("POST /actors returned an empty actor_id")
+	}
+	return response.Actor
+}
+
+func deleteActor(t *testing.T, endpoint, actorID string) {
+	t.Helper()
+	requestJSON(
+		t,
+		http.MethodDelete,
+		endpoint+"/actors/"+url.PathEscape(actorID)+"?namespace=default",
+		nil,
+		&struct{}{},
+	)
+}
+
+func getActor(endpoint, actorID string, includeDestroyed bool) (actorRecord, error) {
+	query := url.Values{}
+	query.Set("namespace", "default")
+	query.Add("actor_id", actorID)
+	if includeDestroyed {
+		query.Set("include_destroyed", "true")
+	}
+	request, err := http.NewRequest(http.MethodGet, endpoint+"/actors?"+query.Encode(), nil)
+	if err != nil {
+		return actorRecord{}, err
+	}
+	request.Header.Set("Authorization", "Bearer dev")
+	response, err := (&http.Client{Timeout: 5 * time.Second}).Do(request)
+	if err != nil {
+		return actorRecord{}, err
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(response.Body, 4<<10))
+		return actorRecord{}, fmt.Errorf("GET /actors returned %s: %s", response.Status, body)
+	}
+	var list actorListResponse
+	if err := json.NewDecoder(response.Body).Decode(&list); err != nil {
+		return actorRecord{}, err
+	}
+	for _, actor := range list.Actors {
+		if actor.ActorID == actorID {
+			return actor, nil
+		}
+	}
+	return actorRecord{}, fmt.Errorf("actor %s is absent from GET /actors", actorID)
+}
+
+func requestJSON(t *testing.T, method, endpoint string, input, output any) {
+	t.Helper()
+	var body io.Reader
+	if input != nil {
+		encoded, err := json.Marshal(input)
+		if err != nil {
+			t.Fatalf("encode %s request: %v", method, err)
+		}
+		body = bytes.NewReader(encoded)
+	}
+	request, err := http.NewRequest(method, endpoint, body)
+	if err != nil {
+		t.Fatalf("build %s request: %v", method, err)
+	}
+	request.Header.Set("Authorization", "Bearer dev")
+	if input != nil {
+		request.Header.Set("Content-Type", "application/json")
+	}
+	response, err := (&http.Client{Timeout: 20 * time.Second}).Do(request)
+	if err != nil {
+		t.Fatalf("%s %s: %v", method, endpoint, err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode < 200 || response.StatusCode >= 300 {
+		responseBody, _ := io.ReadAll(io.LimitReader(response.Body, 8<<10))
+		t.Fatalf("%s %s returned %s: %s", method, endpoint, response.Status, responseBody)
+	}
+	if output != nil {
+		if err := json.NewDecoder(response.Body).Decode(output); err != nil {
+			t.Fatalf("decode %s %s response: %v", method, endpoint, err)
+		}
+	}
+}
+
+func waitForActor(t *testing.T, endpoint, actorID string, includeDestroyed bool, check func(actorRecord) bool) actorRecord {
+	t.Helper()
+	var actor actorRecord
+	eventually(t, 30*time.Second, func() (bool, error) {
+		current, err := getActor(endpoint, actorID, includeDestroyed)
+		if err != nil {
+			return false, err
+		}
+		actor = current
+		return check(current), nil
+	})
+	return actor
 }
 
 func eventually(t *testing.T, timeout time.Duration, check func() (bool, error)) {

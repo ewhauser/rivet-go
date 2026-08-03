@@ -260,3 +260,32 @@ M1 therefore retains and validates `RunnerConfig.total_slots` at the stable FFI
 boundary but cannot transmit it at `v2.3.10`. Actor capacity remains zero
 because the actor manifest is empty. This field stays in place for the M2
 actor-capable adapter rather than changing the boundary or bumping the pin.
+
+### M2 — 2026-08-03
+
+M2 resolves the state-persistence question against the pinned core source.
+`ActorContext::save_state(Vec<StateDelta>)` is an explicit, awaited operation,
+and `ActorStart.snapshot` supplies the last persisted actor-state bytes.
+Accordingly, the Go API exposes `Context.Save(ctx)` rather than an implicit
+save-on-hook-return policy. The FFI keeps the planned `SaveState` command and
+`StatePersisted` completion event.
+
+Core stores actor state and its public actor KV surface in the actor's internal
+SQLite database. The Go adapter selects core's supported `sqlite-remote`
+backend so database operations are executed and persisted by the engine/envoy.
+The alternative native-local backend requires an atomic-write-enabled SQLite
+build and is not part of the Go SDK's prebuilt-library contract. This remains
+core-backed persistence and is verified across an actual engine process
+restart using the same filesystem data directory.
+
+The restart conformance drains the first runner generation, waits for the Go
+`OnStop` observation, kills and restarts the pinned engine, then registers a
+fresh runner in the same pool. The persisted `GoingAway` transition reallocates
+the same actor ID with a new generation; its `OnStart` observes the saved
+counter value. Fresh registration attempts are bounded because the pinned
+filesystem engine performs asynchronous workflow failover after process
+restart. Assertions use management API state and Go hook observations only.
+
+The remaining pin-specific lifecycle mappings are documented in
+[FFI-BOUNDARY.md](FFI-BOUNDARY.md). Actions, HTTP, WebSockets, alarms, and sleep
+remain outside M2.
