@@ -233,8 +233,54 @@ type lifecycleHandler struct {
 
 type dispatchHandler struct {
 	lifecycleHandler
-	action func(context.Context, *ActorSession, wire.Event, any) ([]byte, error)
-	fetch  func(context.Context, *ActorSession, wire.Event, any) error
+	action     func(context.Context, *ActorSession, wire.Event, any) ([]byte, error)
+	fetch      func(context.Context, *ActorSession, wire.Event, any) error
+	wsOpen     func(context.Context, *ActorSession, wire.Event, any) error
+	wsMessage  func(context.Context, *ActorSession, wire.Event, any) error
+	wsClose    func(context.Context, *ActorSession, wire.Event, any) error
+	wsCloseAll func(context.Context, *ActorSession, any)
+}
+
+func (h dispatchHandler) WebSocketOpen(
+	ctx context.Context,
+	session *ActorSession,
+	event wire.Event,
+	state any,
+) error {
+	if h.wsOpen == nil {
+		return nil
+	}
+	return h.wsOpen(ctx, session, event, state)
+}
+
+func (h dispatchHandler) WebSocketMessage(
+	ctx context.Context,
+	session *ActorSession,
+	event wire.Event,
+	state any,
+) error {
+	if h.wsMessage == nil {
+		return nil
+	}
+	return h.wsMessage(ctx, session, event, state)
+}
+
+func (h dispatchHandler) WebSocketClose(
+	ctx context.Context,
+	session *ActorSession,
+	event wire.Event,
+	state any,
+) error {
+	if h.wsClose == nil {
+		return nil
+	}
+	return h.wsClose(ctx, session, event, state)
+}
+
+func (h dispatchHandler) CloseWebSockets(ctx context.Context, session *ActorSession, state any) {
+	if h.wsCloseAll != nil {
+		h.wsCloseAll(ctx, session, state)
+	}
 }
 
 func (h dispatchHandler) Action(
@@ -1049,6 +1095,140 @@ func TestActionDeadlineIsPropagatedAndActorRecovers(t *testing.T) {
 	if command := nextCommand(t, runner); command.Kind != wire.CommandActionResult ||
 		command.CallID != 41 || string(command.Output) != "healthy" {
 		t.Fatalf("post-timeout action result = %#v", command)
+	}
+	cancel()
+	if err := <-result; err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+}
+
+func TestWebSocketEventsAreActorOrderedAndCommandsDoNotUsePoller(t *testing.T) {
+	defer goleak.VerifyNone(t)
+	runner := newFakeRunner()
+	seen := make(chan string, 8)
+	handler := dispatchHandler{
+		wsOpen: func(_ context.Context, _ *ActorSession, event wire.Event, _ any) error {
+			seen <- "open:" + event.WSID
+			return nil
+		},
+		wsMessage: func(ctx context.Context, session *ActorSession, event wire.Event, _ any) error {
+			seen <- "message:" + event.WSID + ":" + string(event.Data)
+			if err := session.Broadcast(ctx, "updated", []byte{0x81, 0x01}, nil); err != nil {
+				return err
+			}
+			return session.SendWebSocket(ctx, "ws-b", []byte("targeted"), false)
+		},
+		wsClose: func(_ context.Context, _ *ActorSession, event wire.Event, _ any) error {
+			seen <- "close:" + event.WSID
+			return nil
+		},
+	}
+	p := NewWithHandlers(runner, map[string]ActorHandler{"socket": handler})
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() { result <- p.Run(ctx) }()
+	waitPumpStarted(t, p)
+
+	runner.emit(wire.Event{Kind: wire.EventActorStart, AID: "socket-aid", Generation: 1, Name: "socket"})
+	if command := nextCommand(t, runner); command.Kind != wire.CommandActorStartResult {
+		t.Fatalf("start command = %#v", command)
+	}
+	runner.emit(
+		wire.Event{Kind: wire.EventWSOpen, AID: "socket-aid", WSID: "ws-a", Path: "/chat"},
+		wire.Event{Kind: wire.EventWSOpen, AID: "socket-aid", WSID: "ws-b", Path: "/chat"},
+	)
+	for _, wsID := range []string{"ws-a", "ws-b"} {
+		if got := <-seen; got != "open:"+wsID {
+			t.Fatalf("open order = %q, want open:%s", got, wsID)
+		}
+		if command := nextCommand(t, runner); command.Kind != wire.CommandWSOpenResult ||
+			command.WSID != wsID || !command.Accept {
+			t.Fatalf("open result = %#v", command)
+		}
+	}
+
+	runner.emit(wire.Event{
+		Kind:         wire.EventWSMessage,
+		WSID:         "ws-a",
+		Data:         []byte("hello"),
+		MessageIndex: 7,
+	})
+	if got := <-seen; got != "message:ws-a:hello" {
+		t.Fatalf("message observation = %q", got)
+	}
+	commands := []wire.Command{nextCommand(t, runner), nextCommand(t, runner), nextCommand(t, runner)}
+	if commands[0].Kind != wire.CommandBroadcast || commands[0].Event != "updated" {
+		t.Fatalf("broadcast command = %#v", commands[0])
+	}
+	if commands[1].Kind != wire.CommandWSSend || commands[1].WSID != "ws-b" {
+		t.Fatalf("targeted send command = %#v", commands[1])
+	}
+	if commands[2].Kind != wire.CommandWSMessageAck || commands[2].MessageIndex != 7 {
+		t.Fatalf("message acknowledgement = %#v", commands[2])
+	}
+	if runner.maxPolls.Load() != 1 {
+		t.Fatalf("maximum concurrent native polls = %d, want 1", runner.maxPolls.Load())
+	}
+
+	reason := "client done"
+	code := uint16(1000)
+	runner.emit(wire.Event{Kind: wire.EventWSClose, WSID: "ws-a", CloseCode: &code, Reason: reason})
+	if got := <-seen; got != "close:ws-a" {
+		t.Fatalf("close observation = %q", got)
+	}
+	runner.emit(wire.Event{Kind: wire.EventActorStop, AID: "socket-aid", Generation: 1, Reason: "destroy"})
+	if got := <-seen; got != "close:ws-b" {
+		t.Fatalf("actor-stop close observation = %q", got)
+	}
+	if command := nextCommand(t, runner); command.Kind != wire.CommandActorStopResult {
+		t.Fatalf("stop command = %#v", command)
+	}
+	cancel()
+	if err := <-result; err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+}
+
+func TestWebSocketHandlerPanicRequestsActorErrorStopAndPeerSurvives(t *testing.T) {
+	runner := newFakeRunner()
+	handlers := map[string]ActorHandler{
+		"panic-socket": dispatchHandler{
+			wsMessage: func(context.Context, *ActorSession, wire.Event, any) error {
+				panic("socket boom")
+			},
+		},
+		"peer": dispatchHandler{
+			action: func(context.Context, *ActorSession, wire.Event, any) ([]byte, error) {
+				return []byte("healthy"), nil
+			},
+		},
+	}
+	p := NewWithHandlers(runner, handlers)
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() { result <- p.Run(ctx) }()
+	waitPumpStarted(t, p)
+	runner.emit(
+		wire.Event{Kind: wire.EventActorStart, AID: "panic-aid", Generation: 1, Name: "panic-socket"},
+		wire.Event{Kind: wire.EventActorStart, AID: "peer-aid", Generation: 1, Name: "peer"},
+	)
+	nextCommand(t, runner)
+	nextCommand(t, runner)
+	runner.emit(wire.Event{Kind: wire.EventWSOpen, AID: "panic-aid", WSID: "ws-panic", Path: "/"})
+	nextCommand(t, runner)
+	runner.emit(wire.Event{Kind: wire.EventWSMessage, WSID: "ws-panic", Data: []byte("boom"), MessageIndex: 1})
+	first := nextCommand(t, runner)
+	second := nextCommand(t, runner)
+	kinds := map[wire.CommandKind]wire.Command{first.Kind: first, second.Kind: second}
+	if ack := kinds[wire.CommandWSMessageAck]; ack.WSID != "ws-panic" {
+		t.Fatalf("panic message acknowledgement = %#v", ack)
+	}
+	if stop := kinds[wire.CommandStopIntent]; stop.AID != "panic-aid" {
+		t.Fatalf("panic stop intent = %#v", stop)
+	}
+	runner.emit(wire.Event{Kind: wire.EventActionCall, AID: "peer-aid", Generation: 1, CallID: 9, Action: "health", ActionTimeoutMS: 1_000})
+	if command := nextCommand(t, runner); command.Kind != wire.CommandActionResult || string(command.Output) != "healthy" {
+		t.Fatalf("peer action after WebSocket panic = %#v", command)
 	}
 	cancel()
 	if err := <-result; err != nil {

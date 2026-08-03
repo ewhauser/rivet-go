@@ -14,7 +14,8 @@ import (
 	"github.com/ewhauser/rivet-go/internal/wire"
 )
 
-// Actor defines typed state, lifecycle hooks, actions, and raw HTTP handling.
+// Actor defines typed state, lifecycle hooks, actions, raw HTTP handling, and
+// raw gateway WebSocket handling.
 type Actor[T any] struct {
 	OnStart func(*Context[T]) error
 	OnStop  func(*Context[T]) error
@@ -24,15 +25,20 @@ type Actor[T any] struct {
 	// serialized, and writes after OnFetch returns fail. Header must not be
 	// mutated concurrently with a write. The M3 writer intentionally does not
 	// implement http.Flusher because v2.3.10 buffers the complete response.
-	OnFetch func(*Context[T], http.ResponseWriter, *http.Request)
+	OnFetch      func(*Context[T], http.ResponseWriter, *http.Request)
+	OnConnect    func(*Context[T], *Connection) error
+	OnMessage    func(*Context[T], *Connection, Message)
+	OnDisconnect func(*Context[T], *Connection)
 }
 
 // Context is one live actor generation. State returns the generation-local
 // typed value loaded from core's persisted snapshot.
 type Context[T any] struct {
-	session *pump.ActorSession
-	state   T
-	saveMu  sync.Mutex
+	session       *pump.ActorSession
+	state         T
+	saveMu        sync.Mutex
+	connectionsMu sync.Mutex
+	connections   map[string]*Connection
 }
 
 func (c *Context[T]) State() *T {
@@ -106,7 +112,11 @@ func (a *actorAdapter[T]) Start(
 	if err != nil {
 		return nil, err
 	}
-	actorContext := &Context[T]{session: session, state: state}
+	actorContext := &Context[T]{
+		session:     session,
+		state:       state,
+		connections: make(map[string]*Connection),
+	}
 	if a.definition.OnStart != nil {
 		if err := a.definition.OnStart(actorContext); err != nil {
 			return nil, err
@@ -198,6 +208,114 @@ func (a *actorAdapter[T]) Fetch(
 	writer := newResponseWriter(session, event.RequestID, incoming.Context)
 	a.definition.OnFetch(actorContext, writer, request)
 	return writer.finish()
+}
+
+func (a *actorAdapter[T]) WebSocketOpen(
+	_ context.Context,
+	session *pump.ActorSession,
+	event wire.Event,
+	state any,
+) error {
+	actorContext, ok := state.(*Context[T])
+	if !ok || actorContext == nil {
+		return errors.New("typed actor context is unavailable during OnConnect")
+	}
+	connection := newConnection(session, event)
+	actorContext.connectionsMu.Lock()
+	if _, exists := actorContext.connections[event.WSID]; exists {
+		actorContext.connectionsMu.Unlock()
+		return pump.HandlerError{Code: "ws_duplicate", Message: "WebSocket connection is already active"}
+	}
+	actorContext.connections[event.WSID] = connection
+	actorContext.connectionsMu.Unlock()
+	if a.definition.OnConnect == nil {
+		return nil
+	}
+	if err := a.definition.OnConnect(actorContext, connection); err != nil {
+		actorContext.connectionsMu.Lock()
+		delete(actorContext.connections, event.WSID)
+		actorContext.connectionsMu.Unlock()
+		connection.markClosed()
+		return err
+	}
+	return nil
+}
+
+func (a *actorAdapter[T]) WebSocketMessage(
+	_ context.Context,
+	_ *pump.ActorSession,
+	event wire.Event,
+	state any,
+) error {
+	actorContext, ok := state.(*Context[T])
+	if !ok || actorContext == nil {
+		return errors.New("typed actor context is unavailable during OnMessage")
+	}
+	actorContext.connectionsMu.Lock()
+	connection := actorContext.connections[event.WSID]
+	actorContext.connectionsMu.Unlock()
+	if connection == nil {
+		return nil
+	}
+	if a.definition.OnMessage != nil {
+		a.definition.OnMessage(actorContext, connection, Message{
+			Data:         append([]byte(nil), event.Data...),
+			Binary:       event.Binary,
+			MessageIndex: event.MessageIndex,
+		})
+	}
+	return nil
+}
+
+func (a *actorAdapter[T]) WebSocketClose(
+	_ context.Context,
+	_ *pump.ActorSession,
+	event wire.Event,
+	state any,
+) error {
+	actorContext, ok := state.(*Context[T])
+	if !ok || actorContext == nil {
+		return errors.New("typed actor context is unavailable during OnDisconnect")
+	}
+	actorContext.connectionsMu.Lock()
+	connection := actorContext.connections[event.WSID]
+	delete(actorContext.connections, event.WSID)
+	actorContext.connectionsMu.Unlock()
+	if connection == nil {
+		return nil
+	}
+	connection.setClose(event.CloseCode, event.Reason)
+	if a.definition.OnDisconnect != nil {
+		a.definition.OnDisconnect(actorContext, connection)
+	}
+	return nil
+}
+
+func (a *actorAdapter[T]) CloseWebSockets(
+	_ context.Context,
+	_ *pump.ActorSession,
+	state any,
+) {
+	actorContext, ok := state.(*Context[T])
+	if !ok || actorContext == nil {
+		return
+	}
+	actorContext.connectionsMu.Lock()
+	connections := make([]*Connection, 0, len(actorContext.connections))
+	for id, connection := range actorContext.connections {
+		delete(actorContext.connections, id)
+		connection.setClose(nil, "actor stopped")
+		connections = append(connections, connection)
+	}
+	actorContext.connectionsMu.Unlock()
+	if a.definition.OnDisconnect != nil {
+		for _, connection := range connections {
+			func() {
+				defer func() { _ = recover() }()
+				a.definition.OnDisconnect(actorContext, connection)
+			}()
+		}
+	}
 }
 
 func decodeState[T any](data []byte) (T, error) {

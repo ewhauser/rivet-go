@@ -21,10 +21,12 @@ const (
 	defaultShutdownTimeout = 10 * time.Second
 	defaultSaveTimeout     = 35 * time.Second
 	defaultHTTPSubmitLimit = 30 * time.Second
+	defaultWSSubmitLimit   = 30 * time.Second
 	defaultSubmitQueue     = 1_024
 	maxSubmitBatch         = 64
 	actorEventQueue        = 64
 	maxHTTPChunk           = 1 << 20
+	maxWSMessage           = 1 << 20
 )
 
 var (
@@ -55,6 +57,13 @@ type actorActionHandler interface {
 
 type actorFetchHandler interface {
 	Fetch(context.Context, *ActorSession, wire.Event, any) error
+}
+
+type actorWebSocketHandler interface {
+	WebSocketOpen(context.Context, *ActorSession, wire.Event, any) error
+	WebSocketMessage(context.Context, *ActorSession, wire.Event, any) error
+	WebSocketClose(context.Context, *ActorSession, wire.Event, any) error
+	CloseWebSockets(context.Context, *ActorSession, any)
 }
 
 // HandlerError is sent to Rust as the structured actor-local error arm of a
@@ -231,6 +240,130 @@ func (s *ActorSession) WriteHTTPResponseChunk(
 		Body:      cloneBytesOrEmpty(body),
 		Finish:    finish,
 	})
+}
+
+// SendWebSocket submits one complete text or binary WebSocket message. A
+// WebSocket message is never split into multiple frames; the boundary maximum
+// is one MiB.
+func (s *ActorSession) SendWebSocket(
+	ctx context.Context,
+	wsID string,
+	data []byte,
+	binary bool,
+) error {
+	if wsID == "" {
+		return errors.New("WebSocket ID is empty")
+	}
+	if len(data) > maxWSMessage {
+		return fmt.Errorf("WebSocket message is %d bytes, maximum is %d", len(data), maxWSMessage)
+	}
+	return s.submitWebSocket(ctx, wire.Command{
+		Kind:   wire.CommandWSSend,
+		WSID:   wsID,
+		Data:   cloneBytesOrEmpty(data),
+		Binary: binary,
+	})
+}
+
+// CloseWebSocket asks core to close one connection. Hibernation is wired on
+// the command but intentionally false until M5.
+func (s *ActorSession) CloseWebSocket(
+	ctx context.Context,
+	wsID string,
+	code uint16,
+	reason string,
+) error {
+	if wsID == "" {
+		return errors.New("WebSocket ID is empty")
+	}
+	return s.submitWebSocket(ctx, wire.Command{
+		Kind:        wire.CommandWSClose,
+		WSID:        wsID,
+		CloseCode:   &code,
+		CloseReason: &reason,
+		Hibernate:   false,
+	})
+}
+
+// Broadcast sends one named CBOR argument array to every live connection on
+// this actor, optionally excluding one raw WebSocket connection.
+func (s *ActorSession) Broadcast(
+	ctx context.Context,
+	event string,
+	payload []byte,
+	excludeConn *string,
+) error {
+	if event == "" {
+		return errors.New("broadcast event is empty")
+	}
+	if len(payload) > maxWSMessage {
+		return fmt.Errorf("broadcast payload is %d bytes, maximum is %d", len(payload), maxWSMessage)
+	}
+	return s.submitWebSocket(ctx, wire.Command{
+		Kind:        wire.CommandBroadcast,
+		AID:         s.AID(),
+		Event:       event,
+		Payload:     cloneBytesOrEmpty(payload),
+		ExcludeConn: excludeConn,
+	})
+}
+
+func (s *ActorSession) submitWebSocket(ctx context.Context, command wire.Command) error {
+	if s == nil || s.pump == nil {
+		return errors.New("actor session is unavailable")
+	}
+	if ctx == nil {
+		return errors.New("WebSocket submission context is nil")
+	}
+	retryCtx, cancel := context.WithTimeout(ctx, s.pump.wsSubmitLimit)
+	defer cancel()
+	backoff := time.Millisecond
+	for {
+		err := s.pump.submitInternal(retryCtx, command)
+		if err == nil {
+			return nil
+		}
+		if retryCtx.Err() != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			return HandlerError{
+				Code:    "ws_backpressure_timeout",
+				Message: fmt.Sprintf("WebSocket submission remained backpressured for %s", s.pump.wsSubmitLimit),
+			}
+		}
+		var coded interface{ ErrorCode() string }
+		if !errors.As(err, &coded) || coded.ErrorCode() != "backpressure" {
+			return err
+		}
+		jitter := time.Duration(rand.Int64N(int64(backoff/2) + 1))
+		timer := time.NewTimer(backoff + jitter)
+		select {
+		case <-timer.C:
+		case <-retryCtx.Done():
+			if !timer.Stop() {
+				<-timer.C
+			}
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			return HandlerError{
+				Code:    "ws_backpressure_timeout",
+				Message: fmt.Sprintf("WebSocket submission remained backpressured for %s", s.pump.wsSubmitLimit),
+			}
+		case <-s.done:
+			if !timer.Stop() {
+				<-timer.C
+			}
+			return ErrShuttingDown
+		case <-s.pump.done:
+			if !timer.Stop() {
+				<-timer.C
+			}
+			return ErrShuttingDown
+		}
+		backoff = min(backoff*2, 25*time.Millisecond)
+	}
 }
 
 func (s *ActorSession) failHTTP(ctx context.Context, requestID uint64, failure *wire.WireError) error {
@@ -714,6 +847,7 @@ type Pump struct {
 	shutdownTimeout time.Duration
 	saveTimeout     time.Duration
 	httpSubmitLimit time.Duration
+	wsSubmitLimit   time.Duration
 	handlers        map[string]ActorHandler
 
 	started      atomic.Bool
@@ -735,6 +869,8 @@ type Pump struct {
 	lateSaves   map[actorIdentity]struct{}
 	httpMu      sync.Mutex
 	httpPending map[uint64]*httpRequestState
+	wsMu        sync.Mutex
+	websockets  map[string]actorIdentity
 
 	subsMu    sync.Mutex
 	subs      map[uint64]*subscriber
@@ -760,6 +896,7 @@ func NewWithHandlers(runner Runner, handlers map[string]ActorHandler) *Pump {
 		shutdownTimeout: defaultShutdownTimeout,
 		saveTimeout:     defaultSaveTimeout,
 		httpSubmitLimit: defaultHTTPSubmitLimit,
+		wsSubmitLimit:   defaultWSSubmitLimit,
 		handlers:        ownedHandlers,
 		submitQueue:     make(chan submitRequest, defaultSubmitQueue),
 		submitStop:      make(chan struct{}),
@@ -769,6 +906,7 @@ func NewWithHandlers(runner Runner, handlers map[string]ActorHandler) *Pump {
 		kvPending:       make(map[uint64]chan wire.Event),
 		lateSaves:       make(map[actorIdentity]struct{}),
 		httpPending:     make(map[uint64]*httpRequestState),
+		websockets:      make(map[string]actorIdentity),
 		subs:            make(map[uint64]*subscriber),
 	}
 }
@@ -1006,6 +1144,9 @@ func (p *Pump) handleInternalEvent(event wire.Event) error {
 		if worker == nil {
 			return fmt.Errorf("ActorStop for unknown actor %s generation %d", event.AID, event.Generation)
 		}
+		for _, closeEvent := range p.detachActorWebSockets(worker.session.identity, "actor stopped") {
+			worker.events <- closeEvent
+		}
 		worker.events <- event
 	case wire.EventActionCall:
 		worker := p.actor(event.AID, event.Generation)
@@ -1056,6 +1197,31 @@ func (p *Pump) handleInternalEvent(event wire.Event) error {
 		abortErr := errors.New("HTTP request aborted by engine")
 		state.cancel(abortErr)
 		state.body.abort(abortErr)
+	case wire.EventWSOpen:
+		worker := p.currentActor(event.AID)
+		if worker == nil {
+			return fmt.Errorf("WsOpen for unknown actor %s", event.AID)
+		}
+		p.wsMu.Lock()
+		if _, exists := p.websockets[event.WSID]; exists {
+			p.wsMu.Unlock()
+			return fmt.Errorf("duplicate WsOpen ws_id %s", event.WSID)
+		}
+		p.websockets[event.WSID] = worker.session.identity
+		p.wsMu.Unlock()
+		worker.events <- event
+	case wire.EventWSMessage:
+		worker := p.websocketActor(event.WSID)
+		if worker == nil {
+			return nil
+		}
+		worker.events <- event
+	case wire.EventWSClose:
+		worker := p.removeWebSocket(event.WSID)
+		if worker == nil {
+			return nil
+		}
+		worker.events <- event
 	case wire.EventStatePersisted:
 		worker := p.actor(event.AID, event.Generation)
 		if worker == nil {
@@ -1106,6 +1272,11 @@ func (w *actorWorker) run(start wire.Event) {
 	if lifecycleError != nil {
 		return
 	}
+	defer func() {
+		if wsHandler, ok := w.handler.(actorWebSocketHandler); ok {
+			wsHandler.CloseWebSockets(context.Background(), w.session, state)
+		}
+	}()
 
 	for {
 		var event wire.Event
@@ -1147,6 +1318,41 @@ func (w *actorWorker) run(start wire.Event) {
 			if fetchError != nil && fetchError.Code == "handler_panic" {
 				return
 			}
+		case wire.EventWSOpen:
+			openError := invokeWebSocketOpen(w.ctx, w.handler, w.session, event, state)
+			if err := w.pump.submitInternal(w.ctx, wire.Command{
+				Kind:   wire.CommandWSOpenResult,
+				WSID:   event.WSID,
+				Accept: openError == nil,
+				Error:  openError,
+			}); err != nil {
+				w.pump.reportWorkerError(fmt.Errorf("submit WsOpenResult: %w", err))
+				return
+			}
+			if openError != nil {
+				w.pump.removeWebSocket(event.WSID)
+				if openError.Code == "handler_panic" {
+					w.requestErrorStop()
+				}
+			}
+		case wire.EventWSMessage:
+			messageError := invokeWebSocketMessage(w.ctx, w.handler, w.session, event, state)
+			if err := w.pump.submitInternal(w.ctx, wire.Command{
+				Kind:         wire.CommandWSMessageAck,
+				WSID:         event.WSID,
+				MessageIndex: event.MessageIndex,
+			}); err != nil {
+				w.pump.reportWorkerError(fmt.Errorf("submit WsMessageAck: %w", err))
+				return
+			}
+			if messageError != nil && messageError.Code == "handler_panic" {
+				w.requestErrorStop()
+			}
+		case wire.EventWSClose:
+			closeError := invokeWebSocketClose(w.ctx, w.handler, w.session, event, state)
+			if closeError != nil && closeError.Code == "handler_panic" {
+				w.requestErrorStop()
+			}
 		case wire.EventActorStop:
 			lifecycleError = invokeStop(w.ctx, w.handler, w.session, event, state)
 			w.session.closeGracefully()
@@ -1168,6 +1374,15 @@ func (w *actorWorker) run(start wire.Event) {
 			))
 			return
 		}
+	}
+}
+
+func (w *actorWorker) requestErrorStop() {
+	if err := w.pump.submitInternal(w.ctx, wire.Command{
+		Kind: wire.CommandStopIntent,
+		AID:  w.session.AID(),
+	}); err != nil {
+		w.pump.reportWorkerError(fmt.Errorf("submit WebSocket panic StopIntent: %w", err))
 	}
 }
 
@@ -1284,6 +1499,81 @@ func invokeFetch(
 	return nil
 }
 
+func invokeWebSocketOpen(
+	ctx context.Context,
+	handler ActorHandler,
+	session *ActorSession,
+	event wire.Event,
+	state any,
+) (handlerError *wire.WireError) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			handlerError = &wire.WireError{
+				Code:    "handler_panic",
+				Message: fmt.Sprintf("OnConnect panicked: %v", recovered),
+			}
+		}
+	}()
+	wsHandler, ok := handler.(actorWebSocketHandler)
+	if !ok {
+		return &wire.WireError{Code: "callback_not_found", Message: "actor has no OnConnect handler"}
+	}
+	if err := wsHandler.WebSocketOpen(ctx, session, event, state); err != nil {
+		return handlerWireError("OnConnect", err)
+	}
+	return nil
+}
+
+func invokeWebSocketMessage(
+	ctx context.Context,
+	handler ActorHandler,
+	session *ActorSession,
+	event wire.Event,
+	state any,
+) (handlerError *wire.WireError) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			handlerError = &wire.WireError{
+				Code:    "handler_panic",
+				Message: fmt.Sprintf("OnMessage panicked: %v", recovered),
+			}
+		}
+	}()
+	wsHandler, ok := handler.(actorWebSocketHandler)
+	if !ok {
+		return &wire.WireError{Code: "callback_not_found", Message: "actor has no OnMessage handler"}
+	}
+	if err := wsHandler.WebSocketMessage(ctx, session, event, state); err != nil {
+		return handlerWireError("OnMessage", err)
+	}
+	return nil
+}
+
+func invokeWebSocketClose(
+	ctx context.Context,
+	handler ActorHandler,
+	session *ActorSession,
+	event wire.Event,
+	state any,
+) (handlerError *wire.WireError) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			handlerError = &wire.WireError{
+				Code:    "handler_panic",
+				Message: fmt.Sprintf("OnDisconnect panicked: %v", recovered),
+			}
+		}
+	}()
+	wsHandler, ok := handler.(actorWebSocketHandler)
+	if !ok {
+		return nil
+	}
+	if err := wsHandler.WebSocketClose(ctx, session, event, state); err != nil {
+		return handlerWireError("OnDisconnect", err)
+	}
+	return nil
+}
+
 func handlerWireError(operation string, err error) *wire.WireError {
 	var structured HandlerError
 	if errors.As(err, &structured) {
@@ -1299,6 +1589,61 @@ func (p *Pump) actor(aid string, generation uint64) *actorWorker {
 	p.actorsMu.Lock()
 	defer p.actorsMu.Unlock()
 	return p.actors[actorIdentity{aid: aid, generation: generation}]
+}
+
+func (p *Pump) currentActor(aid string) *actorWorker {
+	p.actorsMu.Lock()
+	defer p.actorsMu.Unlock()
+	var current *actorWorker
+	var generation uint64
+	for identity, worker := range p.actors {
+		if identity.aid == aid && (current == nil || identity.generation > generation) {
+			current = worker
+			generation = identity.generation
+		}
+	}
+	return current
+}
+
+func (p *Pump) websocketActor(wsID string) *actorWorker {
+	p.wsMu.Lock()
+	identity, ok := p.websockets[wsID]
+	p.wsMu.Unlock()
+	if !ok {
+		return nil
+	}
+	return p.actor(identity.aid, identity.generation)
+}
+
+func (p *Pump) removeWebSocket(wsID string) *actorWorker {
+	p.wsMu.Lock()
+	identity, ok := p.websockets[wsID]
+	delete(p.websockets, wsID)
+	p.wsMu.Unlock()
+	if !ok {
+		return nil
+	}
+	return p.actor(identity.aid, identity.generation)
+}
+
+func (p *Pump) detachActorWebSockets(identity actorIdentity, reason string) []wire.Event {
+	p.wsMu.Lock()
+	events := make([]wire.Event, 0)
+	code := uint16(1001)
+	for wsID, owner := range p.websockets {
+		if owner != identity {
+			continue
+		}
+		delete(p.websockets, wsID)
+		events = append(events, wire.Event{
+			Kind:      wire.EventWSClose,
+			WSID:      wsID,
+			CloseCode: &code,
+			Reason:    reason,
+		})
+	}
+	p.wsMu.Unlock()
+	return events
 }
 
 func (p *Pump) httpRequest(requestID uint64) *httpRequestState {
@@ -1335,6 +1680,7 @@ func (p *Pump) abortHTTPForActor(identity actorIdentity, cause error) {
 }
 
 func (p *Pump) removeActor(identity actorIdentity, worker *actorWorker) {
+	p.detachActorWebSockets(identity, "actor worker stopped")
 	p.actorsMu.Lock()
 	if p.actors[identity] == worker {
 		delete(p.actors, identity)
