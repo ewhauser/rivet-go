@@ -63,4 +63,5 @@ jobs:
     name: musl targets (TODO)
     runs-on: ubuntu-latest
     steps:
-      - run: echo "TODO M1+: add linux/amd64 and linux/arm64 musl cdylib builders and native smoke tests"
+      - run: |
+          echo "TODO M1+: add linux/amd64 and linux/arm64 musl cdylib builders and native smoke tests"
