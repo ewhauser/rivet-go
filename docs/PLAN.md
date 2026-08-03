@@ -470,6 +470,11 @@ The M5 real-engine suite covers alarm wake with pre-sleep state, clear,
 latest-wins replacement, engine-restart alarm durability, mid-flight sleep
 ordering, repeated sleep/wake state, and a same-socket hibernation cycle with
 post-wake client-to-actor and actor-to-client traffic. It uses timestamp-based
-`eventually` checks and a 45-second wake bound; local alarms were not observed
-to need a coarse tick allowance, while engine restart remains bounded by the
-pin's 22-second envoy liveness window.
+`eventually` checks, a required 10-second future margin after engine-visible
+sleep, and a 90-second wake bound. Repeated race runs showed that 5-second and
+10-second deadlines were too close to v2.3.10 shutdown settlement. The stable
+cases use 20-second and 25-second deadlines. Restart durability uses an
+original 60-second schedule, waits through the pin's 22-second envoy liveness
+window, demand-rehydrates once to make the pin reconcile its persisted core
+schedule after abrupt engine replacement, and resleeps without rescheduling
+before the alarm wake.

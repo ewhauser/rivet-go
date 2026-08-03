@@ -70,7 +70,13 @@ gateway. They require an actor to be absent from the runner
   invokes `OnDisconnect` only for the later real close.
 
 Alarm assertions use engine timestamps and `eventually`, never a fixed sleep
-as the success condition. Ordinary and restart wake checks are bounded at 45
-seconds. That bound is intentionally wider than the observed local alarm
-precision because v2.3.10 can spend roughly 22 seconds detecting and replacing
-an envoy connection after an engine restart.
+as the success condition. Ordinary wake tests use 20-second and 25-second
+deadlines, require at least 10 seconds to remain after engine-visible sleep,
+and use a 90-second wake bound. Short 5-second and 10-second deadlines were not
+stable near v2.3.10 shutdown settlement under repeated race runs.
+
+The restart case uses one original 60-second schedule. After replacing the
+engine process it proves a post-restart envoy ping, waits through the pin's
+22-second liveness interval, demand-rehydrates the actor to reconcile the
+persisted core schedule, confirms the alarm has not fired, and resleeps without
+rescheduling before requiring the engine wake.

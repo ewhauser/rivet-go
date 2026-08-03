@@ -506,8 +506,16 @@ This is the pinned behavior, not a promise that a future core will hide every
 sleep-time close.
 
 Real-engine alarm checks use engine-driven timestamps and the existing
-`eventually` polling discipline. Local v2.3.10 runs fired the 5-second and
-10-second schedules at their requested deadlines without evidence of a coarse
-second-level tolerance. Assertions do not depend on that precision: ordinary
-wake and restart durability use a 45-second bound, which also covers the pin's
-22-second envoy disconnect/reconnect liveness window.
+`eventually` polling discipline. Repeated race-enabled v2.3.10 runs made
+5-second and 10-second deadlines unreliable when they sat close to actor
+shutdown settlement. The exit tests therefore use 20-second and 25-second wake
+deadlines and prove that at least 10 seconds remain after engine-visible sleep;
+the wait bound is 90 seconds and is not a sub-second latency assertion.
+
+After an abrupt engine process replacement, the pinned engine does not
+reliably resume an already-sleeping workflow timer until the actor is
+demand-rehydrated. Restart conformance waits for a post-restart envoy ping and
+the 22-second disconnect/liveness interval, rehydrates the actor once, proves
+the core schedule and pre-restart state survived with no alarm delivery,
+resleeps without rescheduling, and then requires the original 60-second alarm
+to wake it. This is the recovery behavior verified at the pin.

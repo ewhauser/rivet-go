@@ -14,8 +14,13 @@ import (
 )
 
 const (
-	alarmConformanceWindow = 45 * time.Second
+	alarmConformanceWindow = 90 * time.Second
 	alarmClearGrace        = 5 * time.Second
+	alarmSleepDelay        = 20 * time.Second
+	alarmOverwriteFirst    = 5 * time.Second
+	alarmOverwriteLatest   = 25 * time.Second
+	alarmRestartDelay      = 60 * time.Second
+	alarmTransitionMargin  = 10 * time.Second
 )
 
 type schedulingState struct {
@@ -98,6 +103,19 @@ func (o *schedulingObservations) order(actorID string, kinds ...string) bool {
 	return next == len(kinds)
 }
 
+func assertAlarmTransitionMargin(t *testing.T, actorID string, dueMS int64, margin time.Duration) {
+	t.Helper()
+	remaining := time.Until(time.UnixMilli(dueMS))
+	if remaining < margin {
+		t.Fatalf(
+			"actor %s alarm has %s remaining after its engine transition, want at least %s",
+			actorID,
+			remaining.Round(time.Millisecond),
+			margin,
+		)
+	}
+}
+
 func TestSchedulingSleepAndMidflightPolicy(t *testing.T) {
 	if testing.Short() {
 		t.Skip("real-engine conformance is disabled by -short")
@@ -161,8 +179,8 @@ func TestSchedulingSleepAndMidflightPolicy(t *testing.T) {
 			"overwriteSleep": rivet.Action(func(ctx *rivet.Context[schedulingState], _ struct{}) (bool, error) {
 				now := time.Now()
 				ctx.State().Value = "latest"
-				ctx.State().FirstDueMS = now.Add(3 * time.Second).UnixMilli()
-				ctx.State().LatestDueMS = now.Add(10 * time.Second).UnixMilli()
+				ctx.State().FirstDueMS = now.Add(alarmOverwriteFirst).UnixMilli()
+				ctx.State().LatestDueMS = now.Add(alarmOverwriteLatest).UnixMilli()
 				if err := ctx.Schedule(time.UnixMilli(ctx.State().FirstDueMS)); err != nil {
 					return false, err
 				}
@@ -201,12 +219,13 @@ func TestSchedulingSleepAndMidflightPolicy(t *testing.T) {
 	alarmActor := createActor(t, engine.endpoint, "m5-scheduling", runnerName, "restart", nil, nil)
 	firstStart := observations.take(t, alarmActor.ActorID, "start", 30*time.Second)
 	assertSuccessfulAction(t, gatewayAction(t, engine.endpoint, alarmActor.ActorID, "scheduleSleep", []any{
-		schedulingInput{Value: "persisted-before-sleep", DelayMS: 5_000},
+		schedulingInput{Value: "persisted-before-sleep", DelayMS: alarmSleepDelay.Milliseconds()},
 	}, websocketTestTimeout))
-	observations.take(t, alarmActor.ActorID, "stop", 20*time.Second)
+	alarmStop := observations.take(t, alarmActor.ActorID, "stop", 20*time.Second)
 	waitForActor(t, engine.endpoint, alarmActor.ActorID, false, func(actor actorRecord) bool {
 		return actor.ConnectableTS == nil && actor.SleepTS != nil && actor.DestroyTS == nil
 	})
+	assertAlarmTransitionMargin(t, alarmActor.ActorID, alarmStop.state.LatestDueMS, alarmTransitionMargin)
 	alarm := observations.take(t, alarmActor.ActorID, "alarm", alarmConformanceWindow)
 	if alarm.generation <= firstStart.generation || alarm.state.Value != "persisted-before-sleep" || alarm.state.AlarmCount != 0 {
 		t.Fatalf("post-sleep alarm observation = %#v, first start = %#v", alarm, firstStart)
@@ -248,6 +267,7 @@ func TestSchedulingSleepAndMidflightPolicy(t *testing.T) {
 	waitForActor(t, engine.endpoint, overwriteActor.ActorID, false, func(actor actorRecord) bool {
 		return actor.ConnectableTS == nil && actor.SleepTS != nil && actor.DestroyTS == nil
 	})
+	assertAlarmTransitionMargin(t, overwriteActor.ActorID, overwriteStop.state.LatestDueMS, alarmTransitionMargin)
 	firstAlarmGrace := time.UnixMilli(overwriteStop.state.FirstDueMS).Add(3 * time.Second)
 	eventually(t, alarmConformanceWindow, func() (bool, error) {
 		if observations.count(overwriteActor.ActorID, "alarm") != 0 {
@@ -339,7 +359,8 @@ func TestAlarmSurvivesEngineRestart(t *testing.T) {
 			}),
 			"schedule": rivet.Action(func(ctx *rivet.Context[schedulingState], _ struct{}) (bool, error) {
 				ctx.State().Value = "durable-across-engine-restart"
-				if err := ctx.ScheduleAfter(35 * time.Second); err != nil {
+				ctx.State().LatestDueMS = time.Now().Add(alarmRestartDelay).UnixMilli()
+				if err := ctx.ScheduleAfter(alarmRestartDelay); err != nil {
 					return false, err
 				}
 				return true, ctx.Sleep()
@@ -354,21 +375,50 @@ func TestAlarmSurvivesEngineRestart(t *testing.T) {
 	firstStart := observations.take(t, actor.ActorID, "start", 30*time.Second)
 	assertSuccessfulAction(t, gatewayAction(t, engine.endpoint, actor.ActorID, "schedule", []any{struct{}{}}, websocketTestTimeout))
 	observations.take(t, actor.ActorID, "stop", 20*time.Second)
-	waitForActor(t, engine.endpoint, actor.ActorID, false, func(actor actorRecord) bool {
+	sleepingActor := waitForActor(t, engine.endpoint, actor.ActorID, false, func(actor actorRecord) bool {
 		return actor.ConnectableTS == nil && actor.SleepTS != nil && actor.DestroyTS == nil
 	})
+	settledAt := time.UnixMilli(*sleepingActor.SleepTS).Add(3 * time.Second)
+	eventually(t, 10*time.Second, func() (bool, error) {
+		record, err := getActor(engine.endpoint, actor.ActorID, false)
+		if err != nil {
+			return false, err
+		}
+		return !time.Now().Before(settledAt) && record.ConnectableTS == nil && record.SleepTS != nil, nil
+	})
 
+	restartStarted := time.Now().UnixMilli()
 	engine.restart(t)
 	eventually(t, disconnectLivenessWindow+20*time.Second, func() (bool, error) {
 		envoys, err := listEnvoys(engine.endpoint, runnerName)
 		if err != nil {
 			return false, err
 		}
-		return len(envoys) == 1, nil
+		return len(envoys) == 1 && envoys[0].StopTS == nil && envoys[0].LastPingTS >= restartStarted, nil
 	})
+	gatewayReadyAt := time.UnixMilli(restartStarted).Add(disconnectLivenessWindow + 5*time.Second)
+	eventually(t, disconnectLivenessWindow+10*time.Second, func() (bool, error) {
+		return !time.Now().Before(gatewayReadyAt), nil
+	})
+	assertActionOutput(
+		t,
+		gatewayAction(t, engine.endpoint, actor.ActorID, "getAlarmCount", []any{struct{}{}}, websocketTestTimeout),
+		http.StatusOK,
+		0,
+	)
+	restartStart := observations.take(t, actor.ActorID, "start", 30*time.Second)
+	if restartStart.generation <= firstStart.generation || restartStart.state.Value != "durable-across-engine-restart" {
+		t.Fatalf("post-restart rehydration = %#v, first start = %#v", restartStart, firstStart)
+	}
+	assertSuccessfulAction(t, gatewayAction(t, engine.endpoint, actor.ActorID, "sleep", []any{struct{}{}}, websocketTestTimeout))
+	postRestartStop := observations.take(t, actor.ActorID, "stop", 20*time.Second)
+	waitForActor(t, engine.endpoint, actor.ActorID, false, func(actor actorRecord) bool {
+		return actor.ConnectableTS == nil && actor.SleepTS != nil && actor.DestroyTS == nil
+	})
+	assertAlarmTransitionMargin(t, actor.ActorID, postRestartStop.state.LatestDueMS, alarmTransitionMargin)
 	alarm := observations.take(t, actor.ActorID, "alarm", alarmConformanceWindow)
-	if alarm.generation <= firstStart.generation || alarm.state.Value != "durable-across-engine-restart" {
-		t.Fatalf("post-restart alarm = %#v, first start = %#v", alarm, firstStart)
+	if alarm.generation <= restartStart.generation || alarm.state.Value != "durable-across-engine-restart" {
+		t.Fatalf("post-restart alarm = %#v, restart start = %#v", alarm, restartStart)
 	}
 	assertActionOutput(
 		t,

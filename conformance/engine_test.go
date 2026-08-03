@@ -57,10 +57,11 @@ type envoyListResponse struct {
 }
 
 type envoyRecord struct {
-	EnvoyKey string `json:"envoy_key"`
-	PoolName string `json:"pool_name"`
-	StopTS   *int64 `json:"stop_ts"`
-	Version  int    `json:"version"`
+	EnvoyKey   string `json:"envoy_key"`
+	PoolName   string `json:"pool_name"`
+	StopTS     *int64 `json:"stop_ts"`
+	LastPingTS int64  `json:"last_ping_ts"`
+	Version    int    `json:"version"`
 }
 
 type actorListResponse struct {
