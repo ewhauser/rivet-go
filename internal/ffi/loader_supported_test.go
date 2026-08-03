@@ -73,11 +73,11 @@ func TestEmbeddedDiskManifestAndLoadedArtifactAgree(t *testing.T) {
 	}
 }
 
-func TestRunnerNewReturnsStructuredNotImplemented(t *testing.T) {
+func TestRunnerNewRejectsInvalidConfig(t *testing.T) {
 	config, err := msgpack.Marshal(map[string]any{
-		"endpoint":    "http://127.0.0.1:6420",
-		"namespace":   "default",
-		"runner_name": "m0-test",
+		"engine_endpoint": "http://127.0.0.1:6420",
+		"namespace":       "default",
+		"runner_name":     "m0-test",
 	})
 	if err != nil {
 		t.Fatalf("marshal config: %v", err)
@@ -98,11 +98,11 @@ func TestRunnerNewReturnsStructuredNotImplemented(t *testing.T) {
 	if err != nil {
 		t.Fatalf("decode error payload: %v", err)
 	}
-	if payload.Code != "not_implemented" {
-		t.Fatalf("error code = %q, want not_implemented", payload.Code)
+	if payload.Code != "invalid_config" {
+		t.Fatalf("error code = %q, want invalid_config", payload.Code)
 	}
-	if !strings.Contains(payload.Message, "rk_runner_new") {
-		t.Fatalf("error message %q does not name rk_runner_new", payload.Message)
+	if !strings.Contains(payload.Message, "RunnerConfig") {
+		t.Fatalf("error message %q does not identify RunnerConfig", payload.Message)
 	}
 }
 
@@ -141,7 +141,7 @@ func TestPanicFirewallThroughLoadedLibrary(t *testing.T) {
 	}
 }
 
-func TestAllM0BindingsMatchTheHeader(t *testing.T) {
+func TestAllBindingsRejectNullRunner(t *testing.T) {
 	if err := Load(); err != nil {
 		t.Fatalf("Load: %v", err)
 	}
@@ -169,11 +169,11 @@ func TestAllM0BindingsMatchTheHeader(t *testing.T) {
 			if err != nil {
 				t.Fatalf("decode error: %v", err)
 			}
-			if payload.Code != "not_implemented" {
-				t.Fatalf("error code = %q, want not_implemented", payload.Code)
+			if payload.Code != "invalid_runner" {
+				t.Fatalf("error code = %q, want invalid_runner", payload.Code)
 			}
-			if !strings.Contains(payload.Message, test.name) {
-				t.Fatalf("error message %q does not name %s", payload.Message, test.name)
+			if !strings.Contains(payload.Message, "null") {
+				t.Fatalf("error message %q does not identify the null handle for %s", payload.Message, test.name)
 			}
 		})
 	}

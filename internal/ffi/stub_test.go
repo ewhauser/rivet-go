@@ -5,6 +5,7 @@ package ffi
 import (
 	"errors"
 	"testing"
+	"time"
 )
 
 func TestUnsupportedPlatformReturnsErrors(t *testing.T) {
@@ -19,6 +20,15 @@ func TestUnsupportedPlatformReturnsErrors(t *testing.T) {
 	}
 
 	var runner *Runner
+	if data, err := runner.Poll(time.Millisecond); data != nil || !errors.Is(err, errUnsupportedPlatform) {
+		t.Fatalf("Runner.Poll = (%v, %v), want (nil, %v)", data, err, errUnsupportedPlatform)
+	}
+	if err := runner.Submit(nil); !errors.Is(err, errUnsupportedPlatform) {
+		t.Fatalf("Runner.Submit error = %v, want %v", err, errUnsupportedPlatform)
+	}
+	if err := runner.Shutdown(time.Millisecond); !errors.Is(err, errUnsupportedPlatform) {
+		t.Fatalf("Runner.Shutdown error = %v, want %v", err, errUnsupportedPlatform)
+	}
 	runner.Close()
 	var nativeError *Error
 	if data, err := nativeError.JSON(); data != nil || !errors.Is(err, errUnsupportedPlatform) {

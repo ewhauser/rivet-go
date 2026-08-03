@@ -17,6 +17,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"time"
 	"unsafe"
 
 	"github.com/ebitengine/purego"
@@ -72,6 +73,7 @@ type embeddedLibrary struct {
 
 // Runner is an owned native runner handle.
 type Runner struct {
+	mu   sync.RWMutex
 	ptr  *cRunner
 	once sync.Once
 }
@@ -92,6 +94,13 @@ type RunnerResult struct {
 type ErrorPayload struct {
 	Code    string `json:"code"`
 	Message string `json:"message"`
+}
+
+func (e ErrorPayload) Error() string {
+	if e.Code == "" {
+		return e.Message
+	}
+	return fmt.Sprintf("%s: %s", e.Code, e.Message)
 }
 
 // Load extracts, verifies, opens, and binds the embedded native library.
@@ -184,8 +193,8 @@ func ABIVersion() (uint32, error) {
 	return api.abiVersion(), nil
 }
 
-// NewRunner calls the M0 runner constructor. It currently returns a structured
-// not_implemented error from Rust.
+// NewRunner starts the native runner and waits for bounded engine
+// registration. Native failures are returned in RunnerResult.Error.
 func NewRunner(config []byte) (RunnerResult, error) {
 	if err := Load(); err != nil {
 		return RunnerResult{}, err
@@ -227,11 +236,102 @@ func (r *Runner) Close() {
 	}
 	r.once.Do(func() {
 		runtime.SetFinalizer(r, nil)
+		r.mu.Lock()
+		defer r.mu.Unlock()
 		if r.ptr != nil {
 			api.runnerFree(r.ptr)
 			r.ptr = nil
 		}
 	})
+}
+
+// Poll blocks for at most timeout and copies the returned EventBatch into Go
+// memory before releasing its native buffer.
+func (r *Runner) Poll(timeout time.Duration) ([]byte, error) {
+	if r == nil {
+		return nil, errors.New("native runner is nil")
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	if r.ptr == nil {
+		return nil, errors.New("native runner is closed")
+	}
+	result := api.runnerPoll(r.ptr, durationMillis(timeout))
+	runtime.KeepAlive(r)
+	if result.err != nil {
+		return nil, consumeNativeError(result.err)
+	}
+	if result.payload.ptr == nil {
+		if result.payload.len == 0 {
+			return nil, nil
+		}
+		return nil, errors.New("native poll returned a nil pointer with non-zero length")
+	}
+	defer api.bytesFree(result.payload)
+	return append([]byte(nil), unsafe.Slice(result.payload.ptr, result.payload.len)...), nil
+}
+
+// Submit enqueues an encoded CommandBatch. It is safe to call concurrently.
+func (r *Runner) Submit(batch []byte) error {
+	if r == nil {
+		return errors.New("native runner is nil")
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	if r.ptr == nil {
+		return errors.New("native runner is closed")
+	}
+	var batchPtr *byte
+	if len(batch) > 0 {
+		batchPtr = unsafe.SliceData(batch)
+	}
+	result := api.runnerSubmit(r.ptr, batchPtr, uintptr(len(batch)))
+	runtime.KeepAlive(batch)
+	runtime.KeepAlive(r)
+	if result.err != nil {
+		return consumeNativeError(result.err)
+	}
+	return nil
+}
+
+// Shutdown begins the graceful drain. Poll remains valid until it returns a
+// RunnerStopped event.
+func (r *Runner) Shutdown(deadline time.Duration) error {
+	if r == nil {
+		return errors.New("native runner is nil")
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	if r.ptr == nil {
+		return errors.New("native runner is closed")
+	}
+	result := api.runnerShutdown(r.ptr, durationMillis(deadline))
+	runtime.KeepAlive(r)
+	if result.err != nil {
+		return consumeNativeError(result.err)
+	}
+	return nil
+}
+
+func durationMillis(duration time.Duration) uint32 {
+	if duration <= 0 {
+		return 0
+	}
+	millis := duration.Milliseconds()
+	if millis > int64(^uint32(0)) {
+		return ^uint32(0)
+	}
+	return uint32(millis)
+}
+
+func consumeNativeError(ptr *cError) error {
+	nativeError := &Error{ptr: ptr}
+	payload, err := nativeError.Payload()
+	nativeError.Close()
+	if err != nil {
+		return fmt.Errorf("decode native error: %w", err)
+	}
+	return payload
 }
 
 // JSON copies the native error's JSON representation into Go memory.
