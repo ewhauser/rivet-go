@@ -9,6 +9,7 @@ documentation = true
 parse_deps = false
 
 [export]
+exclude = ["rk_test_panic"]
 include = [
   "RK_ABI_VERSION",
   "RkBytes",
@@ -28,4 +29,3 @@ include = [
   "rk_runner_submit",
   "rk_runner_shutdown",
 ]
-

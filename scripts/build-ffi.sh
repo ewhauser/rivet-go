@@ -68,17 +68,74 @@ case "$target" in
     ;;
 esac
 
-if [[ "$target" == *-musl ]]; then
-  echo "TODO: musl shared-library builds require a dedicated builder" >&2
-  exit 1
+echo "Building rivetkit-go-ffi for $target"
+host_target="$(rustc -vV | awk '/^host: / { print $2 }')"
+build_command=(cargo build)
+build_target="$target"
+cross_rustc=""
+if [[ "$target" == *-unknown-linux-* || "$target" != "$host_target" ]]; then
+  cross_cargo=(cargo)
+  if command -v rustup >/dev/null 2>&1 && rustup run 1.97.0 rustc --version >/dev/null 2>&1; then
+    cross_cargo=(rustup run 1.97.0 cargo)
+    cross_rustc="$(rustup which --toolchain 1.97.0 rustc)"
+  fi
+  case "$target" in
+    *-unknown-linux-gnu)
+      if ! command -v zig >/dev/null 2>&1 || ! cargo zigbuild --help >/dev/null 2>&1; then
+        echo "zig and cargo-zigbuild are required to build $target reproducibly" >&2
+        exit 1
+      fi
+      build_command=("${cross_cargo[@]}" zigbuild)
+      build_target="$target.2.17"
+      ;;
+    *-unknown-linux-musl)
+      if ! command -v zig >/dev/null 2>&1 || ! cargo zigbuild --help >/dev/null 2>&1; then
+        echo "zig and cargo-zigbuild are required to build $target reproducibly" >&2
+        exit 1
+      fi
+      build_command=("${cross_cargo[@]}" zigbuild)
+      ;;
+    *-pc-windows-msvc)
+      if ! cargo xwin --help >/dev/null 2>&1; then
+        echo "cargo-xwin is required to cross-compile $target" >&2
+        exit 1
+      fi
+      if ! command -v lld-link >/dev/null 2>&1 && [[ -x /opt/homebrew/opt/lld@21/bin/lld-link ]]; then
+        export PATH="/opt/homebrew/opt/lld@21/bin:$PATH"
+      fi
+      if ! command -v lld-link >/dev/null 2>&1; then
+        echo "lld-link is required to cross-compile $target" >&2
+        exit 1
+      fi
+      build_command=("${cross_cargo[@]}" xwin build)
+      ;;
+    *)
+      if ! command -v zig >/dev/null 2>&1 || ! cargo zigbuild --help >/dev/null 2>&1; then
+        echo "zig and cargo-zigbuild are required to cross-compile $target" >&2
+        exit 1
+      fi
+      build_command=("${cross_cargo[@]}" zigbuild)
+      ;;
+  esac
 fi
 
-echo "Building rivetkit-go-ffi for $target"
-cargo build \
+if [[ -n "$cross_rustc" ]]; then
+  export RUSTC="$cross_rustc"
+fi
+unset RUSTFLAGS CARGO_ENCODED_RUSTFLAGS
+if [[ "$target" == *-unknown-linux-musl ]]; then
+  export RUSTFLAGS="-C target-feature=-crt-static"
+elif [[ "$target" == *-pc-windows-msvc ]]; then
+  export RUSTFLAGS="-C target-feature=+crt-static -C link-arg=/ignore:4099"
+fi
+
+"${build_command[@]}" \
   --manifest-path "$ROOT_DIR/Cargo.toml" \
   --package rivetkit-go-ffi \
+  --features ffi-test \
+  --locked \
   --release \
-  --target "$target"
+  --target "$build_target"
 
 artifact="$ROOT_DIR/target/$target/release/$artifact_name"
 if [[ ! -f "$artifact" ]]; then
@@ -92,10 +149,17 @@ cp "$artifact" "$lib_dir/$artifact_name"
 
 case "$target" in
   *-apple-darwin)
+    install_name_tool -id "@rpath/$artifact_name" "$lib_dir/$artifact_name"
     strip -x "$lib_dir/$artifact_name"
     ;;
-  *-unknown-linux-gnu)
-    strip --strip-unneeded "$lib_dir/$artifact_name"
+  *-unknown-linux-*)
+    if command -v llvm-strip >/dev/null 2>&1; then
+      llvm-strip --strip-unneeded "$lib_dir/$artifact_name"
+    elif [[ -x /opt/homebrew/opt/llvm/bin/llvm-strip ]]; then
+      /opt/homebrew/opt/llvm/bin/llvm-strip --strip-unneeded "$lib_dir/$artifact_name"
+    else
+      strip --strip-unneeded "$lib_dir/$artifact_name"
+    fi
     ;;
   *-pc-windows-msvc)
     if command -v llvm-strip >/dev/null 2>&1; then
@@ -147,4 +211,3 @@ if [[ ! -f "$CHECKSUMS_PATH" ]] || ! cmp -s "$checksums_tmp" "$CHECKSUMS_PATH"; 
 fi
 
 echo "Wrote internal/ffi/lib/$platform/$artifact_name"
-

@@ -1,4 +1,4 @@
-//go:build darwin && arm64
+//go:build !rivetgo_ffi_stub && darwin && arm64
 
 package ffi
 
@@ -11,3 +11,8 @@ const (
 	embeddedLibraryDir      = "lib/darwin_arm64"
 	embeddedLibraryFilename = "librivetkit_go_ffi.dylib"
 )
+
+var embeddedLibraries = []embeddedLibrary{{
+	dir:      embeddedLibraryDir,
+	filename: embeddedLibraryFilename,
+}}

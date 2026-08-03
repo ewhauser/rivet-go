@@ -11,12 +11,23 @@ use std::ptr;
 
 use serde::{Deserialize, Serialize};
 
+#[cfg(panic = "abort")]
+compile_error!("rivetkit-go-ffi requires panic=unwind for its C ABI firewall");
+
 /// The single source of truth for the native ABI version.
 pub const RK_ABI_VERSION: u32 = 1;
 
-// This compile-time assertion makes the rivetkit-core pin load-bearing without
-// exporting any upstream symbol through our ABI.
-const _: fn(&rivetkit_core::ActorKey) -> String = rivetkit_core::format_actor_key;
+// Keep the upstream dependency in the release dylib rather than merely in the
+// Cargo graph. Calling a small, stable core helper makes both the selected API
+// and its implementation load-bearing while keeping upstream types private to
+// this crate.
+#[inline(never)]
+fn core_pin_probe() -> bool {
+    use rivetkit_core::{ActorKey, ActorKeySegment, format_actor_key};
+
+    let key: ActorKey = vec![ActorKeySegment::String("rivet-go".to_owned())];
+    std::hint::black_box(format_actor_key(std::hint::black_box(&key))) == "rivet-go"
+}
 
 /// An owned byte buffer allocated by Rust.
 #[repr(C)]
@@ -176,7 +187,10 @@ fn free_bytes(bytes: RkBytes) {
 /// Returns the native ABI version expected by the generated Go binding.
 #[unsafe(no_mangle)]
 pub extern "C" fn rk_abi_version() -> u32 {
-    catch_unwind(AssertUnwindSafe(|| RK_ABI_VERSION)).unwrap_or(0)
+    catch_unwind(AssertUnwindSafe(|| {
+        if core_pin_probe() { RK_ABI_VERSION } else { 0 }
+    }))
+    .unwrap_or(0)
 }
 
 /// Releases an owned byte buffer returned by Rust.
@@ -267,9 +281,12 @@ pub extern "C" fn rk_runner_shutdown(_runner: *mut RkRunner, _deadline_ms: u32) 
     firewall_submit(|| Err(ErrorPayload::not_implemented("rk_runner_shutdown")))
 }
 
-#[cfg(test)]
+// This probe is deliberately excluded from the generated public header. The
+// build script enables it only so Go tests can prove that a panic originating
+// inside the loaded cdylib is caught before returning across extern "C".
+#[cfg(any(test, feature = "ffi-test"))]
 #[unsafe(no_mangle)]
-extern "C" fn rk_test_panic() -> RkSubmitResult {
+pub extern "C" fn rk_test_panic() -> RkSubmitResult {
     firewall_submit(|| panic!("panic firewall probe"))
 }
 
@@ -306,5 +323,10 @@ mod tests {
         let error = decode_and_free(result.err);
         assert_eq!(error.code, "internal_panic");
         assert_eq!(error.message, "panic firewall probe");
+    }
+
+    #[test]
+    fn pinned_core_probe_executes_upstream_code() {
+        assert!(core_pin_probe());
     }
 }

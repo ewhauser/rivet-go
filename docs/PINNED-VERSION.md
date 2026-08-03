@@ -13,7 +13,7 @@ select either its native or WASM WebSocket transport. `native-runtime` is the
 smallest feature that satisfies that requirement on macOS; no SQLite feature is
 enabled, and M0 does not instantiate the runtime or a storage backend.
 
-The FFI crate has a compile-time assertion against the real
-`rivetkit_core::format_actor_key` function. That assertion makes the exact
-upstream pin a load-bearing build dependency without leaking an upstream type
-or function into the C ABI.
+`rk_abi_version` executes a small probe through the real
+`rivetkit_core::format_actor_key` function. That call keeps upstream core code
+in the release dylib and makes the exact pin a load-bearing build dependency
+without leaking an upstream type or function into the public C ABI.

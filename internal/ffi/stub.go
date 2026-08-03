@@ -1,10 +1,10 @@
-//go:build !(darwin && arm64)
+//go:build rivetgo_ffi_stub || !((darwin && arm64) || (linux && (amd64 || arm64)) || (windows && amd64))
 
 package ffi
 
 import "errors"
 
-var errUnsupportedPlatform = errors.New("rivet-go native FFI is unsupported on this platform; M0 supports darwin/arm64")
+var errUnsupportedPlatform = errors.New("rivet-go native FFI is unsupported on this platform")
 
 // Runner is the unsupported-platform runner stub.
 type Runner struct{}
