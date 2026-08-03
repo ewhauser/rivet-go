@@ -11,6 +11,10 @@ func FuzzDecodeEventBatch(f *testing.F) {
 		"event_connected.msgpack",
 		"event_disconnected.msgpack",
 		"event_stopped.msgpack",
+		"event_actor_start.msgpack",
+		"event_actor_stop.msgpack",
+		"event_kv_result.msgpack",
+		"event_state_persisted.msgpack",
 	} {
 		data, err := os.ReadFile(filepath.Join("testdata", name))
 		if err != nil {
