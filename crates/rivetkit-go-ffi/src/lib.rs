@@ -1,8 +1,7 @@
 //! Stable C ABI used by the pure-Go loader.
 //!
-//! M0 deliberately implements only ABI identity, owned buffers, structured
-//! errors, and not-implemented runner entry points. Runner behavior begins in
-//! M1.
+//! The boundary owns the RivetKit runtime and exposes it as a callback-free
+//! event pump to Go.
 
 use std::any::Any;
 use std::mem;
@@ -10,6 +9,13 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::ptr;
 
 use serde::{Deserialize, Serialize};
+
+mod correlation;
+mod runner;
+mod wire;
+
+use runner::RunnerInner;
+use wire::RunnerConfig;
 
 #[cfg(panic = "abort")]
 compile_error!("rivetkit-go-ffi requires panic=unwind for its C ABI firewall");
@@ -55,7 +61,7 @@ pub struct RkError {
     _private: [u8; 0],
 }
 
-/// Opaque runner handle. M0 never creates one.
+/// Opaque runner handle.
 pub struct RkRunner {
     _private: [u8; 0],
 }
@@ -78,16 +84,16 @@ pub struct RkSubmitResult {
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
-struct ErrorPayload {
-    code: String,
-    message: String,
+pub(crate) struct ErrorPayload {
+    pub(crate) code: String,
+    pub(crate) message: String,
 }
 
 impl ErrorPayload {
-    fn not_implemented(function: &str) -> Self {
+    pub(crate) fn new(code: impl Into<String>, message: impl Into<String>) -> Self {
         Self {
-            code: "not_implemented".to_owned(),
-            message: format!("{function} is not implemented in M0"),
+            code: code.into(),
+            message: message.into(),
         }
     }
 
@@ -108,6 +114,34 @@ impl ErrorPayload {
 
 fn error_into_raw(error: ErrorPayload) -> *mut RkError {
     Box::into_raw(Box::new(error)).cast()
+}
+
+fn runner_into_raw(runner: Box<RunnerInner>) -> *mut RkRunner {
+    Box::into_raw(runner).cast()
+}
+
+unsafe fn runner_ref<'a>(runner: *const RkRunner) -> Result<&'a RunnerInner, ErrorPayload> {
+    if runner.is_null() {
+        return Err(ErrorPayload::new("invalid_runner", "runner handle is null"));
+    }
+    // SAFETY: The ownership contract requires a live RkRunner allocated by
+    // runner_into_raw. Go serializes Close against all borrowed calls.
+    Ok(unsafe { &*runner.cast::<RunnerInner>() })
+}
+
+unsafe fn borrowed_bytes<'a>(ptr: *const u8, len: usize) -> Result<&'a [u8], ErrorPayload> {
+    if ptr.is_null() {
+        if len == 0 {
+            return Ok(&[]);
+        }
+        return Err(ErrorPayload::new(
+            "invalid_buffer",
+            "buffer pointer is null with non-zero length",
+        ));
+    }
+    // SAFETY: The caller promises that ptr addresses len readable bytes for
+    // the duration of this call.
+    Ok(unsafe { std::slice::from_raw_parts(ptr, len) })
 }
 
 unsafe fn error_ref<'a>(error: *const RkError) -> &'a ErrorPayload {
@@ -246,39 +280,93 @@ pub unsafe extern "C" fn rk_error_free(error: *mut RkError) {
     }));
 }
 
-/// Creates a runner. M0 returns a structured not-implemented error.
+/// Creates a runner and waits for bounded, management-API-confirmed engine
+/// registration before returning its owned handle.
+///
+/// # Safety
+///
+/// `config` must be null when `config_len` is zero or point to
+/// `config_len` readable bytes for this call.
 #[unsafe(no_mangle)]
-pub extern "C" fn rk_runner_new(_config: *const u8, _config_len: usize) -> RkRunnerResult {
-    firewall_runner(|| Err(ErrorPayload::not_implemented("rk_runner_new")))
+pub unsafe extern "C" fn rk_runner_new(config: *const u8, config_len: usize) -> RkRunnerResult {
+    firewall_runner(|| {
+        // SAFETY: Forwarding the caller's buffer promise.
+        let bytes = unsafe { borrowed_bytes(config, config_len) }?;
+        let config: RunnerConfig = rmp_serde::from_slice(bytes).map_err(|error| {
+            ErrorPayload::new(
+                "invalid_config",
+                format!("decode MessagePack RunnerConfig: {error}"),
+            )
+        })?;
+        RunnerInner::start(config).map(runner_into_raw)
+    })
 }
 
-/// Releases a runner handle. M0 has no constructible runner handles.
+/// Releases a runner handle, forcing a bounded drain if shutdown was omitted.
+///
+/// # Safety
+///
+/// `runner` must be null or a live handle returned by `rk_runner_new` that has
+/// not already been freed. No other call may borrow it concurrently.
 #[unsafe(no_mangle)]
-pub extern "C" fn rk_runner_free(_runner: *mut RkRunner) {
-    let _ = catch_unwind(AssertUnwindSafe(|| {}));
+pub unsafe extern "C" fn rk_runner_free(runner: *mut RkRunner) {
+    let _ = catch_unwind(AssertUnwindSafe(|| {
+        if !runner.is_null() {
+            // SAFETY: The caller transfers the single live allocation back.
+            let runner = unsafe { Box::from_raw(runner.cast::<RunnerInner>()) };
+            runner.close();
+        }
+    }));
 }
 
-/// Polls a runner. M0 returns a structured not-implemented error.
+/// Polls a runner for an encoded EventBatch.
+///
+/// # Safety
+///
+/// `runner` must be a live handle for the duration of this call.
 #[unsafe(no_mangle)]
-pub extern "C" fn rk_runner_poll(_runner: *mut RkRunner, _timeout_ms: u32) -> RkPollResult {
-    firewall_poll(|| Err(ErrorPayload::not_implemented("rk_runner_poll")))
+pub unsafe extern "C" fn rk_runner_poll(runner: *mut RkRunner, timeout_ms: u32) -> RkPollResult {
+    firewall_poll(|| {
+        // SAFETY: Forwarding the caller's live-handle promise.
+        let runner = unsafe { runner_ref(runner) }?;
+        runner.poll(timeout_ms).map(RkBytes::from_vec)
+    })
 }
 
-/// Submits a command batch. M0 returns a structured not-implemented error.
+/// Submits an encoded CommandBatch without blocking on command execution.
+///
+/// # Safety
+///
+/// `runner` must be live and `batch` must satisfy the borrowed-buffer rules.
 #[unsafe(no_mangle)]
-pub extern "C" fn rk_runner_submit(
-    _runner: *mut RkRunner,
-    _batch: *const u8,
+pub unsafe extern "C" fn rk_runner_submit(
+    runner: *mut RkRunner,
+    batch: *const u8,
     len: usize,
 ) -> RkSubmitResult {
-    let _ = len;
-    firewall_submit(|| Err(ErrorPayload::not_implemented("rk_runner_submit")))
+    firewall_submit(|| {
+        // SAFETY: Forwarding the caller's live-handle and buffer promises.
+        let runner = unsafe { runner_ref(runner) }?;
+        let batch = unsafe { borrowed_bytes(batch, len) }?;
+        runner.submit(batch)
+    })
 }
 
-/// Begins graceful shutdown. M0 returns a structured not-implemented error.
+/// Begins graceful shutdown; polling continues through RunnerStopped.
+///
+/// # Safety
+///
+/// `runner` must be a live handle for the duration of this call.
 #[unsafe(no_mangle)]
-pub extern "C" fn rk_runner_shutdown(_runner: *mut RkRunner, _deadline_ms: u32) -> RkSubmitResult {
-    firewall_submit(|| Err(ErrorPayload::not_implemented("rk_runner_shutdown")))
+pub unsafe extern "C" fn rk_runner_shutdown(
+    runner: *mut RkRunner,
+    deadline_ms: u32,
+) -> RkSubmitResult {
+    firewall_submit(|| {
+        // SAFETY: Forwarding the caller's live-handle promise.
+        let runner = unsafe { runner_ref(runner) }?;
+        runner.shutdown(deadline_ms)
+    })
 }
 
 // This probe is deliberately excluded from the generated public header. The
@@ -309,12 +397,12 @@ mod tests {
 
     #[test]
     fn error_json_round_trip() {
-        let result = rk_runner_new(ptr::null(), 0);
+        // SAFETY: null plus zero length is a valid borrowed empty buffer.
+        let result = unsafe { rk_runner_new(ptr::null(), 0) };
         assert!(result.runner.is_null());
-        assert_eq!(
-            decode_and_free(result.err),
-            ErrorPayload::not_implemented("rk_runner_new")
-        );
+        let error = decode_and_free(result.err);
+        assert_eq!(error.code, "invalid_config");
+        assert!(error.message.contains("MessagePack RunnerConfig"));
     }
 
     #[test]

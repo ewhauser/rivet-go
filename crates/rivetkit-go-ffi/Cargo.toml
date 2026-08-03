@@ -13,9 +13,20 @@ crate-type = ["cdylib", "rlib"]
 ffi-test = []
 
 [dependencies]
+anyhow = "1"
+crossbeam-channel = "0.5"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+rmp-serde = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time"] }
+tokio-util = "0.7"
+url = "2"
 
 # v2.3.10 is the newest stable, non-RC engine release in rivet-dev/rivet as of
 # 2026-08-02. Keep this exact tag in sync with docs/PINNED-VERSION.md.
 rivetkit-core = { git = "https://github.com/rivet-dev/rivet", tag = "v2.3.10", default-features = false, features = ["native-runtime"] }
+
+[dev-dependencies]
+proptest = "1"
+tempfile = "3"
