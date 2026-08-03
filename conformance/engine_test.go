@@ -77,6 +77,7 @@ type actorRecord struct {
 	Key           *string         `json:"key"`
 	CreateTS      int64           `json:"create_ts"`
 	ConnectableTS *int64          `json:"connectable_ts"`
+	SleepTS       *int64          `json:"sleep_ts"`
 	DestroyTS     *int64          `json:"destroy_ts"`
 	Error         json.RawMessage `json:"error"`
 }

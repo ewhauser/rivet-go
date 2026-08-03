@@ -105,7 +105,7 @@ instance ID, `gen` = generation; both assigned by core.
 | `HttpRequest` | aid, req_id, method, path, headers, body?, stream flag | `HttpResponseStart` (+ chunks) |
 | `HttpRequestChunk` | req_id, body, finish | — (feeds request body reader) |
 | `HttpRequestAbort` | req_id | abort handler ctx |
-| `WsOpen` | aid, ws_id, path, headers, can_hibernate | `WsOpenResult { ws_id, accept / reject }` |
+| `WsOpen` | aid, ws_id, path, headers, can_hibernate, resumed | `WsOpenResult { ws_id, accept / reject }` |
 | `WsMessage` | ws_id, data, binary, msg_index | `WsMessageAck { ws_id, msg_index }` (hibernation bookkeeping) |
 | `WsClose` | ws_id, code?, reason? | — |
 | `KvResult` | kv_id, ok payload / error | — (completes pending Go future) |
@@ -161,9 +161,9 @@ most bug-prone structure in the crate; it gets dedicated loom/proptest coverage.
 2. **Resolved in the M3 notes below.** The pinned core normalizes action args
    to CBOR before the embedder callback, so the boundary passes those bytes
    through unchanged.
-3. Hibernating WS resume: how much of the `msg_index` replay bookkeeping does
-   core hide from its embedder vs expect the embedder to persist? Check what
-   rivetkit-napi exposes to JS.
+3. **Resolved in the M5 notes below.** Core persists the transport metadata and
+   message indexes; the embedder must not return from a hibernatable raw-message
+   callback until its handler has durably accepted the message.
 4. Whether `rk_runner_poll` should also carry a wakeup fd/eventfd alternative
    for integration with Go netpoller — only if the pinned thread ever shows up
    as a real cost.
@@ -426,3 +426,84 @@ non-hibernating path in M4. Core currently persists and acknowledges a
 hibernating raw message after its embedder callback returns, which happens
 before the asynchronous Go handler completes; M5 must reconcile that pin
 behavior with durable replay before enabling hibernation.
+
+## M5 pin-specific notes — 2026-08-03
+
+M5 adds `ActorAlarm`, `AlarmHandled`, `SetAlarm`, and `SleepIntent`, adds the
+`WsOpen.resumed` marker, and bumps the boundary ABI to 5. The shape scanner
+limits remain unchanged: alarm timestamps and generations are fixed-width
+integers, actor IDs use the existing string cap, and no new blob, map, or
+container surface is introduced. Rust produces the M5 command and alarm-event
+goldens; Go decodes and re-encodes them byte-for-byte.
+
+The public SDK presents one durable alarm per actor. `SetAlarm` is implemented
+with the pinned core's persisted one-shot schedule table using the reserved
+action name `__rivet_go_alarm`, rather than with an embedder-owned timer.
+Replacement and clear operations are revisioned and serialized; the latest
+accepted command cancels any prior reserved schedule before optionally adding
+the new timestamp. Other core schedule rows are untouched. The reserved action
+cannot be registered by an actor author. When core fires it, the FFI converts
+the scheduled action to `ActorAlarm`, waits for `AlarmHandled`, and replies to
+core only after the Go hook and its implicit state save complete. Core owns the
+SQLite schedule durability, engine alarm transport, restart resynchronization,
+and wake allocation.
+
+`SleepIntent` calls `ActorContext::sleep`. The per-actor Go worker serializes
+actions, alarms, HTTP handlers, WebSocket callbacks, and lifecycle hooks. A
+handler that requests sleep therefore finishes normally before `OnStop`; a
+successful action's implicit save and result, an HTTP response, or a WebSocket
+message acknowledgement is submitted before the worker can process
+`ActorStop`. Rust additionally reserves explicit state and alarm mutations and
+does not resolve `ActorStopResult` until those accepted operations are idle.
+Once stop acknowledgement begins, new actor-scoped state work is rejected.
+Existing action deadlines, engine HTTP aborts, and runner-shutdown cancellation
+remain the only abort paths; sleep does not add a second cancellation policy.
+`ActorStop.reason` is `sleep` for engine sleep, `stop` for the actor-local
+`StopIntent` panic path, and `destroy` for an engine destroy.
+
+The hibernatable raw-message callback has a 60-second boundary acknowledgement
+limit. If Go has not returned and acknowledged by then, the FFI closes that
+connection with code 1011 and reason `ws.handler_ack_timed_out` and returns an
+error to core. Go handlers remain cooperatively cancellable; the timeout does
+not preempt arbitrary Go code, and the actor worker stays serialized until the
+handler returns or runner shutdown cancels the generation.
+
+Open question 3 is resolved at v2.3.10 as follows:
+
+- core persists each hibernatable connection's gateway/request identity,
+  request path and headers, client message index, server message index, and
+  embedder connection-state bytes in actor SQLite;
+- core restores those handles at actor startup, passes them through
+  `ActorStart.hibernated`, and privately supplies the corresponding
+  `CommandStartActor.hibernatingRequests` metadata to the envoy client. The
+  embedder never sees or reconstructs gateway/request IDs;
+- the envoy client rebuilds the raw `WebSocket` transport and invokes core's
+  WebSocket callback with its restoring flag. The FFI emits
+  `WsOpen { resumed: true }`, installs fresh callbacks for the new actor
+  generation, and Go rebuilds its internal `Connection` without invoking the
+  actor author's `OnConnect`;
+- for a hibernatable incoming message, core advances and persists the client
+  index and acknowledges the engine only after the embedder callback returns.
+  The FFI therefore blocks that callback until the matching FIFO
+  `WsMessageAck` arrives after the serialized Go handler. Core suppresses
+  already-persisted replay before the callback; the FFI still validates FIFO
+  acknowledgements for every message it does receive;
+- on sleep, `WsCloseCmd { hibernate: true }` detaches the outgoing queue and
+  callbacks belonging to the old generation without calling
+  `WebSocket::close`. Core and the engine own the hibernating transport and
+  preserve the client connection across the stopped generation.
+
+Hibernation itself does not emit `WsClose` and does not invoke `OnDisconnect`.
+A real close observed while the actor is awake still invokes `OnDisconnect`.
+At this pin a client that disappears while the actor is fully asleep can be
+removed by core's startup settlement before the foreign run handler starts, so
+there is no Go disconnect callback for that already-dead restored transport.
+This is the pinned behavior, not a promise that a future core will hide every
+sleep-time close.
+
+Real-engine alarm checks use engine-driven timestamps and the existing
+`eventually` polling discipline. Local v2.3.10 runs fired the 5-second and
+10-second schedules at their requested deadlines without evidence of a coarse
+second-level tolerance. Assertions do not depend on that precision: ordinary
+wake and restart durability use a 45-second bound, which also covers the pin's
+22-second envoy disconnect/reconnect liveness window.

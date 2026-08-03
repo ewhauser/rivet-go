@@ -429,3 +429,43 @@ through ABI 4. The command takes the ordinary close path and the acknowledgement
 is process-local bookkeeping only. M5 must add durable replay and reconcile
 core's current post-callback acknowledgement timing before enabling either
 sleep or hibernating WebSockets.
+
+## M5 pin-specific deviation notes — 2026-08-03
+
+M5 enables core sleep (`no_sleep = false`) and raw WebSocket hibernation
+(`can_hibernate_websocket = true`) and bumps the single-sourced FFI ABI to 5.
+`Context.Schedule`, `ScheduleAfter`, and `ClearSchedule` map the actor's one Go
+alarm to a reserved durable one-shot core schedule. `OnAlarm` runs as a normal
+serialized actor callback after core and the engine wake a sleeping actor, and
+its resulting state is saved before `AlarmHandled`. Rapid replacement is
+latest-wins and clear removes only the reserved Go alarm.
+
+`Context.Sleep` is an intent, not an immediate goroutine cancellation. Work
+already admitted to the actor's serial worker completes first: the initiating
+action/HTTP/WebSocket handler returns, successful action or alarm state is
+persisted, the action/HTTP result or WebSocket acknowledgement is submitted,
+and then `OnStop` runs. Explicit state and alarm mutations already accepted by
+Rust are also drained before `ActorStopResult`. Handler deadlines, engine HTTP
+aborts, and runner shutdown retain their earlier cancellation behavior. The
+real-engine mid-flight case observes the action-complete marker before the stop
+hook and actor eviction.
+
+Core hides hibernating gateway/request IDs, persists both message indexes and
+request metadata, restores `CommandStartActor.hibernatingRequests`, and drops
+already-acknowledged client replay. It expects the embedder's raw-message
+callback not to return before handler acceptance is durable. The FFI now holds
+that callback until Go submits the matching FIFO `WsMessageAck`; only then can
+core persist the index and acknowledge the engine. On sleep the old generation
+is detached without a transport close, and the restored `WsOpen` is marked
+`resumed` so Go rebuilds its connection table without calling user
+`OnConnect`. Hibernation does not call `OnDisconnect`; a real awake close does.
+If a client disappears while fully asleep, v2.3.10 may prune it during core
+startup settlement before Go can observe a disconnect.
+
+The M5 real-engine suite covers alarm wake with pre-sleep state, clear,
+latest-wins replacement, engine-restart alarm durability, mid-flight sleep
+ordering, repeated sleep/wake state, and a same-socket hibernation cycle with
+post-wake client-to-actor and actor-to-client traffic. It uses timestamp-based
+`eventually` checks and a 45-second wake bound; local alarms were not observed
+to need a coarse tick allowance, while engine restart remains bounded by the
+pin's 22-second envoy liveness window.
