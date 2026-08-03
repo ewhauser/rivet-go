@@ -3,6 +3,7 @@ package conformance
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
@@ -26,6 +27,7 @@ import (
 	"github.com/ewhauser/rivet-go/internal/ffi"
 	"github.com/ewhauser/rivet-go/internal/wire"
 	"github.com/ewhauser/rivet-go/rivet"
+	"github.com/fxamacker/cbor/v2"
 )
 
 const (
@@ -660,6 +662,9 @@ func TestActionsAndHTTPTunnelRoundTrip(t *testing.T) {
 		DelayMS int `json:"delay_ms"`
 	}
 	slowStarted := make(chan string, 1)
+	deadlineFinished := make(chan struct{}, 1)
+	lateWriteRelease := make(chan struct{})
+	lateWriteResult := make(chan error, 1)
 	streamBody := bytes.Repeat([]byte("rivet-go-stream\n"), 150_000)
 	registry := rivet.NewRegistry()
 	if err := rivet.Register(registry, "m3-counter", rivet.Actor[counterState]{
@@ -670,6 +675,17 @@ func TestActionsAndHTTPTunnelRoundTrip(t *testing.T) {
 			}),
 			"get": rivet.Action(func(ctx *rivet.Context[counterState], _ struct{}) (int, error) {
 				return ctx.State().Count, nil
+			}),
+			"raw": rivet.RawAction(func(_ *rivet.Context[counterState], encoded []byte) ([]byte, error) {
+				return cbor.Marshal(map[string]any{"argument_bytes": len(encoded)})
+			}),
+			"encode_failure": rivet.Action(func(*rivet.Context[counterState], struct{}) (chan int, error) {
+				return make(chan int), nil
+			}),
+			"deadline": rivet.ActionWithContext(func(ctx context.Context, _ *rivet.Context[counterState], _ struct{}) (int, error) {
+				<-ctx.Done()
+				deadlineFinished <- struct{}{}
+				return 0, ctx.Err()
 			}),
 			"slow_increment": rivet.Action(func(ctx *rivet.Context[counterState], input slowArgument) (int, error) {
 				slowStarted <- ctx.ActorID()
@@ -685,8 +701,77 @@ func TestActionsAndHTTPTunnelRoundTrip(t *testing.T) {
 			}),
 		},
 		OnFetch: func(_ *rivet.Context[counterState], writer http.ResponseWriter, request *http.Request) {
-			if request.URL.Path == "/panic" {
+			switch request.URL.Path {
+			case "/panic":
 				panic("intentional M3 fetch panic")
+			case "/inspect":
+				body, err := io.ReadAll(request.Body)
+				if err != nil {
+					panic(fmt.Sprintf("read inspected request body: %v", err))
+				}
+				digest := sha256.Sum256(body)
+				writer.Header().Set("Content-Type", "application/json")
+				if err := json.NewEncoder(writer).Encode(map[string]any{
+					"method":          request.Method,
+					"path":            request.URL.Path,
+					"query":           request.URL.RawQuery,
+					"host":            request.Host,
+					"repeated_header": request.Header.Values("X-Repeated"),
+					"cookie_length":   len(request.Header.Get("Cookie")),
+					"body_length":     len(body),
+					"body_sha256":     fmt.Sprintf("%x", digest),
+				}); err != nil {
+					panic(fmt.Sprintf("write inspected response: %v", err))
+				}
+				return
+			case "/content-length":
+				writer.Header().Set("Content-Length", "5")
+				_, _ = writer.Write([]byte("hello"))
+				return
+			case "/bad-content-length":
+				writer.Header().Set("Content-Length", "4")
+				_, _ = writer.Write([]byte("hello"))
+				return
+			case "/too-many-headers":
+				for index := range 257 {
+					writer.Header().Set(fmt.Sprintf("X-Limit-%03d", index), "value")
+				}
+				writer.WriteHeader(http.StatusOK)
+				return
+			case "/repeated-cookie":
+				writer.Header().Add("Set-Cookie", "first=1")
+				writer.Header().Add("Set-Cookie", "second=2")
+				writer.WriteHeader(http.StatusOK)
+				return
+			case "/oversized-header":
+				writer.Header().Set("X-Large", strings.Repeat("v", (1<<20)+1))
+				writer.WriteHeader(http.StatusOK)
+				return
+			case "/late-write":
+				go func() {
+					<-lateWriteRelease
+					_, err := writer.Write([]byte("late"))
+					lateWriteResult <- err
+				}()
+				return
+			case "/concurrent-writes":
+				var writes sync.WaitGroup
+				writeErrors := make(chan error, 32)
+				for range 32 {
+					writes.Add(1)
+					go func() {
+						defer writes.Done()
+						if _, err := writer.Write([]byte("chunk\n")); err != nil {
+							writeErrors <- err
+						}
+					}()
+				}
+				writes.Wait()
+				close(writeErrors)
+				for err := range writeErrors {
+					panic(fmt.Sprintf("concurrent response write: %v", err))
+				}
+				return
 			}
 			writer.Header().Set("Content-Type", "text/plain")
 			writer.Header().Set("X-Rivet-Go-M3", "streamed")
@@ -707,7 +792,8 @@ func TestActionsAndHTTPTunnelRoundTrip(t *testing.T) {
 	primary := createActor(t, engine.endpoint, "m3-counter", runnerName, "destroy", nil, nil)
 	fast := createActor(t, engine.endpoint, "m3-counter", runnerName, "destroy", nil, nil)
 	slow := createActor(t, engine.endpoint, "m3-counter", runnerName, "destroy", nil, nil)
-	for _, actor := range []actorRecord{primary, fast, slow} {
+	deadlineActor := createActor(t, engine.endpoint, "m3-counter", runnerName, "destroy", nil, nil)
+	for _, actor := range []actorRecord{primary, fast, slow, deadlineActor} {
 		waitForActor(t, engine.endpoint, actor.ActorID, false, func(actor actorRecord) bool {
 			return actor.ConnectableTS != nil && actor.DestroyTS == nil
 		})
@@ -717,6 +803,51 @@ func TestActionsAndHTTPTunnelRoundTrip(t *testing.T) {
 	assertActionOutput(t, increment, http.StatusOK, 3)
 	observed := gatewayAction(t, engine.endpoint, primary.ActorID, "get", []any{struct{}{}}, 10*time.Second)
 	assertActionOutput(t, observed, http.StatusOK, 3)
+	assertGatewayError(
+		t,
+		gatewayAction(t, engine.endpoint, primary.ActorID, "increment", []any{}, 10*time.Second),
+		http.StatusInternalServerError,
+		"actor",
+		"action_decode_failed",
+	)
+	assertGatewayError(
+		t,
+		gatewayAction(t, engine.endpoint, primary.ActorID, "increment", []any{"wrong-type"}, 10*time.Second),
+		http.StatusInternalServerError,
+		"actor",
+		"action_decode_failed",
+	)
+	assertGatewayError(
+		t,
+		gatewayAction(t, engine.endpoint, primary.ActorID, "encode_failure", []any{struct{}{}}, 10*time.Second),
+		http.StatusInternalServerError,
+		"actor",
+		"action_encode_failed",
+	)
+	rawAction := gatewayAction(t, engine.endpoint, primary.ActorID, "raw", []any{"kept-raw"}, 10*time.Second)
+	if rawAction.err != nil || rawAction.response == nil || rawAction.response.StatusCode != http.StatusOK {
+		t.Fatalf("raw action response: status=%s err=%v body=%s", responseStatus(rawAction.response), rawAction.err, rawAction.body)
+	}
+	var rawOutput struct {
+		Output struct {
+			ArgumentBytes int `json:"argument_bytes"`
+		} `json:"output"`
+	}
+	if err := json.Unmarshal(rawAction.body, &rawOutput); err != nil || rawOutput.Output.ArgumentBytes == 0 {
+		t.Fatalf("raw action output = %#v, decode error = %v", rawOutput, err)
+	}
+
+	deadlineResult := make(chan gatewayResponse, 1)
+	go func() {
+		deadlineResult <- gatewayAction(
+			t,
+			engine.endpoint,
+			deadlineActor.ActorID,
+			"deadline",
+			[]any{struct{}{}},
+			70*time.Second,
+		)
+	}()
 
 	slowResult := make(chan gatewayResponse, 1)
 	go func() {
@@ -737,6 +868,10 @@ func TestActionsAndHTTPTunnelRoundTrip(t *testing.T) {
 	case <-time.After(10 * time.Second):
 		t.Fatal("slow action did not reach the Go handler")
 	}
+	secondSlowResult := make(chan gatewayResponse, 1)
+	go func() {
+		secondSlowResult <- gatewayAction(t, engine.endpoint, slow.ActorID, "increment", []any{2}, 5*time.Second)
+	}()
 	fastStarted := time.Now()
 	fastResponse := gatewayAction(t, engine.endpoint, fast.ActorID, "increment", []any{9}, 5*time.Second)
 	assertActionOutput(t, fastResponse, http.StatusOK, 9)
@@ -748,11 +883,17 @@ func TestActionsAndHTTPTunnelRoundTrip(t *testing.T) {
 		t.Fatalf("slow action completed before isolation assertion: status=%v err=%v body=%s", responseStatus(result.response), result.err, result.body)
 	default:
 	}
+	select {
+	case result := <-secondSlowResult:
+		t.Fatalf("second same-actor action completed before the first: status=%v err=%v body=%s", responseStatus(result.response), result.err, result.body)
+	default:
+	}
 	result := <-slowResult
 	if result.err != nil {
 		t.Fatalf("slow action request: %v", result.err)
 	}
 	assertActionOutput(t, result, http.StatusOK, 4)
+	assertActionOutput(t, <-secondSlowResult, http.StatusOK, 6)
 
 	rawResponse, rawBody, err := gatewayRequest(
 		engine.endpoint,
@@ -772,6 +913,150 @@ func TestActionsAndHTTPTunnelRoundTrip(t *testing.T) {
 	}
 	if !bytes.Equal(rawBody, streamBody) || len(rawBody) <= 2*(1<<20) {
 		t.Fatalf("raw HTTP response length = %d, want %d bytes across multiple chunks", len(rawBody), len(streamBody))
+	}
+	if rawResponse.ContentLength >= 0 && rawResponse.ContentLength != int64(len(streamBody)) {
+		t.Fatalf("raw HTTP Content-Length = %d, body length = %d", rawResponse.ContentLength, len(streamBody))
+	}
+
+	requestBody := bytes.Repeat([]byte("request-chunk\n"), 170_000)
+	requestDigest := sha256.Sum256(requestBody)
+	requestHeaders := make(http.Header)
+	requestHeaders.Add("X-Repeated", "first")
+	requestHeaders.Add("X-Repeated", "second")
+	requestHeaders.Set("Cookie", "session="+strings.Repeat("c", 16<<10))
+	inspectResponse, inspectBody, err := gatewayHTTPRequest(
+		engine.endpoint,
+		primary.ActorID,
+		"/request/inspect?part=one&part=two",
+		http.MethodPatch,
+		requestBody,
+		requestHeaders,
+		10*time.Second,
+	)
+	if err != nil {
+		t.Fatalf("inspect HTTP gateway request: %v", err)
+	}
+	if inspectResponse.StatusCode != http.StatusOK {
+		t.Fatalf("inspect HTTP status = %s; body=%s", inspectResponse.Status, inspectBody)
+	}
+	var inspected struct {
+		Method         string   `json:"method"`
+		Path           string   `json:"path"`
+		Query          string   `json:"query"`
+		Host           string   `json:"host"`
+		RepeatedHeader []string `json:"repeated_header"`
+		CookieLength   int      `json:"cookie_length"`
+		BodyLength     int      `json:"body_length"`
+		BodySHA256     string   `json:"body_sha256"`
+	}
+	if err := json.Unmarshal(inspectBody, &inspected); err != nil {
+		t.Fatalf("decode inspected request: %v; body=%s", err, inspectBody)
+	}
+	if inspected.Method != http.MethodPatch || inspected.Path != "/inspect" ||
+		inspected.Query != "part=one&part=two" || inspected.Host == "" ||
+		inspected.BodyLength != len(requestBody) ||
+		inspected.BodySHA256 != fmt.Sprintf("%x", requestDigest) ||
+		inspected.CookieLength != len(requestHeaders.Get("Cookie")) {
+		t.Fatalf("inspected request = %#v", inspected)
+	}
+	if len(inspected.RepeatedHeader) != 1 || inspected.RepeatedHeader[0] != "second" {
+		t.Fatalf("pinned-core repeated request header = %#v, want the last value", inspected.RepeatedHeader)
+	}
+	tooManyRequestHeaders := make(http.Header)
+	for index := range 257 {
+		tooManyRequestHeaders.Set(fmt.Sprintf("X-Request-Limit-%03d", index), "value")
+	}
+	tooManyResponse, tooManyBody, err := gatewayHTTPRequest(
+		engine.endpoint,
+		primary.ActorID,
+		"/request/inspect",
+		http.MethodGet,
+		nil,
+		tooManyRequestHeaders,
+		10*time.Second,
+	)
+	if err != nil {
+		t.Fatalf("request header-limit gateway call: %v", err)
+	}
+	if tooManyResponse.StatusCode != http.StatusRequestHeaderFieldsTooLarge {
+		t.Fatalf("request header-limit status = %s, want 431; body=%s", tooManyResponse.Status, tooManyBody)
+	}
+
+	lengthResponse, lengthBody, err := gatewayRequest(
+		engine.endpoint,
+		primary.ActorID,
+		"/request/content-length",
+		nil,
+		10*time.Second,
+	)
+	if err != nil || string(lengthBody) != "hello" || lengthResponse.ContentLength != int64(len(lengthBody)) {
+		t.Fatalf("content-length response: status=%s length=%d body=%q err=%v", responseStatus(lengthResponse), responseContentLength(lengthResponse), lengthBody, err)
+	}
+	badLengthResponse, badLengthBody, err := gatewayRequest(
+		engine.endpoint,
+		primary.ActorID,
+		"/request/bad-content-length",
+		nil,
+		10*time.Second,
+	)
+	if err != nil {
+		t.Fatalf("bad content-length request: %v", err)
+	}
+	assertGatewayError(
+		t,
+		gatewayResponse{response: badLengthResponse, body: badLengthBody},
+		http.StatusInternalServerError,
+		"actor",
+		"http_response_content_length_mismatch",
+	)
+
+	for path, code := range map[string]string{
+		"/request/too-many-headers": "http_response_headers_too_large",
+		"/request/repeated-cookie":  "http_response_repeated_header_unsupported",
+		"/request/oversized-header": "http_response_header_too_large",
+	} {
+		response, body, requestErr := gatewayRequest(engine.endpoint, primary.ActorID, path, nil, 10*time.Second)
+		if requestErr != nil {
+			t.Fatalf("%s: %v", path, requestErr)
+		}
+		assertGatewayError(
+			t,
+			gatewayResponse{response: response, body: body},
+			http.StatusInternalServerError,
+			"actor",
+			code,
+		)
+	}
+
+	concurrentResponse, concurrentBody, err := gatewayRequest(
+		engine.endpoint,
+		primary.ActorID,
+		"/request/concurrent-writes",
+		nil,
+		10*time.Second,
+	)
+	if err != nil || concurrentResponse.StatusCode != http.StatusOK ||
+		len(concurrentBody) != 32*len("chunk\n") || bytes.Count(concurrentBody, []byte("chunk\n")) != 32 {
+		t.Fatalf("concurrent response: status=%s bytes=%d chunks=%d err=%v", responseStatus(concurrentResponse), len(concurrentBody), bytes.Count(concurrentBody, []byte("chunk\n")), err)
+	}
+	lateResponse, lateBody, err := gatewayRequest(
+		engine.endpoint,
+		primary.ActorID,
+		"/request/late-write",
+		nil,
+		10*time.Second,
+	)
+	if err != nil || lateResponse.StatusCode != http.StatusOK || len(lateBody) != 0 {
+		t.Fatalf("late-write initial response: status=%s body=%q err=%v", responseStatus(lateResponse), lateBody, err)
+	}
+	close(lateWriteRelease)
+	select {
+	case lateErr := <-lateWriteResult:
+		if lateErr == nil || !strings.Contains(lateErr.Error(), "after OnFetch returned") {
+			t.Fatalf("late response write error = %v", lateErr)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("late response writer did not reject the write")
 	}
 
 	missing := gatewayAction(t, engine.endpoint, primary.ActorID, "missing", []any{}, 10*time.Second)
@@ -819,6 +1104,143 @@ func TestActionsAndHTTPTunnelRoundTrip(t *testing.T) {
 		http.StatusOK,
 		9,
 	)
+
+	select {
+	case timedOut := <-deadlineResult:
+		assertGatewayError(t, timedOut, http.StatusRequestTimeout, "actor", "action_timed_out")
+	case <-time.After(75 * time.Second):
+		t.Fatal("core action deadline did not return a gateway response")
+	}
+	select {
+	case <-deadlineFinished:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Go action context did not observe the pinned core deadline")
+	}
+	assertActionOutput(
+		t,
+		gatewayAction(t, engine.endpoint, deadlineActor.ActorID, "get", []any{struct{}{}}, 10*time.Second),
+		http.StatusOK,
+		0,
+	)
+}
+
+func TestActionImplicitSavePersistsAcrossEngineRestart(t *testing.T) {
+	if testing.Short() {
+		t.Skip("real-engine conformance is disabled by -short")
+	}
+	engineBinary, err := acquireEngine(context.Background())
+	if err != nil {
+		t.Fatalf("obtain Rivet engine %s: %v\n%s", engineTag, err, engineRemediation())
+	}
+	engine := startEngine(t, engineBinary)
+
+	type counterState struct {
+		Count int `json:"count"`
+	}
+	type observation struct {
+		actorID    string
+		generation uint64
+		count      int
+	}
+	started := make(chan observation, 4)
+	stopped := make(chan observation, 2)
+	registry := rivet.NewRegistry()
+	if err := rivet.Register(registry, "m3-persistent-action", rivet.Actor[counterState]{
+		OnStart: func(ctx *rivet.Context[counterState]) error {
+			started <- observation{actorID: ctx.ActorID(), generation: ctx.Generation(), count: ctx.State().Count}
+			return nil
+		},
+		OnStop: func(ctx *rivet.Context[counterState]) error {
+			stopped <- observation{actorID: ctx.ActorID(), generation: ctx.Generation(), count: ctx.State().Count}
+			return nil
+		},
+		Actions: rivet.Actions[counterState]{
+			"increment": rivet.Action(func(ctx *rivet.Context[counterState], amount int) (int, error) {
+				ctx.State().Count += amount
+				return ctx.State().Count, nil
+			}),
+			"get": rivet.Action(func(ctx *rivet.Context[counterState], _ struct{}) (int, error) {
+				return ctx.State().Count, nil
+			}),
+		},
+	}); err != nil {
+		t.Fatalf("register persistent M3 action actor: %v", err)
+	}
+	runnerName := fmt.Sprintf("rivet-go-m3-persistence-%d", time.Now().UnixNano())
+	served := startRegistry(t, engine, runnerName, registry)
+	key := "m3-action-persistence"
+	actor := createActor(t, engine.endpoint, "m3-persistent-action", runnerName, "restart", &key, nil)
+
+	var first observation
+	select {
+	case first = <-started:
+	case <-time.After(30 * time.Second):
+		t.Fatal("persistent action actor did not start")
+	}
+	if first.actorID != actor.ActorID || first.count != 0 {
+		t.Fatalf("first action actor observation = %#v", first)
+	}
+	waitForActor(t, engine.endpoint, actor.ActorID, false, func(actor actorRecord) bool {
+		return actor.ConnectableTS != nil && actor.DestroyTS == nil
+	})
+	assertActionOutput(
+		t,
+		gatewayAction(t, engine.endpoint, actor.ActorID, "increment", []any{17}, 10*time.Second),
+		http.StatusOK,
+		17,
+	)
+
+	engine.kill(t)
+	select {
+	case stoppedActor := <-stopped:
+		if stoppedActor.actorID != actor.ActorID || stoppedActor.generation != first.generation || stoppedActor.count != 17 {
+			t.Fatalf("pre-restart action stop observation = %#v", stoppedActor)
+		}
+	case err := <-served.result:
+		served.stopOnce.Do(func() {
+			served.cancel()
+			served.stopErr = err
+		})
+		t.Fatalf("runner exited while the engine was stopped: %v", err)
+	case <-time.After(disconnectLivenessWindow + 10*time.Second):
+		t.Fatal("action actor worker did not stop after engine loss")
+	}
+
+	engine.start(t)
+	waitForActor(t, engine.endpoint, actor.ActorID, true, func(actor actorRecord) bool {
+		return actor.ConnectableTS == nil && len(actor.Error) != 0
+	})
+	wakeResult := wakeActor(engine.endpoint, actor.ActorID, rehydrateWindow)
+	var rehydrated observation
+	select {
+	case rehydrated = <-started:
+	case err := <-served.result:
+		served.stopOnce.Do(func() {
+			served.cancel()
+			served.stopErr = err
+		})
+		t.Fatalf("runner exited before action actor rehydration: %v", err)
+	case <-time.After(rehydrateWindow):
+		t.Fatal("action actor was not rehydrated after engine restart")
+	}
+	if rehydrated.actorID != actor.ActorID || rehydrated.count != 17 || rehydrated.generation <= first.generation {
+		t.Fatalf("rehydrated action actor = %#v, first = %#v", rehydrated, first)
+	}
+	select {
+	case wakeErr := <-wakeResult:
+		if wakeErr != nil {
+			t.Fatalf("gateway wake request: %v", wakeErr)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("gateway wake request did not complete")
+	}
+	assertActionOutput(
+		t,
+		gatewayAction(t, engine.endpoint, actor.ActorID, "get", []any{struct{}{}}, 10*time.Second),
+		http.StatusOK,
+		17,
+	)
+	deleteActor(t, engine.endpoint, actor.ActorID)
 }
 
 func TestActorDestroyRunsGoCleanupHook(t *testing.T) {
@@ -1241,26 +1663,43 @@ func gatewayRequest(
 	timeout time.Duration,
 ) (*http.Response, []byte, error) {
 	method := http.MethodGet
-	var body io.Reader
+	var body []byte
+	headers := make(http.Header)
 	if payload != nil {
 		method = http.MethodPost
 		encoded, err := json.Marshal(payload)
 		if err != nil {
 			return nil, nil, fmt.Errorf("encode gateway request: %w", err)
 		}
-		body = bytes.NewReader(encoded)
+		body = encoded
+		headers.Set("Content-Type", "application/json")
+	}
+	return gatewayHTTPRequest(endpoint, actorID, path, method, body, headers, timeout)
+}
+
+func gatewayHTTPRequest(
+	endpoint, actorID, path, method string,
+	body []byte,
+	headers http.Header,
+	timeout time.Duration,
+) (*http.Response, []byte, error) {
+	var bodyReader io.Reader
+	if body != nil {
+		bodyReader = bytes.NewReader(body)
 	}
 	request, err := http.NewRequest(
 		method,
 		endpoint+"/gateway/"+url.PathEscape(actorID)+path,
-		body,
+		bodyReader,
 	)
 	if err != nil {
 		return nil, nil, fmt.Errorf("build gateway request: %w", err)
 	}
 	request.Header.Set("Authorization", "Bearer dev")
-	if payload != nil {
-		request.Header.Set("Content-Type", "application/json")
+	for name, values := range headers {
+		for _, value := range values {
+			request.Header.Add(name, value)
+		}
 	}
 	response, err := (&http.Client{Timeout: timeout}).Do(request)
 	if err != nil {
@@ -1324,6 +1763,13 @@ func responseStatus(response *http.Response) string {
 		return "<no response>"
 	}
 	return response.Status
+}
+
+func responseContentLength(response *http.Response) int64 {
+	if response == nil {
+		return -1
+	}
+	return response.ContentLength
 }
 
 func createActor(
