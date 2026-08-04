@@ -276,6 +276,14 @@ func render(results []result, root, engine, archive string) (string, error) {
 	fmt.Fprintln(&b, "- **S4 cold start:** 50 fresh actors, sequentially measured from create request through the first persisted or volatile `increment(1)` result. S4 is count-bounded because pacing 50 samples to 60 seconds would fabricate throughput.")
 	fmt.Fprintln(&b, "- S1-S3 use at least 10 seconds of excluded warmup and a 60-second measured window. S4 uses at least 10 seconds of excluded fresh-actor warmup and then exactly 50 measured actors. Latency uses an HDR histogram with three significant figures. All requests use the same Go HTTP/WebSocket gateway client.")
 	fmt.Fprintln(&b)
+	fmt.Fprintln(&b, "## Post-hibernation-fix")
+	fmt.Fprintln(&b)
+	fmt.Fprintln(&b, "The Go SDK previously registered every actor with WebSocket hibernation enabled, while the pinned TypeScript and Rust SDKs default it to false. A latency investigation observed one engine hibernation acknowledgement per Go echo message and measured only about 36 us in Go's in-runner critical path. In an interleaved Go-only A/B that changed only this flag, S3 client p50 moved from 8.243 ms to 6.459 ms, about 1.8 ms. The earlier conclusion that Go was roughly 22% behind in S3 because of its callback-free FFI design was therefore a configuration mismatch, not a measured runner-performance cost.")
+	fmt.Fprintln(&b)
+	fmt.Fprintln(&b, "The table below averages the two same-run persistent repetitions for S1 and S4 and the two non-persistence S3 repetitions. All three S3 echo actors use non-hibernating WebSockets.")
+	fmt.Fprintln(&b)
+	fmt.Fprintln(&b, sameRunTable(groups))
+	fmt.Fprintln(&b)
 
 	fmt.Fprintln(&b, "## Summary")
 	fmt.Fprintln(&b)
@@ -306,6 +314,7 @@ func render(results []result, root, engine, archive string) (string, error) {
 
 	fmt.Fprintln(&b, "## Caveats")
 	fmt.Fprintln(&b)
+	fmt.Fprintln(&b, "- **The corrected S3 comparison uses matching WebSocket configuration.** Go, TypeScript, and Rust all run the echo actor with hibernation disabled. The earlier Go-only hibernation setting caused an engine acknowledgement on every message and explained the reported S3 latency gap; the interleaved flag-only A/B moved Go p50 from 8.243 ms to 6.459 ms, while Go's measured in-runner critical path was about 36 us. The post-fix S3 rows measure the SDK paths after removing that mismatch, so they do not support attributing the old gap to Go's callback-free FFI design.")
 	fmt.Fprintln(&b, "- **Persistence is labeled, not assumed.** The strict `persist` rows await a state save before returning the increment result in every SDK. Go's public action adapter performs this save automatically after a successful handler, so an additional `ctx.Save` would double-save. TypeScript's state proxy normally requests deferred persistence; this actor also awaits `saveState({ immediate: true })`. Rust explicitly awaits `Ctx::save_state`. The `no-persist` rows use actor-generation-local values and exist only for TypeScript and Rust because Go exposes no no-persist successful action.")
 	fmt.Fprintln(&b, "- **The native paths differ.** Go crosses a purego C ABI and MessagePack event-pump hop for each event before using the pinned Rust core. TypeScript crosses N-API between JavaScript and the same core and performs JavaScript/CBOR work. Rust calls the core natively. Those costs are the SDK implementations being measured, but this is not a language-only comparison.")
 	fmt.Fprintln(&b, "- **Pinned Rust needs the database marker for state.** The standalone git dependency enables `sqlite-remote`, but its registry selects that backend only when `Actor::HAS_DATABASE` is true. Both Rust actors set the marker and issue no application SQL. Omitting it makes new actors fail with `SQLite is unavailable` at this pin.")
@@ -344,6 +353,34 @@ func render(results []result, root, engine, archive string) (string, error) {
 	fmt.Fprintf(&b, "Profiling-only S1 and S3 runs are excluded from every table above. Their pprof data and text tops are in `%s/go-s1-cpu.pprof`, `%s/go-s3-cpu.pprof`, and the adjacent `*-pprof-top.txt` files.\n", archive, archive)
 
 	return b.String(), nil
+}
+
+func sameRunTable(groups map[groupKey][]result) string {
+	var b strings.Builder
+	fmt.Fprintln(&b, "| Scenario | SDK | Throughput ops/s | p50 ms | Runner CPU avg |")
+	fmt.Fprintln(&b, "|---|---|---:|---:|---:|")
+	for _, scenario := range []string{"s1", "s3", "s4"} {
+		variant := "persist"
+		if scenario == "s3" {
+			variant = "not-applicable"
+		}
+		for _, sdk := range []string{"go", "typescript", "rust"} {
+			runs := groups[groupKey{Scenario: scenario, Variant: variant, SDK: sdk}]
+			if len(runs) != 2 {
+				continue
+			}
+			fmt.Fprintf(
+				&b,
+				"| %s | %s | %.1f | %.3f | %.1f%% |\n",
+				strings.ToUpper(scenario),
+				displaySDK(sdk),
+				(runs[0].ThroughputOpsSecond+runs[1].ThroughputOpsSecond)/2,
+				(runs[0].Latency.P50+runs[1].Latency.P50)/2,
+				(runs[0].CPU.Runner.AverageCPU+runs[1].CPU.Runner.AverageCPU)/2,
+			)
+		}
+	}
+	return strings.TrimRight(b.String(), "\n")
 }
 
 func internalErrorTable(root, archive string) string {

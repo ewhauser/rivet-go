@@ -116,6 +116,9 @@ func run() error {
 		return err
 	}
 	if err := rivet.Register(registry, "echo", rivet.Actor[echoState]{
+		// Match the pinned TypeScript and Rust default. Hibernation changes the
+		// engine message path and is not part of the echo scenario.
+		HibernateWebSockets: false,
 		OnMessage: func(_ *rivet.Context[echoState], connection *rivet.Connection, message rivet.Message) {
 			if message.Binary {
 				_ = connection.SendBinary(message.Data)
