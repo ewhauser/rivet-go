@@ -638,30 +638,15 @@ func (r *soakRun) runAlarms(ctx context.Context) {
 		actionCtx, cancel := context.WithTimeout(ctx, 45*time.Second)
 		actual, err := gatewayAction[alarmState](actionCtx, r.api, r.alarmActor, "arm", args)
 		cancel()
-		firedEarly := false
-		if err == nil {
-			select {
-			case fired := <-r.alarmOracle.fired:
-				expected, err = r.alarmOracle.expectFire(fired)
-				if err == nil {
-					firedEarly = true
-					r.activations.sleepWakes.Add(1)
-				}
-			default:
-			}
-		}
 		if err == nil {
 			err = compareAlarm(actual, expected)
 		}
-		r.gate.release()
 		if err != nil {
+			r.gate.release()
 			if ctx.Err() == nil {
 				r.errors.report(fmt.Errorf("arm alarm: %w", err))
 			}
 			return
-		}
-		if firedEarly {
-			continue
 		}
 		alarmTimer := time.NewTimer(r.config.alarmDelay + 45*time.Second)
 		select {
@@ -670,11 +655,13 @@ func (r *soakRun) runAlarms(ctx context.Context) {
 				<-alarmTimer.C
 			}
 			if _, err := r.alarmOracle.expectFire(fired); err != nil {
+				r.gate.release()
 				r.errors.report(err)
 				return
 			}
 			r.activations.sleepWakes.Add(1)
 		case <-alarmTimer.C:
+			r.gate.release()
 			r.errors.report(fmt.Errorf("alarm %s did not fire within %s", nonce, r.config.alarmDelay+45*time.Second))
 			return
 		case <-ctx.Done():
@@ -684,8 +671,10 @@ func (r *soakRun) runAlarms(ctx context.Context) {
 				default:
 				}
 			}
+			r.gate.release()
 			return
 		}
+		r.gate.release()
 	}
 }
 
