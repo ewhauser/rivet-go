@@ -46,6 +46,28 @@ type recordingHooks struct {
 	observed map[string][]time.Duration
 }
 
+type reentrantBlockingHooks struct {
+	pump      *Pump
+	once      sync.Once
+	started   chan struct{}
+	release   chan struct{}
+	reentered chan error
+}
+
+func (h *reentrantBlockingHooks) Counter(name string, _ int64) {
+	if name != metricCommandsSubmitted {
+		return
+	}
+	h.once.Do(func() {
+		close(h.started)
+		<-h.release
+		h.reentered <- h.pump.Submit(context.Background())
+	})
+}
+
+func (*reentrantBlockingHooks) Gauge(string, int64)                   {}
+func (*reentrantBlockingHooks) ObserveDuration(string, time.Duration) {}
+
 func newRecordingHooks() *recordingHooks {
 	return &recordingHooks{
 		counters: make(map[string]int64),
@@ -221,6 +243,94 @@ func TestConcurrentSubmittersAndCleanShutdown(t *testing.T) {
 	case <-runner.closed:
 	default:
 		t.Fatal("runner was not closed")
+	}
+}
+
+func TestHooksMayBlockBrieflyAndReenterPump(t *testing.T) {
+	defer goleak.VerifyNone(t)
+	runner := newFakeRunner()
+	hooks := &reentrantBlockingHooks{
+		started:   make(chan struct{}),
+		release:   make(chan struct{}),
+		reentered: make(chan error, 1),
+	}
+	p := NewWithOptions(runner, nil, Options{Hooks: hooks})
+	hooks.pump = p
+	ctx, cancel := context.WithCancel(context.Background())
+	runResult := make(chan error, 1)
+	go func() { runResult <- p.Run(ctx) }()
+	waitPumpStarted(t, p)
+
+	submitResult := make(chan error, 1)
+	go func() {
+		submitResult <- p.Submit(context.Background(), wire.Command{Kind: "test"})
+	}()
+	select {
+	case <-hooks.started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("command metric hook was not called")
+	}
+	select {
+	case err := <-submitResult:
+		if err != nil {
+			t.Fatalf("Submit while hook blocked: %v", err)
+		}
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("blocking hook stalled the submit loop")
+	}
+	close(hooks.release)
+	select {
+	case err := <-hooks.reentered:
+		if err != nil {
+			t.Fatalf("hook reentrant Submit: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("hook reentrant Submit deadlocked")
+	}
+
+	cancel()
+	if err := <-runResult; err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+}
+
+func TestPollLatencyExcludesIdleTimeouts(t *testing.T) {
+	defer goleak.VerifyNone(t)
+	runner := newFakeRunner()
+	hooks := newRecordingHooks()
+	p := NewWithOptions(runner, nil, Options{Hooks: hooks})
+	p.pollTimeout = 10 * time.Millisecond
+	ctx, cancel := context.WithCancel(context.Background())
+	runResult := make(chan error, 1)
+	go func() { runResult <- p.Run(ctx) }()
+	waitPumpStarted(t, p)
+
+	deadline := time.Now().Add(time.Second)
+	for runner.nextSeq.Load() < 3 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if runner.nextSeq.Load() < 3 {
+		t.Fatal("runner did not complete idle poll timeouts")
+	}
+	_, _, observed := hooks.snapshot()
+	if len(observed[metricPollLatency]) != 0 {
+		t.Fatalf("idle timeouts recorded as poll latency: %v", observed[metricPollLatency])
+	}
+
+	runner.emit(wire.Event{Kind: wire.EventRunnerConnected, RunnerID: "runner"})
+	for {
+		_, _, observed = hooks.snapshot()
+		if len(observed[metricPollLatency]) != 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("event-bearing poll latency was not observed")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	cancel()
+	if err := <-runResult; err != nil {
+		t.Fatalf("Run: %v", err)
 	}
 }
 

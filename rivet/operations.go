@@ -2,9 +2,10 @@ package rivet
 
 import "time"
 
-// Hooks receives dependency-free runtime measurements. Implementations must
-// be safe for concurrent use and should return quickly. A hook panic is
-// recovered and logged without stopping the runner.
+// Hooks receives dependency-free runtime measurements on a serialized
+// dispatcher outside pump locks and runtime-critical goroutines. Hooks may
+// call back into the SDK and should return quickly so shutdown can drain the
+// observation queue. A hook panic is recovered without stopping the runner.
 type Hooks interface {
 	Counter(name string, delta int64)
 	Gauge(name string, value int64)

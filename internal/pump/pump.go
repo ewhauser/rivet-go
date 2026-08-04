@@ -49,8 +49,8 @@ const (
 	metricPollLatency       = "poll_latency"
 )
 
-// Hooks is the dependency-free metrics sink used by the public SDK. Hook
-// implementations must be safe for concurrent use and should return quickly.
+// Hooks is the dependency-free metrics sink used by the public SDK. Calls are
+// serialized on a dispatcher outside runtime-critical goroutines.
 type Hooks interface {
 	Counter(string, int64)
 	Gauge(string, int64)
@@ -998,7 +998,7 @@ type Pump struct {
 	result    error
 	seenSeq   bool
 	lastSeq   uint64
-	hooks     Hooks
+	hooks     *hookDispatcher
 	logger    *slog.Logger
 }
 
@@ -1039,7 +1039,7 @@ func NewWithOptions(runner Runner, handlers map[string]ActorHandler, options Opt
 		httpPending:     make(map[uint64]*httpRequestState),
 		websockets:      make(map[string]websocketOwner),
 		subs:            make(map[uint64]*subscriber),
-		hooks:           options.Hooks,
+		hooks:           newHookDispatcher(options.Hooks, options.Logger),
 		logger:          options.Logger,
 	}
 }
@@ -1078,6 +1078,7 @@ func (p *Pump) Run(ctx context.Context) error {
 		return errors.New("pump runner is nil")
 	}
 
+	p.hooks.start()
 	p.submitWG.Add(1)
 	go p.submitLoop()
 	go p.pollLoop(ctx)
@@ -1148,6 +1149,7 @@ func (p *Pump) pollLoop(ctx context.Context) {
 		p.submitWG.Wait()
 		p.failKVWaiters()
 		p.failActorIntentWaiters()
+		p.hooks.stop()
 		p.runner.Close()
 		p.closeSubscribers()
 		close(p.done)
@@ -1181,7 +1183,6 @@ func (p *Pump) pollLoop(ctx context.Context) {
 
 		pollStarted := time.Now()
 		data, err := p.runner.Poll(p.pollTimeout)
-		p.observeDuration(metricPollLatency, time.Since(pollStarted))
 		if err != nil {
 			p.setResult(fmt.Errorf("poll native runner: %w", err))
 			return
@@ -1190,6 +1191,10 @@ func (p *Pump) pollLoop(ctx context.Context) {
 		if err != nil {
 			p.setResult(err)
 			return
+		}
+		if len(batch.Events) != 0 {
+			// Empty batches are the intentional poll timeout, not event latency.
+			p.observeDuration(metricPollLatency, time.Since(pollStarted))
 		}
 		if p.seenSeq && batch.Seq <= p.lastSeq {
 			p.setResult(fmt.Errorf(
@@ -1301,9 +1306,9 @@ func (p *Pump) handleInternalEvent(event wire.Event) error {
 		p.actors[identity] = worker
 		liveActors := len(p.actors)
 		p.actorWG.Add(1)
+		p.gauge(metricLiveActors, int64(liveActors))
 		p.actorsMu.Unlock()
 		p.counter(metricActorStarts, 1)
-		p.gauge(metricLiveActors, int64(liveActors))
 		p.log(slog.LevelDebug, "actor started",
 			slog.String("actor_id", event.AID),
 			slog.Uint64("generation", event.Generation),
@@ -1421,8 +1426,8 @@ func (p *Pump) handleInternalEvent(event wire.Event) error {
 			canHibernate: event.CanHibernate,
 		}
 		liveConnections := len(p.websockets)
-		p.wsMu.Unlock()
 		p.gauge(metricLiveConnections, int64(liveConnections))
+		p.wsMu.Unlock()
 		worker.events <- event
 	case wire.EventWSMessage:
 		worker := p.websocketActor(event.WSID)
@@ -1883,11 +1888,13 @@ func (p *Pump) removeWebSocket(wsID string) *actorWorker {
 	owner, ok := p.websockets[wsID]
 	delete(p.websockets, wsID)
 	liveConnections := len(p.websockets)
+	if ok {
+		p.gauge(metricLiveConnections, int64(liveConnections))
+	}
 	p.wsMu.Unlock()
 	if !ok {
 		return nil
 	}
-	p.gauge(metricLiveConnections, int64(liveConnections))
 	return p.actor(owner.identity.aid, owner.identity.generation)
 }
 
@@ -1921,8 +1928,8 @@ func (p *Pump) detachActorWebSockets(
 		})
 	}
 	liveConnections := len(p.websockets)
-	p.wsMu.Unlock()
 	p.gauge(metricLiveConnections, int64(liveConnections))
+	p.wsMu.Unlock()
 	return events, commands
 }
 
@@ -1968,10 +1975,10 @@ func (p *Pump) removeActor(identity actorIdentity, worker *actorWorker) {
 		removed = true
 	}
 	liveActors := len(p.actors)
-	p.actorsMu.Unlock()
 	if removed {
 		p.gauge(metricLiveActors, int64(liveActors))
 	}
+	p.actorsMu.Unlock()
 }
 
 func (p *Pump) cancelActorWorkers() {
@@ -2173,33 +2180,24 @@ func (p *Pump) recordHandlerPanic(failure *wire.WireError, operation string, ses
 }
 
 func (p *Pump) counter(name string, delta int64) {
-	if p == nil || p.hooks == nil || delta == 0 {
+	if p == nil || delta == 0 {
 		return
 	}
-	p.callHook(func() { p.hooks.Counter(name, delta) })
+	p.hooks.enqueue(hookObservation{kind: hookCounter, name: name, value: delta})
 }
 
 func (p *Pump) gauge(name string, value int64) {
-	if p == nil || p.hooks == nil {
+	if p == nil {
 		return
 	}
-	p.callHook(func() { p.hooks.Gauge(name, value) })
+	p.hooks.enqueue(hookObservation{kind: hookGauge, name: name, value: value})
 }
 
 func (p *Pump) observeDuration(name string, value time.Duration) {
-	if p == nil || p.hooks == nil {
+	if p == nil {
 		return
 	}
-	p.callHook(func() { p.hooks.ObserveDuration(name, value) })
-}
-
-func (p *Pump) callHook(call func()) {
-	defer func() {
-		if recovered := recover(); recovered != nil {
-			p.log(slog.LevelWarn, "operability hook panicked", slog.Any("panic", recovered))
-		}
-	}()
-	call()
+	p.hooks.enqueue(hookObservation{kind: hookDuration, name: name, duration: value})
 }
 
 func (p *Pump) log(level slog.Level, message string, attributes ...slog.Attr) {
@@ -2215,4 +2213,114 @@ func errorCode(err error) string {
 		return coded.ErrorCode()
 	}
 	return ""
+}
+
+type hookKind uint8
+
+const (
+	hookCounter hookKind = iota + 1
+	hookGauge
+	hookDuration
+)
+
+type hookObservation struct {
+	kind     hookKind
+	name     string
+	value    int64
+	duration time.Duration
+}
+
+// hookDispatcher keeps user hooks off the poll, submit, and actor goroutines.
+// Queueing is safe while a pump state lock is held because user code runs only
+// after the dispatcher releases its own mutex.
+type hookDispatcher struct {
+	sink    Hooks
+	logger  *slog.Logger
+	mu      sync.Mutex
+	cond    *sync.Cond
+	queue   []hookObservation
+	stopNow bool
+	started bool
+	done    chan struct{}
+}
+
+func newHookDispatcher(sink Hooks, logger *slog.Logger) *hookDispatcher {
+	if sink == nil {
+		return nil
+	}
+	dispatcher := &hookDispatcher{sink: sink, logger: logger, done: make(chan struct{})}
+	dispatcher.cond = sync.NewCond(&dispatcher.mu)
+	return dispatcher
+}
+
+func (d *hookDispatcher) start() {
+	if d == nil {
+		return
+	}
+	d.mu.Lock()
+	if d.started {
+		d.mu.Unlock()
+		return
+	}
+	d.started = true
+	d.mu.Unlock()
+	go d.run()
+}
+
+func (d *hookDispatcher) enqueue(observation hookObservation) {
+	if d == nil {
+		return
+	}
+	d.mu.Lock()
+	if !d.stopNow {
+		d.queue = append(d.queue, observation)
+		d.cond.Signal()
+	}
+	d.mu.Unlock()
+}
+
+func (d *hookDispatcher) stop() {
+	if d == nil {
+		return
+	}
+	d.mu.Lock()
+	d.stopNow = true
+	d.cond.Broadcast()
+	d.mu.Unlock()
+	<-d.done
+}
+
+func (d *hookDispatcher) run() {
+	defer close(d.done)
+	for {
+		d.mu.Lock()
+		for len(d.queue) == 0 && !d.stopNow {
+			d.cond.Wait()
+		}
+		if len(d.queue) == 0 && d.stopNow {
+			d.mu.Unlock()
+			return
+		}
+		observation := d.queue[0]
+		d.queue[0] = hookObservation{}
+		d.queue = d.queue[1:]
+		d.mu.Unlock()
+		d.call(observation)
+	}
+}
+
+func (d *hookDispatcher) call(observation hookObservation) {
+	defer func() {
+		if recovered := recover(); recovered != nil && d.logger != nil {
+			d.logger.Warn("operability hook panicked", slog.Any("panic", recovered))
+		}
+	}()
+	switch observation.kind {
+	case hookCounter:
+		d.sink.Counter(observation.name, observation.value)
+	case hookGauge:
+		d.sink.Gauge(observation.name, observation.value)
+	case hookDuration:
+		d.sink.ObserveDuration(observation.name, observation.duration)
+	}
 }
