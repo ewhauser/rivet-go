@@ -30,7 +30,7 @@ void     rk_bytes_free(RkBytes b);
 
 // runner lifecycle
 // config: msgpack RunnerConfig (engine endpoint, namespace, runner name,
-//         version, total_slots, actor name manifest, log level)
+//         version, total_slots, actor manifest and options, log level)
 RkRunnerResult rk_runner_new(const uint8_t* config, uintptr_t config_len);
 void           rk_runner_free(RkRunner* r);
 
@@ -584,3 +584,37 @@ There are no new SDK/FFI decode surfaces in M6. The soak and real-subprocess
 conformance tooling decode bounded management/action JSON plus the existing
 v2.3.10 CBOR actor-connect event envelope; these decoders do not cross the FFI
 boundary or change its allocation limits.
+
+## WebSocket hibernation opt-in notes — 2026-08-04
+
+ABI 6 adds `RunnerConfig.actor_hibernate_websockets`, a map from each
+registered actor name to the public `Actor.HibernateWebSockets` boolean. The
+FFI validates every map key against `RunnerConfig.actor_names` and sets that
+actor factory's `ActorConfig.can_hibernate_websocket` to the matching boolean,
+defaulting a missing entry to false. This is the level at which pinned core
+keys the behavior: core evaluates the actor config when accepting a gateway
+WebSocket and supplies the resulting `WsOpen.can_hibernate` marker. The Go
+pump then uses that marker when an actor stops for sleep. No per-open override
+or new WebSocket event field is needed.
+
+The false public default now matches the v2.3.10 TypeScript option schema,
+Rust actor config, and core `CanHibernateWebSocket::default()`. On sleep, core
+closes a non-hibernatable transport; the client receives code 1001 and reason
+`actor sleeping`, and Go invokes `OnDisconnect`. With
+`HibernateWebSockets: true`, the existing ABI 5 hibernation flow remains:
+sleep detaches the old generation without a transport close, a later message
+wakes the actor through a resumed open, and hibernation itself does not invoke
+`OnDisconnect`.
+
+Hibernatable raw messages require core and the engine to persist and
+acknowledge the message index before advancing. In the recorded loopback A/B,
+changing only this actor option moved Go S3 client p50 from 8.243 ms to
+6.459 ms, about 1.8 ms. Applications should opt in when preserving a socket
+through sleep matters more than the per-message acknowledgement cost.
+
+New decode surfaces: the ABI 6 actor-hibernation map is the only new decoder
+input. The existing 1,024 actor limit bounds its cardinality, values are
+booleans, and unknown actor keys are rejected before the registry starts. It
+adds no event/command variant, binary blob, nested container, or new native
+allocation ownership rule. No fuzz or deliberately malformed-input test was
+added.

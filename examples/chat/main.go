@@ -47,6 +47,7 @@ func run() error {
 
 	registry := rivet.NewRegistry()
 	if err := rivet.Register(registry, "chat", rivet.Actor[chatState]{
+		HibernateWebSockets: true,
 		Actions: rivet.Actions[chatState]{
 			"stats": rivet.Action(func(ctx *rivet.Context[chatState], _ struct{}) (chatState, error) {
 				return *ctx.State(), nil

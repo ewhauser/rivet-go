@@ -128,17 +128,18 @@ func (r *Registry) Serve(ctx context.Context, config Config) error {
 	serveCtx, stopSignals := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
 	defer stopSignals()
 
-	actorNames, actorActions, handlers := r.snapshotActors()
+	actorNames, actorActions, actorHibernateWebSockets, handlers := r.snapshotActors()
 	config = withDefaults(config)
 	encoded, err := wire.EncodeRunnerConfig(wire.RunnerConfig{
-		EngineEndpoint: config.Endpoint,
-		Namespace:      config.Namespace,
-		RunnerName:     config.RunnerName,
-		Version:        config.Version,
-		TotalSlots:     config.TotalSlots,
-		ActorNames:     actorNames,
-		ActorActions:   actorActions,
-		LogLevel:       config.LogLevel,
+		EngineEndpoint:           config.Endpoint,
+		Namespace:                config.Namespace,
+		RunnerName:               config.RunnerName,
+		Version:                  config.Version,
+		TotalSlots:               config.TotalSlots,
+		ActorNames:               actorNames,
+		ActorActions:             actorActions,
+		ActorHibernateWebSockets: actorHibernateWebSockets,
+		LogLevel:                 config.LogLevel,
 	})
 	if err != nil {
 		return err
@@ -178,6 +179,7 @@ func (r *Registry) Serve(ctx context.Context, config Config) error {
 func (r *Registry) snapshotActors() (
 	[]string,
 	map[string][]string,
+	map[string]bool,
 	map[string]pump.ActorHandler,
 ) {
 	r.mu.RLock()
@@ -185,6 +187,7 @@ func (r *Registry) snapshotActors() (
 	names := make([]string, 0, len(r.actors))
 	handlers := make(map[string]pump.ActorHandler, len(r.actors))
 	actions := make(map[string][]string, len(r.actors))
+	hibernateWebSockets := make(map[string]bool, len(r.actors))
 	for name, handler := range r.actors {
 		names = append(names, name)
 		handlers[name] = handler
@@ -193,9 +196,12 @@ func (r *Registry) snapshotActors() (
 			sort.Strings(actionNames)
 			actions[name] = actionNames
 		}
+		if definition, ok := handler.(interface{ hibernateWebSockets() bool }); ok {
+			hibernateWebSockets[name] = definition.hibernateWebSockets()
+		}
 	}
 	sort.Strings(names)
-	return names, actions, handlers
+	return names, actions, hibernateWebSockets, handlers
 }
 
 func withDefaults(config Config) Config {

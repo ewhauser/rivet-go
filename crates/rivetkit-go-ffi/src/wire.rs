@@ -63,6 +63,8 @@ pub(crate) struct RunnerConfig {
     pub actor_names: Vec<String>,
     #[serde(default)]
     pub actor_actions: BTreeMap<String, Vec<String>>,
+    #[serde(default)]
+    pub actor_hibernate_websockets: BTreeMap<String, bool>,
     pub log_level: String,
 }
 
@@ -754,6 +756,7 @@ mod tests {
             total_slots: 4,
             actor_names: vec!["counter".to_owned()],
             actor_actions: BTreeMap::from([("counter".to_owned(), vec!["increment".to_owned()])]),
+            actor_hibernate_websockets: BTreeMap::from([("counter".to_owned(), true)]),
             log_level: "info".to_owned(),
         };
         write_golden(

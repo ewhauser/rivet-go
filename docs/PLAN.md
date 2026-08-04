@@ -556,3 +556,34 @@ action clients decode local-engine JSON with capped response bodies, and its
 WebSocket clients decode the existing pinned CBOR actor-connect event envelope
 under a 1 MiB read limit. No fuzz case, deliberately malformed-input test, or
 raw binary-payload test was added.
+
+## WebSocket hibernation opt-in deviation note — 2026-08-04
+
+The original M5 implementation registered every Go actor with
+`can_hibernate_websocket = true`. That differed from rivetkit TypeScript,
+rivetkit Rust, and `ActorConfig::default()` at v2.3.10, all of which default
+raw WebSocket hibernation to false. ABI 6 corrects the public default and adds
+`Actor.HibernateWebSockets`; the registry carries one boolean per actor in
+`RunnerConfig.actor_hibernate_websockets`, and the FFI maps it directly to
+core's `ActorConfig.can_hibernate_websocket` before registering that actor
+factory. Core continues to derive the per-open `can_hibernate` value and owns
+all persisted hibernation metadata.
+
+The false default closes a raw WebSocket when its actor sleeps, invoking
+`OnDisconnect`; an actor that opts in retains the M5 sleep/wake behavior and
+suppresses `OnDisconnect` for hibernation itself. The hibernation conformance
+actor, the chat example, and the hibernating soak chat actor now opt in
+explicitly. The soak also opens a default non-hibernating socket and requires
+the code-1001 `actor sleeping` close, so both paths remain active coverage.
+
+The configuration mismatch explained the earlier Go S3 latency gap. An
+interleaved loopback A/B changing only this flag moved Go client p50 from
+8.243 ms to 6.459 ms; the hibernating path emitted an engine acknowledgement
+for every message. This is about 1.8 ms of observed p50 overhead, not evidence
+that the callback-free FFI event pump is intrinsically that far behind.
+
+New decode surfaces: ABI 6 adds one bounded string-to-boolean map to the
+existing MessagePack `RunnerConfig`. Its cardinality is bounded by the
+existing 1,024 actor-name limit, and Rust rejects keys that are not present in
+`actor_names`. It adds no event, command, blob, or unbounded allocation
+surface. No fuzz or deliberately malformed-input test was added.

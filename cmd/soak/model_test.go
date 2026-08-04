@@ -79,6 +79,8 @@ func TestChaosActivationGuardRejectsVacuousRun(t *testing.T) {
 	counts.engineRestarts.Store(1)
 	counts.disconnects.Store(1)
 	counts.sleepWakes.Store(1)
+	counts.hibernatingWSWakes.Store(1)
+	counts.nonHibernatingCloses.Store(1)
 	counts.stalls.Store(1)
 	if err := counts.validate(); err == nil || !strings.Contains(err.Error(), "action_panic") {
 		t.Fatalf("activation error = %v", err)

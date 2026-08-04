@@ -109,8 +109,13 @@ if err := rivet.Serve(registry); err != nil {
 ```
 
 [`examples/chat`](examples/chat) is a runnable raw-WebSocket actor with durable
-message sequencing and broadcast. [`examples/counter`](examples/counter) can
-also expose SDK metrics through `expvar`:
+message sequencing and broadcast. Raw WebSocket hibernation is opt-in with
+`Actor.HibernateWebSockets`: it preserves connections across actor sleep but
+adds a per-message engine acknowledgement. The default is false and closes
+connections when the actor sleeps, matching rivetkit v2.3.10. See
+[WebSocket hibernation](docs/WEBSOCKET-HIBERNATION.md) for the tradeoff.
+[`examples/counter`](examples/counter) can also expose SDK metrics through
+`expvar`:
 
 ```sh
 go run ./examples/counter -metrics-address 127.0.0.1:6060

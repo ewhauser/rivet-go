@@ -198,14 +198,15 @@ func TestValidateShapeEnforcesBoundaryLimitsBeforeDecode(t *testing.T) {
 func TestGoEncoderOutputsPassShapeValidation(t *testing.T) {
 	values := []any{
 		RunnerConfig{
-			EngineEndpoint: "http://127.0.0.1:6420",
-			Namespace:      "default",
-			RunnerName:     "shape-test",
-			Version:        1,
-			TotalSlots:     1,
-			ActorNames:     []string{},
-			ActorActions:   map[string][]string{},
-			LogLevel:       "info",
+			EngineEndpoint:           "http://127.0.0.1:6420",
+			Namespace:                "default",
+			RunnerName:               "shape-test",
+			Version:                  1,
+			TotalSlots:               1,
+			ActorNames:               []string{},
+			ActorActions:             map[string][]string{},
+			ActorHibernateWebSockets: map[string]bool{},
+			LogLevel:                 "info",
 		},
 		CommandBatch{Commands: []Command{}},
 		EventBatch{Seq: 1, Events: []Event{{

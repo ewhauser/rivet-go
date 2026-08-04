@@ -17,9 +17,10 @@ the deadline; their accepted state and alarm operations are fenced before
 reason `runner shutting down` while core's transport is still able to deliver
 the close frame. An already-admitted WebSocket handler may finish internally,
 but the terminating process does not keep the client transport open for a late
-reply. Ordinary actor sleep still hibernates eligible sockets. The native
-runner then emits `RunnerStopped`, the pump closes its handle, and a clean drain
-returns nil so `main` exits with code zero.
+reply. Ordinary actor sleep hibernates sockets only when the actor definition
+sets `HibernateWebSockets: true`; the default closes them with code 1001 and
+reason `actor sleeping`. The native runner then emits `RunnerStopped`, the pump
+closes its handle, and a clean drain returns nil so `main` exits with code zero.
 
 If the deadline expires, core aborts the remaining runtime work and reports a
 non-graceful drain. In-flight action and HTTP clients must not observe success,
@@ -172,8 +173,8 @@ download dependency.
 
 ## Known v2.3.10 limitations
 
-The following 12 bullets are the grouped, complete deviation summary for the
-M1-M6 pin-specific notes in `docs/FFI-BOUNDARY.md`:
+The following 13 bullets are the grouped, complete deviation summary for the
+pin-specific notes in `docs/FFI-BOUNDARY.md`:
 
 - Core calls runner registration an envoy and exposes it through `/envoys`.
   The public SDK deliberately retains runner vocabulary.
@@ -204,6 +205,11 @@ M1-M6 pin-specific notes in `docs/FFI-BOUNDARY.md`:
   its FIFO acknowledgement, with a 60-second bound. Frames accepted in the
   sleep-intent gap finish on the old generation; later frames wake the new
   generation. Hibernation itself suppresses `OnDisconnect`.
+- Raw WebSocket hibernation is opt-in per actor through
+  `Actor.HibernateWebSockets`. The false default matches the pinned TypeScript,
+  Rust, and core defaults and avoids the engine acknowledgement on every
+  message. Enabling it preserves sockets across sleep but added about 1.8 ms
+  client-observed p50 per loopback echo in the recorded investigation.
 - After abrupt engine replacement, an already-sleeping actor may need one
   demand rehydration to reconcile its persisted alarm. A client that vanished
   while fully asleep may be pruned before Go observes `OnDisconnect`.
@@ -217,5 +223,6 @@ design.
 
 ## Tracked follow-ups
 
-There are no unresolved code TODOs in M6. Future pin changes must convert any
-new limitation into an issue reference here before leaving a TODO in code.
+There are no unresolved code TODOs in the current implementation. Future pin
+changes must convert any new limitation into an issue reference here before
+leaving a TODO in code.

@@ -131,22 +131,25 @@ func parseFlags() (soakConfig, error) {
 }
 
 type soakRun struct {
-	config       soakConfig
-	runnerName   string
-	engine       *devengine.Engine
-	api          *engineAPI
-	hooks        *soakHooks
-	errors       *errorSink
-	gate         *workGate
-	activations  *activationCounts
-	chatOracle   *chatOracle
-	alarmOracle  *alarmOracle
-	clients      *clientManager
-	chatActor    string
-	alarmActor   string
-	counterIDs   []string
-	counterTruth []counterState
-	chaosMu      sync.Mutex
+	config                     soakConfig
+	runnerName                 string
+	engine                     *devengine.Engine
+	api                        *engineAPI
+	hooks                      *soakHooks
+	errors                     *errorSink
+	gate                       *workGate
+	activations                *activationCounts
+	chatOracle                 *chatOracle
+	alarmOracle                *alarmOracle
+	clients                    *clientManager
+	chatActor                  string
+	alarmActor                 string
+	chatSlept                  chan struct{}
+	nonHibernatingStopped      chan struct{}
+	nonHibernatingDisconnected chan struct{}
+	counterIDs                 []string
+	counterTruth               []counterState
+	chaosMu                    sync.Mutex
 }
 
 func runSoak(parent context.Context, config soakConfig) (summary soakSummary, runErr error) {
@@ -202,17 +205,20 @@ func runSoak(parent context.Context, config soakConfig) (summary soakSummary, ru
 	defer engine.Kill()
 
 	run := &soakRun{
-		config:       config,
-		runnerName:   fmt.Sprintf("rivet-go-soak-%d", config.seed),
-		engine:       engine,
-		api:          newEngineAPI(engine.Endpoint),
-		hooks:        newSoakHooks(),
-		errors:       newErrorSink(),
-		gate:         newWorkGate(),
-		activations:  &activationCounts{},
-		chatOracle:   newChatOracle(),
-		alarmOracle:  newAlarmOracle(),
-		counterTruth: make([]counterState, config.counters),
+		config:                     config,
+		runnerName:                 fmt.Sprintf("rivet-go-soak-%d", config.seed),
+		engine:                     engine,
+		api:                        newEngineAPI(engine.Endpoint),
+		hooks:                      newSoakHooks(),
+		errors:                     newErrorSink(),
+		gate:                       newWorkGate(),
+		activations:                &activationCounts{},
+		chatOracle:                 newChatOracle(),
+		alarmOracle:                newAlarmOracle(),
+		chatSlept:                  make(chan struct{}, 1),
+		nonHibernatingStopped:      make(chan struct{}, 1),
+		nonHibernatingDisconnected: make(chan struct{}, 1),
+		counterTruth:               make([]counterState, config.counters),
 	}
 	defer run.api.close()
 
@@ -361,11 +367,13 @@ func runSoak(parent context.Context, config soakConfig) (summary soakSummary, ru
 		ReceivedReceipts:  receivedReceipts,
 		AlarmFires:        alarmTruth.Fired,
 		Chaos: map[string]int64{
-			"engine_restarts":    run.activations.engineRestarts.Load(),
-			"client_disconnects": run.activations.disconnects.Load(),
-			"sleep_wakes":        run.activations.sleepWakes.Load(),
-			"stalled_clients":    run.activations.stalls.Load(),
-			"action_panics":      run.activations.panics.Load(),
+			"engine_restarts":           run.activations.engineRestarts.Load(),
+			"client_disconnects":        run.activations.disconnects.Load(),
+			"sleep_wakes":               run.activations.sleepWakes.Load(),
+			"hibernating_ws_wakes":      run.activations.hibernatingWSWakes.Load(),
+			"non_hibernating_ws_closes": run.activations.nonHibernatingCloses.Load(),
+			"stalled_clients":           run.activations.stalls.Load(),
+			"action_panics":             run.activations.panics.Load(),
 		},
 		Metrics:          counters,
 		GoroutinesBefore: goroutinesBefore,
@@ -390,10 +398,21 @@ func (r *soakRun) registry() (*rivet.Registry, error) {
 		return nil, err
 	}
 	if err := rivet.Register(registry, "soak-chat", rivet.Actor[chatState]{
+		HibernateWebSockets: true,
 		Actions: rivet.Actions[chatState]{
 			"snapshot": rivet.Action(func(ctx *rivet.Context[chatState], _ struct{}) (chatState, error) {
 				return *ctx.State(), nil
 			}),
+			"sleep": rivet.Action(func(ctx *rivet.Context[chatState], _ struct{}) (chatState, error) {
+				return *ctx.State(), ctx.Sleep()
+			}),
+		},
+		OnStop: func(*rivet.Context[chatState]) error {
+			select {
+			case r.chatSlept <- struct{}{}:
+			default:
+			}
+			return nil
 		},
 		OnConnect: func(_ *rivet.Context[chatState], connection *rivet.Connection) error {
 			label := headerValue(connection.Headers(), "x-client-label")
@@ -431,6 +450,36 @@ func (r *soakRun) registry() (*rivet.Registry, error) {
 		OnDisconnect: func(_ *rivet.Context[chatState], connection *rivet.Connection) {
 			label := headerValue(connection.Headers(), "x-client-label")
 			r.chatOracle.observeDisconnect(label)
+		},
+	}); err != nil {
+		return nil, err
+	}
+	if err := rivet.Register(registry, "soak-non-hibernating-websocket", rivet.Actor[struct{}]{
+		OnConnect: func(_ *rivet.Context[struct{}], connection *rivet.Connection) error {
+			return connection.SendText("ready:non-hibernating")
+		},
+		OnMessage: func(ctx *rivet.Context[struct{}], connection *rivet.Connection, message rivet.Message) {
+			if message.Binary || string(message.Data) != "sleep" {
+				r.errors.report(errors.New("non-hibernating soak actor received an unexpected message"))
+				_ = connection.Close(1003, "expected sleep")
+				return
+			}
+			if err := ctx.Sleep(); err != nil {
+				r.errors.report(fmt.Errorf("sleep non-hibernating WebSocket actor: %w", err))
+			}
+		},
+		OnDisconnect: func(*rivet.Context[struct{}], *rivet.Connection) {
+			select {
+			case r.nonHibernatingDisconnected <- struct{}{}:
+			default:
+			}
+		},
+		OnStop: func(*rivet.Context[struct{}]) error {
+			select {
+			case r.nonHibernatingStopped <- struct{}{}:
+			default:
+			}
+			return nil
 		},
 	}); err != nil {
 		return nil, err
@@ -502,13 +551,85 @@ func (r *soakRun) createWorkload(ctx context.Context) error {
 	}
 	r.alarmActor = alarmActor
 	r.clients = newClientManager(r.engine.Endpoint, r.chatActor, r.chatOracle, r.errors)
-	connectCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	connectCtx, cancel := context.WithTimeout(ctx, 90*time.Second)
 	defer cancel()
 	for range r.config.clients {
 		if _, err := r.clients.connect(connectCtx); err != nil {
 			return err
 		}
 	}
+	if err := r.exerciseHibernatingWebSocket(connectCtx); err != nil {
+		return err
+	}
+	nonHibernatingActor, err := r.api.createActor(
+		connectCtx,
+		"soak-non-hibernating-websocket",
+		r.runnerName,
+		"non-hibernating-websocket",
+	)
+	if err != nil {
+		return err
+	}
+	if err := exerciseNonHibernatingWebSocket(
+		connectCtx,
+		r.engine.Endpoint,
+		nonHibernatingActor,
+	); err != nil {
+		return err
+	}
+	for name, observation := range map[string]<-chan struct{}{
+		"OnDisconnect": r.nonHibernatingDisconnected,
+		"OnStop":       r.nonHibernatingStopped,
+	} {
+		select {
+		case <-observation:
+		case <-connectCtx.Done():
+			return fmt.Errorf("wait for non-hibernating WebSocket %s: %w", name, connectCtx.Err())
+		}
+	}
+	r.activations.nonHibernatingCloses.Add(1)
+	return nil
+}
+
+func (r *soakRun) exerciseHibernatingWebSocket(ctx context.Context) error {
+	actual, err := gatewayAction[chatState](ctx, r.api, r.chatActor, "sleep", struct{}{})
+	if err != nil {
+		return fmt.Errorf("sleep hibernating chat actor: %w", err)
+	}
+	if err := compareChat(actual, r.chatOracle.stateTruth()); err != nil {
+		return fmt.Errorf("chat state before hibernation: %w", err)
+	}
+	select {
+	case <-r.chatSlept:
+	case <-ctx.Done():
+		return fmt.Errorf("wait for hibernating chat actor sleep: %w", ctx.Err())
+	}
+	if err := r.api.waitActorSleeping(ctx, r.chatActor); err != nil {
+		return fmt.Errorf("wait for engine-visible hibernating chat sleep: %w", err)
+	}
+	labels := r.clients.labels()
+	if len(labels) == 0 {
+		return errors.New("hibernation probe has no connected chat clients")
+	}
+	const token = "chat-hibernation-probe"
+	if _, err := r.chatOracle.expectIntent(token, labels); err != nil {
+		return err
+	}
+	if err := r.clients.client(labels[0]).write(token); err != nil {
+		return fmt.Errorf("write hibernation wake probe: %w", err)
+	}
+	if err := waitUntil(ctx, 25*time.Millisecond, func() (bool, error) {
+		return r.chatOracle.observed(token), nil
+	}); err != nil {
+		return fmt.Errorf("wait for hibernation wake probe: %w", err)
+	}
+	if err := waitUntil(ctx, 25*time.Millisecond, func() (bool, error) {
+		err := r.chatOracle.convergence("")
+		return err == nil, err
+	}); err != nil {
+		return fmt.Errorf("converge hibernation wake broadcast: %w", err)
+	}
+	r.activations.hibernatingWSWakes.Add(1)
 	return nil
 }
 

@@ -1872,14 +1872,15 @@ func nonEngineEndpoint(t *testing.T) string {
 func expectRunnerNewError(t *testing.T, endpoint string) ffi.ErrorPayload {
 	t.Helper()
 	config, err := wire.EncodeRunnerConfig(wire.RunnerConfig{
-		EngineEndpoint: endpoint,
-		Namespace:      "default",
-		RunnerName:     "rivet-go-error-probe",
-		Version:        1,
-		TotalSlots:     1,
-		ActorNames:     []string{},
-		ActorActions:   map[string][]string{},
-		LogLevel:       "error",
+		EngineEndpoint:           endpoint,
+		Namespace:                "default",
+		RunnerName:               "rivet-go-error-probe",
+		Version:                  1,
+		TotalSlots:               1,
+		ActorNames:               []string{},
+		ActorActions:             map[string][]string{},
+		ActorHibernateWebSockets: map[string]bool{},
+		LogLevel:                 "error",
 	})
 	if err != nil {
 		t.Fatalf("encode config: %v", err)
@@ -1910,14 +1911,15 @@ func startNativeRunner(t *testing.T, endpoint, name string) *ffi.Runner {
 func startNativeRunnerWithActors(t *testing.T, endpoint, name string, actorNames []string) *ffi.Runner {
 	t.Helper()
 	config, err := wire.EncodeRunnerConfig(wire.RunnerConfig{
-		EngineEndpoint: endpoint,
-		Namespace:      "default",
-		RunnerName:     name,
-		Version:        1,
-		TotalSlots:     1,
-		ActorNames:     actorNames,
-		ActorActions:   map[string][]string{},
-		LogLevel:       "error",
+		EngineEndpoint:           endpoint,
+		Namespace:                "default",
+		RunnerName:               name,
+		Version:                  1,
+		TotalSlots:               1,
+		ActorNames:               actorNames,
+		ActorActions:             map[string][]string{},
+		ActorHibernateWebSockets: map[string]bool{},
+		LogLevel:                 "error",
 	})
 	if err != nil {
 		t.Fatalf("encode config: %v", err)

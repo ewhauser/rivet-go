@@ -62,8 +62,12 @@ gateway. They require an actor to be absent from the runner
   ordered client messages sent while the actor is asleep, uses those messages
   to rehydrate the actor before its later alarm, receives targeted and
   broadcast traffic on the same socket, and invokes `OnDisconnect` only for
-  the later real close. The stopped generation sees an unsaved mutation while
-  the rehydrated generation reloads the earlier persisted value.
+  the later real close. That actor explicitly sets `HibernateWebSockets`; a
+  second actor leaves the option at its false default and proves sleep closes
+  the socket with code 1001 and reason `actor sleeping`, invokes
+  `OnDisconnect`, and stops the actor. The stopped hibernating generation sees
+  an unsaved mutation while the rehydrated generation reloads the earlier
+  persisted value.
 
 When a WebSocket handler itself requests sleep, the intent is admitted before
 that handler returns but applied after its FIFO acknowledgement. Frames sent

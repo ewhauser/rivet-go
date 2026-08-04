@@ -18,10 +18,14 @@ import (
 // Actor defines typed state, lifecycle hooks, actions, raw HTTP handling, and
 // raw gateway WebSocket handling.
 type Actor[T any] struct {
-	OnStart func(*Context[T]) error
-	OnStop  func(*Context[T]) error
-	OnAlarm func(*Context[T]) error
-	Actions Actions[T]
+	// HibernateWebSockets keeps raw gateway WebSockets connected while this
+	// actor sleeps. It is opt-in because the pinned engine acknowledges every
+	// message on hibernatable connections, adding per-message latency.
+	HibernateWebSockets bool
+	OnStart             func(*Context[T]) error
+	OnStop              func(*Context[T]) error
+	OnAlarm             func(*Context[T]) error
+	Actions             Actions[T]
 	// OnFetch handles buffered HTTP requests from the pinned core. Response
 	// headers lock on the first WriteHeader or Write, concurrent Write calls are
 	// serialized, and writes after OnFetch returns fail. Header must not be
@@ -137,6 +141,10 @@ func (a *actorAdapter[T]) actionNames() []string {
 		names = append(names, name)
 	}
 	return names
+}
+
+func (a *actorAdapter[T]) hibernateWebSockets() bool {
+	return a.definition.HibernateWebSockets
 }
 
 func (a *actorAdapter[T]) Start(

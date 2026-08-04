@@ -632,6 +632,7 @@ func TestHibernatingWebSocketSurvivesSleep(t *testing.T) {
 
 	registry := rivet.NewRegistry()
 	if err := rivet.Register(registry, "m5-hibernating-websocket", rivet.Actor[websocketSleepState]{
+		HibernateWebSockets: true,
 		OnStart: func(ctx *rivet.Context[websocketSleepState]) error {
 			started <- lifecycleObservation{
 				generation: ctx.Generation(), count: ctx.State().Count,
@@ -876,5 +877,77 @@ func TestHibernatingWebSocketSurvivesSleep(t *testing.T) {
 	case <-time.After(20 * time.Second):
 		t.Fatal("actor did not sleep before cleanup")
 	}
+	deleteActor(t, engine.endpoint, actor.ActorID)
+}
+
+func TestDefaultWebSocketClosesOnSleep(t *testing.T) {
+	if testing.Short() {
+		t.Skip("real-engine conformance is disabled by -short")
+	}
+	engineBinary, err := acquireEngine(context.Background())
+	if err != nil {
+		t.Fatalf("obtain Rivet engine %s: %v\n%s", engineTag, err, engineRemediation())
+	}
+	engine := startEngine(t, engineBinary)
+
+	connected := make(chan bool, 1)
+	disconnected := make(chan struct{}, 1)
+	stopped := make(chan struct{}, 1)
+	registry := rivet.NewRegistry()
+	if err := rivet.Register(registry, "m5-default-websocket", rivet.Actor[struct{}]{
+		OnConnect: func(_ *rivet.Context[struct{}], connection *rivet.Connection) error {
+			connected <- connection.CanHibernate()
+			return nil
+		},
+		OnDisconnect: func(*rivet.Context[struct{}], *rivet.Connection) {
+			disconnected <- struct{}{}
+		},
+		OnStop: func(*rivet.Context[struct{}]) error {
+			stopped <- struct{}{}
+			return nil
+		},
+		Actions: rivet.Actions[struct{}]{
+			"sleep": rivet.Action(func(ctx *rivet.Context[struct{}], _ struct{}) (bool, error) {
+				return true, ctx.Sleep()
+			}),
+		},
+	}); err != nil {
+		t.Fatalf("register default WebSocket actor: %v", err)
+	}
+	runnerName := fmt.Sprintf("rivet-go-m5-default-ws-%d", time.Now().UnixNano())
+	startRegistry(t, engine, runnerName, registry)
+	actor := createActor(t, engine.endpoint, "m5-default-websocket", runnerName, "restart", nil, nil)
+	client := openGatewayWebSocket(t, engine.endpoint, actor.ActorID, "m5-default", true)
+	select {
+	case canHibernate := <-connected:
+		if canHibernate {
+			t.Fatal("default actor opened a hibernatable WebSocket")
+		}
+	case <-time.After(websocketTestTimeout):
+		t.Fatal("default WebSocket actor did not observe OnConnect")
+	}
+
+	assertSuccessfulAction(t, gatewayAction(
+		t,
+		engine.endpoint,
+		actor.ActorID,
+		"sleep",
+		[]any{struct{}{}},
+		websocketTestTimeout,
+	))
+	assertGatewayWebSocketClose(t, client, 1001, "actor sleeping")
+	select {
+	case <-disconnected:
+	case <-time.After(websocketTestTimeout):
+		t.Fatal("default WebSocket close did not invoke OnDisconnect")
+	}
+	select {
+	case <-stopped:
+	case <-time.After(20 * time.Second):
+		t.Fatal("default WebSocket actor did not stop after sleep")
+	}
+	waitForActor(t, engine.endpoint, actor.ActorID, false, func(actor actorRecord) bool {
+		return actor.ConnectableTS == nil && actor.SleepTS != nil && actor.DestroyTS == nil
+	})
 	deleteActor(t, engine.endpoint, actor.ActorID)
 }

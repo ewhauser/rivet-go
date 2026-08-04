@@ -25,6 +25,72 @@ type actorEventEnvelope struct {
 	} `cbor:"body"`
 }
 
+func exerciseNonHibernatingWebSocket(ctx context.Context, endpoint, actorID string) error {
+	websocketURL, err := url.Parse(endpoint)
+	if err != nil {
+		return fmt.Errorf("parse engine endpoint: %w", err)
+	}
+	switch websocketURL.Scheme {
+	case "http":
+		websocketURL.Scheme = "ws"
+	case "https":
+		websocketURL.Scheme = "wss"
+	default:
+		return fmt.Errorf("unsupported engine endpoint scheme %q", websocketURL.Scheme)
+	}
+	websocketURL.Path = "/gateway/" + url.PathEscape(actorID) + "/websocket/soak"
+	headers := make(http.Header)
+	headers.Set("Authorization", "Bearer dev")
+	dialer := websocket.Dialer{
+		HandshakeTimeout: 15 * time.Second,
+		Subprotocols: []string{
+			"rivet",
+			"rivet_target.actor",
+			"rivet_actor." + actorID,
+			"rivet_token.dev",
+		},
+	}
+	conn, response, err := dialer.DialContext(ctx, websocketURL.String(), headers)
+	if err != nil {
+		if response != nil && response.Body != nil {
+			_ = response.Body.Close()
+		}
+		return fmt.Errorf("dial non-hibernating WebSocket: %w", err)
+	}
+	defer conn.Close()
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		deadline = time.Now().Add(30 * time.Second)
+	}
+	if err := conn.SetReadDeadline(deadline); err != nil {
+		return err
+	}
+	if err := conn.SetWriteDeadline(deadline); err != nil {
+		return err
+	}
+	kind, data, err := conn.ReadMessage()
+	if err != nil {
+		return fmt.Errorf("read non-hibernating WebSocket ready frame: %w", err)
+	}
+	if kind != websocket.TextMessage || string(data) != "ready:non-hibernating" {
+		return fmt.Errorf("non-hibernating WebSocket ready frame kind=%d data=%q", kind, data)
+	}
+	if err := conn.WriteMessage(websocket.TextMessage, []byte("sleep")); err != nil {
+		return fmt.Errorf("write non-hibernating WebSocket sleep probe: %w", err)
+	}
+	for {
+		_, _, err := conn.ReadMessage()
+		if err == nil {
+			continue
+		}
+		var closeError *websocket.CloseError
+		if !errors.As(err, &closeError) || closeError.Code != 1001 || closeError.Text != "actor sleeping" {
+			return fmt.Errorf("non-hibernating WebSocket close=%v, want 1001 actor sleeping", err)
+		}
+		return nil
+	}
+}
+
 type wsClient struct {
 	label  string
 	conn   *websocket.Conn

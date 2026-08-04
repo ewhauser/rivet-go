@@ -57,14 +57,15 @@ const (
 
 // RunnerConfig is consumed by rk_runner_new.
 type RunnerConfig struct {
-	EngineEndpoint string              `msgpack:"engine_endpoint"`
-	Namespace      string              `msgpack:"namespace"`
-	RunnerName     string              `msgpack:"runner_name"`
-	Version        uint32              `msgpack:"version"`
-	TotalSlots     uint32              `msgpack:"total_slots"`
-	ActorNames     []string            `msgpack:"actor_names"`
-	ActorActions   map[string][]string `msgpack:"actor_actions"`
-	LogLevel       string              `msgpack:"log_level"`
+	EngineEndpoint           string              `msgpack:"engine_endpoint"`
+	Namespace                string              `msgpack:"namespace"`
+	RunnerName               string              `msgpack:"runner_name"`
+	Version                  uint32              `msgpack:"version"`
+	TotalSlots               uint32              `msgpack:"total_slots"`
+	ActorNames               []string            `msgpack:"actor_names"`
+	ActorActions             map[string][]string `msgpack:"actor_actions"`
+	ActorHibernateWebSockets map[string]bool     `msgpack:"actor_hibernate_websockets"`
+	LogLevel                 string              `msgpack:"log_level"`
 }
 
 // EventBatch is returned by rk_runner_poll. Seq is monotonic per runner.

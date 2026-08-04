@@ -436,20 +436,24 @@ func (g *workGate) resume() {
 }
 
 type activationCounts struct {
-	engineRestarts atomic.Int64
-	disconnects    atomic.Int64
-	sleepWakes     atomic.Int64
-	stalls         atomic.Int64
-	panics         atomic.Int64
+	engineRestarts       atomic.Int64
+	disconnects          atomic.Int64
+	sleepWakes           atomic.Int64
+	hibernatingWSWakes   atomic.Int64
+	nonHibernatingCloses atomic.Int64
+	stalls               atomic.Int64
+	panics               atomic.Int64
 }
 
 func (a *activationCounts) validate() error {
 	values := map[string]int64{
-		"engine_restart":    a.engineRestarts.Load(),
-		"client_disconnect": a.disconnects.Load(),
-		"actor_sleep_wake":  a.sleepWakes.Load(),
-		"stalled_ws_client": a.stalls.Load(),
-		"action_panic":      a.panics.Load(),
+		"engine_restart":           a.engineRestarts.Load(),
+		"client_disconnect":        a.disconnects.Load(),
+		"actor_sleep_wake":         a.sleepWakes.Load(),
+		"hibernating_ws_wake":      a.hibernatingWSWakes.Load(),
+		"non_hibernating_ws_close": a.nonHibernatingCloses.Load(),
+		"stalled_ws_client":        a.stalls.Load(),
+		"action_panic":             a.panics.Load(),
 	}
 	var missing []string
 	for name, value := range values {

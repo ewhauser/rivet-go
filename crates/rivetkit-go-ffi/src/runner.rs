@@ -319,6 +319,14 @@ fn validate_config(config: &RunnerConfig) -> Result<(), ErrorPayload> {
             }
         }
     }
+    for actor_name in config.actor_hibernate_websockets.keys() {
+        if !seen_actor_names.contains(actor_name) {
+            return Err(ErrorPayload::new(
+                "invalid_config",
+                format!("actor_hibernate_websockets contains unknown actor `{actor_name}`"),
+            ));
+        }
+    }
     if !matches!(
         config.log_level.as_str(),
         "trace" | "debug" | "info" | "warn" | "error"
@@ -381,7 +389,12 @@ async fn run_runner(
     let (handle_tx, handle_rx) = oneshot::channel();
     let actor_proxy = ActorProxy::new(events.clone(), correlations.clone());
     let mut registry = CoreRegistry::new();
-    actor_proxy.register(&mut registry, &config.actor_names, &config.actor_actions);
+    actor_proxy.register(
+        &mut registry,
+        &config.actor_names,
+        &config.actor_actions,
+        &config.actor_hibernate_websockets,
+    );
     let serve_config = ServeConfig {
         version: config.version,
         endpoint: config.engine_endpoint.clone(),
@@ -713,23 +726,38 @@ mod tests {
             total_slots: 1,
             actor_names: Vec::new(),
             actor_actions: BTreeMap::new(),
+            actor_hibernate_websockets: BTreeMap::new(),
             log_level: "info".to_owned(),
         }
     }
 
     #[test]
-    fn validates_m5_config() {
+    fn validates_runner_config() {
         assert!(validate_config(&valid_config()).is_ok());
         let mut config = valid_config();
         config.actor_names.push("actor".to_owned());
         config
             .actor_actions
             .insert("actor".to_owned(), vec!["increment".to_owned()]);
+        config
+            .actor_hibernate_websockets
+            .insert("actor".to_owned(), true);
         assert!(validate_config(&config).is_ok());
         config.actor_names.push("actor".to_owned());
         assert_eq!(
             validate_config(&config)
                 .expect_err("duplicate actor name")
+                .code,
+            "invalid_config"
+        );
+
+        let mut config = valid_config();
+        config
+            .actor_hibernate_websockets
+            .insert("unknown".to_owned(), true);
+        assert_eq!(
+            validate_config(&config)
+                .expect_err("unknown hibernation actor")
                 .code,
             "invalid_config"
         );

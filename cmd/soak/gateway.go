@@ -44,6 +44,56 @@ type envoyRecord struct {
 	LastPingTS int64  `json:"last_ping_ts"`
 }
 
+type actorRecord struct {
+	ActorID       string `json:"actor_id"`
+	ConnectableTS *int64 `json:"connectable_ts"`
+	SleepTS       *int64 `json:"sleep_ts"`
+	DestroyTS     *int64 `json:"destroy_ts"`
+}
+
+func (a *engineAPI) waitActorSleeping(ctx context.Context, actorID string) error {
+	return waitUntil(ctx, 100*time.Millisecond, func() (bool, error) {
+		query := url.Values{}
+		query.Set("namespace", "default")
+		query.Set("actor_id", actorID)
+		request, err := http.NewRequestWithContext(
+			ctx,
+			http.MethodGet,
+			a.endpoint+"/actors?"+query.Encode(),
+			nil,
+		)
+		if err != nil {
+			return false, err
+		}
+		request.Header.Set("Authorization", "Bearer dev")
+		response, err := a.client.Do(request)
+		if err != nil {
+			return false, err
+		}
+		defer response.Body.Close()
+		if response.StatusCode != http.StatusOK {
+			body, _ := io.ReadAll(io.LimitReader(response.Body, 8<<10))
+			return false, fmt.Errorf("list actor %s: %s: %s", actorID, response.Status, body)
+		}
+		var payload struct {
+			Actors []actorRecord `json:"actors"`
+		}
+		if err := decodeBoundedJSON(response.Body, &payload); err != nil {
+			return false, err
+		}
+		for _, actor := range payload.Actors {
+			if actor.ActorID != actorID || actor.ConnectableTS != nil || actor.SleepTS == nil || actor.DestroyTS != nil {
+				continue
+			}
+			// v2.3.10 needs a brief post-checkpoint settlement before a
+			// hibernated gateway message can reliably allocate the next
+			// generation. This is the same state-based gate as conformance.
+			return !time.Now().Before(time.UnixMilli(*actor.SleepTS).Add(2 * time.Second)), nil
+		}
+		return false, nil
+	})
+}
+
 func (a *engineAPI) waitRunnerPingAfter(ctx context.Context, runnerName string, timestamp int64) error {
 	return waitUntil(ctx, 100*time.Millisecond, func() (bool, error) {
 		request, err := http.NewRequestWithContext(ctx, http.MethodGet,

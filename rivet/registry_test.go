@@ -22,10 +22,13 @@ func TestConfigDefaults(t *testing.T) {
 
 func TestRegisterBuildsSortedManifestAndRejectsDuplicates(t *testing.T) {
 	registry := NewRegistry()
-	if err := Register(registry, "zeta", Actor[struct{}]{Actions: Actions[struct{}]{
-		"z": Action(func(*Context[struct{}], struct{}) (struct{}, error) { return struct{}{}, nil }),
-		"a": Action(func(*Context[struct{}], struct{}) (struct{}, error) { return struct{}{}, nil }),
-	}}); err != nil {
+	if err := Register(registry, "zeta", Actor[struct{}]{
+		HibernateWebSockets: true,
+		Actions: Actions[struct{}]{
+			"z": Action(func(*Context[struct{}], struct{}) (struct{}, error) { return struct{}{}, nil }),
+			"a": Action(func(*Context[struct{}], struct{}) (struct{}, error) { return struct{}{}, nil }),
+		},
+	}); err != nil {
 		t.Fatalf("Register zeta: %v", err)
 	}
 	if err := Register(registry, "alpha", Actor[int]{}); err != nil {
@@ -34,7 +37,7 @@ func TestRegisterBuildsSortedManifestAndRejectsDuplicates(t *testing.T) {
 	if err := Register(registry, "alpha", Actor[int]{}); err == nil {
 		t.Fatal("duplicate Register succeeded")
 	}
-	names, actions, handlers := registry.snapshotActors()
+	names, actions, hibernateWebSockets, handlers := registry.snapshotActors()
 	if !reflect.DeepEqual(names, []string{"alpha", "zeta"}) {
 		t.Fatalf("actor names = %#v", names)
 	}
@@ -43,6 +46,9 @@ func TestRegisterBuildsSortedManifestAndRejectsDuplicates(t *testing.T) {
 	}
 	if len(actions) != 2 || !reflect.DeepEqual(actions["zeta"], []string{"a", "z"}) {
 		t.Fatalf("actor action manifests = %#v", actions)
+	}
+	if !reflect.DeepEqual(hibernateWebSockets, map[string]bool{"alpha": false, "zeta": true}) {
+		t.Fatalf("actor WebSocket hibernation manifest = %#v", hibernateWebSockets)
 	}
 }
 

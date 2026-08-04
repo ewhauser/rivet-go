@@ -21,14 +21,15 @@ func golden(t *testing.T, name string) []byte {
 
 func TestRustRunnerConfigGolden(t *testing.T) {
 	want := RunnerConfig{
-		EngineEndpoint: "http://127.0.0.1:6420",
-		Namespace:      "default",
-		RunnerName:     "rivet-go-golden",
-		Version:        1,
-		TotalSlots:     4,
-		ActorNames:     []string{"counter"},
-		ActorActions:   map[string][]string{"counter": {"increment"}},
-		LogLevel:       "info",
+		EngineEndpoint:           "http://127.0.0.1:6420",
+		Namespace:                "default",
+		RunnerName:               "rivet-go-golden",
+		Version:                  1,
+		TotalSlots:               4,
+		ActorNames:               []string{"counter"},
+		ActorActions:             map[string][]string{"counter": {"increment"}},
+		ActorHibernateWebSockets: map[string]bool{"counter": true},
+		LogLevel:                 "info",
 	}
 	var got RunnerConfig
 	data := golden(t, "runner_config.msgpack")

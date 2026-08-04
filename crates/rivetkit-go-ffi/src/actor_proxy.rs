@@ -404,6 +404,7 @@ impl ActorProxy {
         registry: &mut CoreRegistry,
         actor_names: &[String],
         actor_actions: &BTreeMap<String, Vec<String>>,
+        actor_hibernate_websockets: &BTreeMap<String, bool>,
     ) {
         for actor_name in actor_names {
             let proxy = self.clone();
@@ -416,7 +417,12 @@ impl ActorProxy {
                 // otherwise need to ship.
                 remote_sqlite: true,
                 no_sleep: false,
-                can_hibernate_websocket: CanHibernateWebSocket::Bool(true),
+                can_hibernate_websocket: CanHibernateWebSocket::Bool(
+                    actor_hibernate_websockets
+                        .get(actor_name)
+                        .copied()
+                        .unwrap_or(false),
+                ),
                 max_incoming_message_size: MAX_BODY_CHUNK as u32,
                 max_outgoing_message_size: MAX_BODY_CHUNK as u32,
                 action_timeout: ACTION_RESULT_TIMEOUT,
