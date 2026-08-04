@@ -72,9 +72,11 @@ The transcript is:
 3
 ```
 
-Stop either Go runner with Ctrl-C or `SIGTERM`; admitted actor work drains,
-WebSockets receive code 1001, the engine observes the runner leave, and the
-process exits successfully.
+Stop a runner with Ctrl-C during development, or send `SIGTERM` to its built
+executable. Admitted actor work drains, WebSockets receive code 1001, and the
+engine observes the runner leave. A built runner exits successfully after a
+clean drain; the `go run` wrapper may still report its own interrupt status
+after Ctrl-C even when the runner log records a completed drain.
 
 ## SDK shape
 
