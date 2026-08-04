@@ -57,6 +57,8 @@ type soakSummary struct {
 	DataDir           string           `json:"data_dir,omitempty"`
 }
 
+const soakShutdownTimeout = 60 * time.Second
+
 func main() {
 	config, err := parseFlags()
 	if err != nil {
@@ -222,11 +224,15 @@ func runSoak(parent context.Context, config soakConfig) (summary soakSummary, ru
 	serveResult := make(chan error, 1)
 	go func() {
 		serveResult <- registry.Serve(serveCtx, rivet.Config{
-			Endpoint:        engine.Endpoint,
-			RunnerName:      run.runnerName,
-			TotalSlots:      64,
-			LogLevel:        "error",
-			ShutdownTimeout: 10 * time.Second,
+			Endpoint:   engine.Endpoint,
+			RunnerName: run.runnerName,
+			TotalSlots: 64,
+			LogLevel:   "error",
+			// A long run accumulates pinned workflow generations. Give final
+			// actor stops enough time to cross multiple 16-second engine ticks;
+			// process-drain conformance separately verifies the public 10-second
+			// default and forced-deadline policy.
+			ShutdownTimeout: soakShutdownTimeout,
 			Hooks:           run.hooks,
 			Logger: slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{
 				Level: slog.LevelWarn,
