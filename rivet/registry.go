@@ -4,10 +4,15 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
+	"os"
+	"os/signal"
 	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
+	"time"
 
 	"github.com/ewhauser/rivet-go/internal/ffi"
 	"github.com/ewhauser/rivet-go/internal/pump"
@@ -26,12 +31,17 @@ const (
 // version. TotalSlots remains a stable boundary field but v2.3.10 does not
 // expose a CoreRegistry setter for it.
 type Config struct {
-	Endpoint   string
-	Namespace  string
-	RunnerName string
-	Version    uint32
-	TotalSlots uint32
-	LogLevel   string
+	Endpoint        string
+	Namespace       string
+	RunnerName      string
+	Version         uint32
+	TotalSlots      uint32
+	LogLevel        string
+	ShutdownTimeout time.Duration
+	Hooks           Hooks
+	// Logger receives structured SDK lifecycle records. Nil discards Go-side
+	// logs. LogLevel separately configures the pinned native runtime.
+	Logger *slog.Logger
 }
 
 // Registry owns typed actor registrations and may serve only once at a time.
@@ -43,6 +53,23 @@ type Registry struct {
 
 func NewRegistry() *Registry {
 	return &Registry{actors: make(map[string]pump.ActorHandler)}
+}
+
+// Serve hosts registry until SIGINT or SIGTERM, then waits for a graceful
+// drain. At most one Config may be supplied; omitted configuration uses the
+// local-development defaults.
+func Serve(registry *Registry, configs ...Config) error {
+	if registry == nil {
+		return errors.New("rivet registry is nil")
+	}
+	if len(configs) > 1 {
+		return errors.New("rivet Serve accepts at most one Config")
+	}
+	var config Config
+	if len(configs) == 1 {
+		config = configs[0]
+	}
+	return registry.Serve(context.Background(), config)
 }
 
 // Register adds one typed actor definition to registry. Registrations are
@@ -98,6 +125,8 @@ func (r *Registry) Serve(ctx context.Context, config Config) error {
 		return errors.New("registry is already serving")
 	}
 	defer r.serving.Store(false)
+	serveCtx, stopSignals := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
+	defer stopSignals()
 
 	actorNames, actorActions, handlers := r.snapshotActors()
 	config = withDefaults(config)
@@ -119,6 +148,7 @@ func (r *Registry) Serve(ctx context.Context, config Config) error {
 		return fmt.Errorf("load native runner: %w", err)
 	}
 	if result.Error != nil {
+		result.Error.SetLogger(config.Logger)
 		defer result.Error.Close()
 		payload, decodeErr := result.Error.Payload()
 		if decodeErr != nil {
@@ -129,8 +159,20 @@ func (r *Registry) Serve(ctx context.Context, config Config) error {
 	if result.Runner == nil {
 		return errors.New("start native runner: native constructor returned neither runner nor error")
 	}
+	result.Runner.SetLogger(config.Logger)
 
-	return pump.NewWithHandlers(result.Runner, handlers).Run(ctx)
+	if config.Logger != nil {
+		config.Logger.InfoContext(serveCtx, "runner starting",
+			slog.String("endpoint", config.Endpoint),
+			slog.String("namespace", config.Namespace),
+			slog.String("runner_name", config.RunnerName),
+		)
+	}
+	return pump.NewWithOptions(result.Runner, handlers, pump.Options{
+		Hooks:           config.Hooks,
+		Logger:          config.Logger,
+		ShutdownTimeout: config.ShutdownTimeout,
+	}).Run(serveCtx)
 }
 
 func (r *Registry) snapshotActors() (

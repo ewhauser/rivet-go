@@ -4,6 +4,7 @@ package ffi
 
 import (
 	"errors"
+	"log/slog"
 	"time"
 )
 
@@ -14,6 +15,15 @@ type Runner struct{}
 
 // Error is the unsupported-platform native error stub.
 type Error struct{}
+
+// HandleCounts reports native allocations currently owned by Go wrappers.
+type HandleCounts struct {
+	Runners int64
+	Errors  int64
+	Buffers int64
+}
+
+func ActiveHandleCounts() HandleCounts { return HandleCounts{} }
 
 // RunnerResult is the unsupported-platform runner result stub.
 type RunnerResult struct {
@@ -48,6 +58,9 @@ func NewRunner([]byte) (RunnerResult, error) { return RunnerResult{}, errUnsuppo
 // Close is a no-op for an unsupported-platform runner.
 func (*Runner) Close() {}
 
+// SetLogger is a no-op for an unsupported-platform runner.
+func (*Runner) SetLogger(*slog.Logger) {}
+
 // Poll reports that the current target has no embedded native library.
 func (*Runner) Poll(time.Duration) ([]byte, error) { return nil, errUnsupportedPlatform }
 
@@ -65,3 +78,6 @@ func (*Error) Payload() (ErrorPayload, error) { return ErrorPayload{}, errUnsupp
 
 // Close is a no-op for an unsupported-platform error.
 func (*Error) Close() {}
+
+// SetLogger is a no-op for an unsupported-platform error.
+func (*Error) SetLogger(*slog.Logger) {}

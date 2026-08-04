@@ -39,6 +39,57 @@ type codedTestError struct {
 	code string
 }
 
+type recordingHooks struct {
+	mu       sync.Mutex
+	counters map[string]int64
+	gauges   map[string]int64
+	observed map[string][]time.Duration
+}
+
+func newRecordingHooks() *recordingHooks {
+	return &recordingHooks{
+		counters: make(map[string]int64),
+		gauges:   make(map[string]int64),
+		observed: make(map[string][]time.Duration),
+	}
+}
+
+func (h *recordingHooks) Counter(name string, delta int64) {
+	h.mu.Lock()
+	h.counters[name] += delta
+	h.mu.Unlock()
+}
+
+func (h *recordingHooks) Gauge(name string, value int64) {
+	h.mu.Lock()
+	h.gauges[name] = value
+	h.mu.Unlock()
+}
+
+func (h *recordingHooks) ObserveDuration(name string, value time.Duration) {
+	h.mu.Lock()
+	h.observed[name] = append(h.observed[name], value)
+	h.mu.Unlock()
+}
+
+func (h *recordingHooks) snapshot() (map[string]int64, map[string]int64, map[string][]time.Duration) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	counters := make(map[string]int64, len(h.counters))
+	for name, value := range h.counters {
+		counters[name] = value
+	}
+	gauges := make(map[string]int64, len(h.gauges))
+	for name, value := range h.gauges {
+		gauges[name] = value
+	}
+	observed := make(map[string][]time.Duration, len(h.observed))
+	for name, values := range h.observed {
+		observed[name] = append([]time.Duration(nil), values...)
+	}
+	return counters, gauges, observed
+}
+
 func (e codedTestError) Error() string     { return e.code }
 func (e codedTestError) ErrorCode() string { return e.code }
 
@@ -1013,8 +1064,9 @@ func TestShutdownCancelsPendingKV(t *testing.T) {
 
 func TestHandlerPanicIsActorLocalAndStructured(t *testing.T) {
 	runner := newFakeRunner()
+	hooks := newRecordingHooks()
 	healthyStarted := make(chan struct{}, 1)
-	p := NewWithHandlers(runner, map[string]ActorHandler{
+	p := NewWithOptions(runner, map[string]ActorHandler{
 		"panic": lifecycleHandler{start: func(context.Context, *ActorSession, wire.Event) (any, error) {
 			panic("start failed")
 		}},
@@ -1022,7 +1074,7 @@ func TestHandlerPanicIsActorLocalAndStructured(t *testing.T) {
 			healthyStarted <- struct{}{}
 			return nil, nil
 		}},
-	})
+	}, Options{Hooks: hooks})
 	ctx, cancel := context.WithCancel(context.Background())
 	result := make(chan error, 1)
 	go func() { result <- p.Run(ctx) }()
@@ -1063,6 +1115,19 @@ func TestHandlerPanicIsActorLocalAndStructured(t *testing.T) {
 	cancel()
 	if err := <-result; err != nil {
 		t.Fatalf("Run after handler panic: %v", err)
+	}
+	counters, gauges, observed := hooks.snapshot()
+	if counters[metricActorStarts] != 2 || counters[metricActorStops] != 1 || counters[metricActorPanics] != 1 {
+		t.Fatalf("actor metrics = %#v", counters)
+	}
+	if counters[metricEventsPolled] != 4 || counters[metricCommandsSubmitted] != 3 {
+		t.Fatalf("pump metrics = %#v", counters)
+	}
+	if gauges[metricLiveActors] != 0 || gauges[metricLiveConnections] != 0 {
+		t.Fatalf("final gauges = %#v", gauges)
+	}
+	if len(observed[metricPollLatency]) == 0 {
+		t.Fatal("poll latency was not observed")
 	}
 }
 
@@ -1718,6 +1783,7 @@ func TestHTTPRequestChunksFeedBodyAndResponsesSubmitFromHandler(t *testing.T) {
 func TestHTTPResponseRetriesNativeBackpressure(t *testing.T) {
 	base := newFakeRunner()
 	runner := &retryRunner{fakeRunner: base}
+	hooks := newRecordingHooks()
 	handler := dispatchHandler{
 		fetch: func(ctx context.Context, session *ActorSession, event wire.Event, _ any) error {
 			if err := session.StartHTTPResponse(ctx, event.RequestID, 200, nil, nil, true); err != nil {
@@ -1726,7 +1792,7 @@ func TestHTTPResponseRetriesNativeBackpressure(t *testing.T) {
 			return session.WriteHTTPResponseChunk(ctx, event.RequestID, []byte("done"), true)
 		},
 	}
-	p := NewWithHandlers(runner, map[string]ActorHandler{"fetch": handler})
+	p := NewWithOptions(runner, map[string]ActorHandler{"fetch": handler}, Options{Hooks: hooks})
 	ctx, cancel := context.WithCancel(context.Background())
 	result := make(chan error, 1)
 	go func() { result <- p.Run(ctx) }()
@@ -1753,6 +1819,10 @@ func TestHTTPResponseRetriesNativeBackpressure(t *testing.T) {
 	cancel()
 	if err := <-result; err != nil {
 		t.Fatalf("Run: %v", err)
+	}
+	counters, _, _ := hooks.snapshot()
+	if counters[metricBackpressureHits] != 2 {
+		t.Fatalf("backpressure metric = %d, want 2", counters[metricBackpressureHits])
 	}
 }
 

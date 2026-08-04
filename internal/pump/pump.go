@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"math/rand/v2"
 	"runtime"
 	"sync"
@@ -35,6 +36,33 @@ var (
 	ErrNotStarted     = errors.New("pump is not running")
 	ErrShuttingDown   = errors.New("pump is shutting down")
 )
+
+const (
+	metricEventsPolled      = "events_polled_total"
+	metricCommandsSubmitted = "commands_submitted_total"
+	metricBackpressureHits  = "backpressure_hits_total"
+	metricActorStarts       = "actor_starts_total"
+	metricActorStops        = "actor_stops_total"
+	metricActorPanics       = "actor_panics_total"
+	metricLiveActors        = "live_actors"
+	metricLiveConnections   = "live_connections"
+	metricPollLatency       = "poll_latency"
+)
+
+// Hooks is the dependency-free metrics sink used by the public SDK. Hook
+// implementations must be safe for concurrent use and should return quickly.
+type Hooks interface {
+	Counter(string, int64)
+	Gauge(string, int64)
+	ObserveDuration(string, time.Duration)
+}
+
+// Options configures pump operability and drain behavior.
+type Options struct {
+	Hooks           Hooks
+	Logger          *slog.Logger
+	ShutdownTimeout time.Duration
+}
 
 // Runner is implemented by the owned internal/ffi runner handle.
 type Runner interface {
@@ -970,6 +998,8 @@ type Pump struct {
 	result    error
 	seenSeq   bool
 	lastSeq   uint64
+	hooks     Hooks
+	logger    *slog.Logger
 }
 
 func New(runner Runner) *Pump {
@@ -977,14 +1007,22 @@ func New(runner Runner) *Pump {
 }
 
 func NewWithHandlers(runner Runner, handlers map[string]ActorHandler) *Pump {
+	return NewWithOptions(runner, handlers, Options{})
+}
+
+func NewWithOptions(runner Runner, handlers map[string]ActorHandler, options Options) *Pump {
 	ownedHandlers := make(map[string]ActorHandler, len(handlers))
 	for name, handler := range handlers {
 		ownedHandlers[name] = handler
 	}
+	shutdownTimeout := options.ShutdownTimeout
+	if shutdownTimeout <= 0 {
+		shutdownTimeout = defaultShutdownTimeout
+	}
 	return &Pump{
 		runner:          runner,
 		pollTimeout:     defaultPollTimeout,
-		shutdownTimeout: defaultShutdownTimeout,
+		shutdownTimeout: shutdownTimeout,
 		saveTimeout:     defaultSaveTimeout,
 		intentTimeout:   defaultIntentTimeout,
 		httpSubmitLimit: defaultHTTPSubmitLimit,
@@ -1001,6 +1039,8 @@ func NewWithHandlers(runner Runner, handlers map[string]ActorHandler) *Pump {
 		httpPending:     make(map[uint64]*httpRequestState),
 		websockets:      make(map[string]websocketOwner),
 		subs:            make(map[uint64]*subscriber),
+		hooks:           options.Hooks,
+		logger:          options.Logger,
 	}
 }
 
@@ -1127,6 +1167,10 @@ func (p *Pump) pollLoop(ctx context.Context) {
 			case <-ctx.Done():
 				shutdownRequested = true
 				p.shuttingDown.Store(true)
+				p.log(slog.LevelInfo, "runner drain started",
+					slog.Duration("deadline", p.shutdownTimeout),
+					slog.String("cause", context.Cause(ctx).Error()),
+				)
 				if err := p.runner.Shutdown(p.shutdownTimeout); err != nil {
 					p.setResult(fmt.Errorf("shutdown native runner: %w", err))
 					return
@@ -1135,7 +1179,9 @@ func (p *Pump) pollLoop(ctx context.Context) {
 			}
 		}
 
+		pollStarted := time.Now()
 		data, err := p.runner.Poll(p.pollTimeout)
+		p.observeDuration(metricPollLatency, time.Since(pollStarted))
 		if err != nil {
 			p.setResult(fmt.Errorf("poll native runner: %w", err))
 			return
@@ -1155,6 +1201,7 @@ func (p *Pump) pollLoop(ctx context.Context) {
 		}
 		p.seenSeq = true
 		p.lastSeq = batch.Seq
+		p.counter(metricEventsPolled, int64(len(batch.Events)))
 		for _, event := range batch.Events {
 			if err := p.handleInternalEvent(event); err != nil {
 				p.setResult(err)
@@ -1164,6 +1211,9 @@ func (p *Pump) pollLoop(ctx context.Context) {
 				return
 			}
 			if event.Kind == wire.EventRunnerStopped {
+				p.log(slog.LevelInfo, "runner drain completed",
+					slog.Uint64("event_seq", batch.Seq),
+				)
 				return
 			}
 		}
@@ -1194,6 +1244,11 @@ func (p *Pump) submitLoop() {
 			if err == nil {
 				err = p.runner.Submit(encoded)
 			}
+			if err == nil {
+				p.counter(metricCommandsSubmitted, int64(len(commands)))
+			} else if errorCode(err) == "backpressure" {
+				p.counter(metricBackpressureHits, 1)
+			}
 			for _, request := range requests {
 				request.result <- err
 			}
@@ -1203,6 +1258,12 @@ func (p *Pump) submitLoop() {
 
 func (p *Pump) handleInternalEvent(event wire.Event) error {
 	switch event.Kind {
+	case wire.EventRunnerConnected:
+		p.log(slog.LevelInfo, "runner connected", slog.String("runner_id", event.RunnerID))
+	case wire.EventRunnerDisconnected:
+		p.log(slog.LevelWarn, "runner disconnected", slog.String("reason", event.Reason))
+	case wire.EventRunnerStopped:
+		// The poll loop logs completion after subscribers observe this event.
 	case wire.EventActorStart:
 		identity := actorIdentity{aid: event.AID, generation: event.Generation}
 		workerCtx, cancel := context.WithCancel(context.Background())
@@ -1230,8 +1291,16 @@ func (p *Pump) handleInternalEvent(event wire.Event) error {
 			return fmt.Errorf("duplicate ActorStart for %s generation %d", event.AID, event.Generation)
 		}
 		p.actors[identity] = worker
+		liveActors := len(p.actors)
 		p.actorWG.Add(1)
 		p.actorsMu.Unlock()
+		p.counter(metricActorStarts, 1)
+		p.gauge(metricLiveActors, int64(liveActors))
+		p.log(slog.LevelDebug, "actor started",
+			slog.String("actor_id", event.AID),
+			slog.Uint64("generation", event.Generation),
+			slog.String("actor_name", event.Name),
+		)
 		go worker.run(event)
 	case wire.EventActorStop:
 		worker := p.actor(event.AID, event.Generation)
@@ -1254,6 +1323,12 @@ func (p *Pump) handleInternalEvent(event wire.Event) error {
 		for _, closeEvent := range closeEvents {
 			worker.events <- closeEvent
 		}
+		p.counter(metricActorStops, 1)
+		p.log(slog.LevelDebug, "actor stopping",
+			slog.String("actor_id", event.AID),
+			slog.Uint64("generation", event.Generation),
+			slog.String("reason", event.Reason),
+		)
 		worker.events <- event
 	case wire.EventActorAlarm:
 		worker := p.actor(event.AID, event.Generation)
@@ -1332,7 +1407,9 @@ func (p *Pump) handleInternalEvent(event wire.Event) error {
 			identity:     worker.session.identity,
 			canHibernate: event.CanHibernate,
 		}
+		liveConnections := len(p.websockets)
 		p.wsMu.Unlock()
+		p.gauge(metricLiveConnections, int64(liveConnections))
 		worker.events <- event
 	case wire.EventWSMessage:
 		worker := p.websocketActor(event.WSID)
@@ -1383,6 +1460,7 @@ func (w *actorWorker) run(start wire.Event) {
 	defer w.session.abort()
 
 	state, lifecycleError := invokeStart(w.ctx, w.handler, w.session, start)
+	w.pump.recordHandlerPanic(lifecycleError, "OnStart", w.session)
 	if err := w.pump.submitInternal(w.ctx, wire.Command{
 		Kind:       wire.CommandActorStartResult,
 		AID:        w.session.identity.aid,
@@ -1415,6 +1493,7 @@ func (w *actorWorker) run(start wire.Event) {
 			actionTimeout := time.Duration(event.ActionTimeoutMS) * time.Millisecond
 			actionContext, cancelAction := context.WithTimeout(w.ctx, actionTimeout)
 			output, actionError := invokeAction(actionContext, w.handler, w.session, event, state)
+			w.pump.recordHandlerPanic(actionError, "action "+event.Action, w.session)
 			cancelAction()
 			if actionError == nil && output == nil {
 				output = []byte{}
@@ -1433,6 +1512,7 @@ func (w *actorWorker) run(start wire.Event) {
 			}
 		case wire.EventActorAlarm:
 			alarmError := invokeAlarm(w.ctx, w.handler, w.session, event, state)
+			w.pump.recordHandlerPanic(alarmError, "OnAlarm", w.session)
 			if err := w.pump.submitInternal(w.ctx, wire.Command{
 				Kind:       wire.CommandAlarmHandled,
 				AID:        w.session.identity.aid,
@@ -1447,6 +1527,7 @@ func (w *actorWorker) run(start wire.Event) {
 			}
 		case wire.EventHTTPRequest:
 			fetchError := invokeFetch(w.ctx, w.handler, w.session, event, state)
+			w.pump.recordHandlerPanic(fetchError, "OnFetch", w.session)
 			if fetchError != nil {
 				if err := w.session.failHTTP(w.ctx, event.RequestID, fetchError); err != nil {
 					w.pump.reportWorkerError(fmt.Errorf("submit HTTP handler error: %w", err))
@@ -1459,6 +1540,7 @@ func (w *actorWorker) run(start wire.Event) {
 			}
 		case wire.EventWSOpen:
 			openError := invokeWebSocketOpen(w.ctx, w.handler, w.session, event, state)
+			w.pump.recordHandlerPanic(openError, "OnConnect", w.session)
 			if err := w.pump.submitInternal(w.ctx, wire.Command{
 				Kind:   wire.CommandWSOpenResult,
 				WSID:   event.WSID,
@@ -1476,6 +1558,7 @@ func (w *actorWorker) run(start wire.Event) {
 			}
 		case wire.EventWSMessage:
 			messageError := invokeWebSocketMessage(w.ctx, w.handler, w.session, event, state)
+			w.pump.recordHandlerPanic(messageError, "OnMessage", w.session)
 			if err := w.pump.submitInternal(w.ctx, wire.Command{
 				Kind:         wire.CommandWSMessageAck,
 				WSID:         event.WSID,
@@ -1489,12 +1572,14 @@ func (w *actorWorker) run(start wire.Event) {
 			}
 		case wire.EventWSClose:
 			closeError := invokeWebSocketClose(w.ctx, w.handler, w.session, event, state)
+			w.pump.recordHandlerPanic(closeError, "OnDisconnect", w.session)
 			if closeError != nil && closeError.Code == "handler_panic" {
 				w.requestErrorStop()
 			}
 		case wire.EventActorStop:
 			stopReason = event.Reason
 			lifecycleError = invokeStop(w.ctx, w.handler, w.session, event, state)
+			w.pump.recordHandlerPanic(lifecycleError, "OnStop", w.session)
 			w.session.closeGracefully()
 			if err := w.pump.submitInternal(w.ctx, wire.Command{
 				Kind:       wire.CommandActorStopResult,
@@ -1784,10 +1869,12 @@ func (p *Pump) removeWebSocket(wsID string) *actorWorker {
 	p.wsMu.Lock()
 	owner, ok := p.websockets[wsID]
 	delete(p.websockets, wsID)
+	liveConnections := len(p.websockets)
 	p.wsMu.Unlock()
 	if !ok {
 		return nil
 	}
+	p.gauge(metricLiveConnections, int64(liveConnections))
 	return p.actor(owner.identity.aid, owner.identity.generation)
 }
 
@@ -1820,7 +1907,9 @@ func (p *Pump) detachActorWebSockets(
 			Reason:    reason,
 		})
 	}
+	liveConnections := len(p.websockets)
 	p.wsMu.Unlock()
+	p.gauge(metricLiveConnections, int64(liveConnections))
 	return events, commands
 }
 
@@ -1860,10 +1949,16 @@ func (p *Pump) abortHTTPForActor(identity actorIdentity, cause error) {
 func (p *Pump) removeActor(identity actorIdentity, worker *actorWorker) {
 	_, _ = p.detachActorWebSockets(identity, false, "actor worker stopped")
 	p.actorsMu.Lock()
+	removed := false
 	if p.actors[identity] == worker {
 		delete(p.actors, identity)
+		removed = true
 	}
+	liveActors := len(p.actors)
 	p.actorsMu.Unlock()
+	if removed {
+		p.gauge(metricLiveActors, int64(liveActors))
+	}
 }
 
 func (p *Pump) cancelActorWorkers() {
@@ -2047,4 +2142,64 @@ func (p *Pump) setResult(err error) {
 		p.result = err
 	}
 	p.resultMu.Unlock()
+}
+
+func (p *Pump) recordHandlerPanic(failure *wire.WireError, operation string, session *ActorSession) {
+	if failure == nil || failure.Code != "handler_panic" {
+		return
+	}
+	p.counter(metricActorPanics, 1)
+	attributes := []slog.Attr{slog.String("operation", operation)}
+	if session != nil {
+		attributes = append(attributes,
+			slog.String("actor_id", session.AID()),
+			slog.Uint64("generation", session.Generation()),
+		)
+	}
+	p.log(slog.LevelError, "actor handler panicked", attributes...)
+}
+
+func (p *Pump) counter(name string, delta int64) {
+	if p == nil || p.hooks == nil || delta == 0 {
+		return
+	}
+	p.callHook(func() { p.hooks.Counter(name, delta) })
+}
+
+func (p *Pump) gauge(name string, value int64) {
+	if p == nil || p.hooks == nil {
+		return
+	}
+	p.callHook(func() { p.hooks.Gauge(name, value) })
+}
+
+func (p *Pump) observeDuration(name string, value time.Duration) {
+	if p == nil || p.hooks == nil {
+		return
+	}
+	p.callHook(func() { p.hooks.ObserveDuration(name, value) })
+}
+
+func (p *Pump) callHook(call func()) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			p.log(slog.LevelWarn, "operability hook panicked", slog.Any("panic", recovered))
+		}
+	}()
+	call()
+}
+
+func (p *Pump) log(level slog.Level, message string, attributes ...slog.Attr) {
+	if p == nil || p.logger == nil {
+		return
+	}
+	p.logger.LogAttrs(context.Background(), level, message, attributes...)
+}
+
+func errorCode(err error) string {
+	var coded interface{ ErrorCode() string }
+	if errors.As(err, &coded) {
+		return coded.ErrorCode()
+	}
+	return ""
 }

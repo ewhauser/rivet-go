@@ -10,13 +10,14 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
-	"log"
+	"log/slog"
 	"os"
 	"path"
 	"path/filepath"
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unsafe"
 
@@ -64,7 +65,28 @@ type nativeAPI struct {
 	runnerShutdown func(*cRunner, uint32) cSubmitResult
 }
 
-var api nativeAPI
+var (
+	api           nativeAPI
+	activeRunners atomic.Int64
+	activeErrors  atomic.Int64
+	activeBuffers atomic.Int64
+)
+
+// HandleCounts reports native allocations currently owned by Go wrappers.
+// It is used by the soak oracle after the runner has fully drained.
+type HandleCounts struct {
+	Runners int64
+	Errors  int64
+	Buffers int64
+}
+
+func ActiveHandleCounts() HandleCounts {
+	return HandleCounts{
+		Runners: activeRunners.Load(),
+		Errors:  activeErrors.Load(),
+		Buffers: activeBuffers.Load(),
+	}
+}
 
 type embeddedLibrary struct {
 	dir      string
@@ -73,16 +95,18 @@ type embeddedLibrary struct {
 
 // Runner is an owned native runner handle.
 type Runner struct {
-	mu   sync.RWMutex
-	ptr  *cRunner
-	once sync.Once
+	mu     sync.RWMutex
+	ptr    *cRunner
+	once   sync.Once
+	logger *slog.Logger
 }
 
 // Error is an owned structured native error handle.
 type Error struct {
-	mu   sync.RWMutex
-	ptr  *cError
-	once sync.Once
+	mu     sync.RWMutex
+	ptr    *cError
+	once   sync.Once
+	logger *slog.Logger
 }
 
 // RunnerResult is the native result of constructing a runner.
@@ -222,24 +246,55 @@ func NewRunner(config []byte) (RunnerResult, error) {
 	var runner *Runner
 	if result.runner != nil {
 		runner = &Runner{ptr: result.runner}
+		activeRunners.Add(1)
 		runtime.SetFinalizer(runner, finalizeRunner)
 	}
 	var nativeError *Error
 	if result.err != nil {
-		nativeError = &Error{ptr: result.err}
-		runtime.SetFinalizer(nativeError, finalizeError)
+		nativeError = newError(result.err)
 	}
 	return RunnerResult{Runner: runner, Error: nativeError}, nil
 }
 
 func finalizeRunner(runner *Runner) {
-	log.Printf("rivet-go: leaked native runner; releasing from finalizer")
+	runner.mu.RLock()
+	logger := runner.logger
+	runner.mu.RUnlock()
+	if logger != nil {
+		logger.Error("leaked native runner; releasing from finalizer")
+	}
 	runner.Close()
 }
 
 func finalizeError(nativeError *Error) {
-	log.Printf("rivet-go: leaked native error; releasing from finalizer")
+	nativeError.mu.RLock()
+	logger := nativeError.logger
+	nativeError.mu.RUnlock()
+	if logger != nil {
+		logger.Error("leaked native error; releasing from finalizer")
+	}
 	nativeError.Close()
+}
+
+// SetLogger configures structured diagnostics for handle-leak backstops and
+// native errors returned by subsequent runner calls. Nil discards them.
+func (r *Runner) SetLogger(logger *slog.Logger) {
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	r.logger = logger
+	r.mu.Unlock()
+}
+
+// SetLogger configures structured diagnostics for this owned error handle.
+func (e *Error) SetLogger(logger *slog.Logger) {
+	if e == nil {
+		return
+	}
+	e.mu.Lock()
+	e.logger = logger
+	e.mu.Unlock()
 }
 
 // Close releases the native runner handle exactly once.
@@ -254,6 +309,7 @@ func (r *Runner) Close() {
 		if r.ptr != nil {
 			api.runnerFree(r.ptr)
 			r.ptr = nil
+			activeRunners.Add(-1)
 		}
 	})
 }
@@ -272,10 +328,14 @@ func (r *Runner) Poll(timeout time.Duration) ([]byte, error) {
 	result := api.runnerPoll(r.ptr, durationMillis(timeout))
 	runtime.KeepAlive(r)
 	if result.payload.ptr != nil {
-		defer api.bytesFree(result.payload)
+		activeBuffers.Add(1)
+		defer func() {
+			api.bytesFree(result.payload)
+			activeBuffers.Add(-1)
+		}()
 	}
 	if result.err != nil {
-		return nil, consumeNativeError(result.err)
+		return nil, consumeNativeError(result.err, r.logger)
 	}
 	if result.payload.ptr == nil {
 		if result.payload.len == 0 {
@@ -304,7 +364,7 @@ func (r *Runner) Submit(batch []byte) error {
 	runtime.KeepAlive(batch)
 	runtime.KeepAlive(r)
 	if result.err != nil {
-		return consumeNativeError(result.err)
+		return consumeNativeError(result.err, r.logger)
 	}
 	return nil
 }
@@ -323,7 +383,7 @@ func (r *Runner) Shutdown(deadline time.Duration) error {
 	result := api.runnerShutdown(r.ptr, durationMillis(deadline))
 	runtime.KeepAlive(r)
 	if result.err != nil {
-		return consumeNativeError(result.err)
+		return consumeNativeError(result.err, r.logger)
 	}
 	return nil
 }
@@ -339,8 +399,9 @@ func durationMillis(duration time.Duration) uint32 {
 	return uint32(millis)
 }
 
-func consumeNativeError(ptr *cError) error {
-	nativeError := &Error{ptr: ptr}
+func consumeNativeError(ptr *cError, logger *slog.Logger) error {
+	nativeError := newError(ptr)
+	nativeError.SetLogger(logger)
 	payload, err := nativeError.Payload()
 	nativeError.Close()
 	if err != nil {
@@ -367,7 +428,11 @@ func (e *Error) JSON() ([]byte, error) {
 		}
 		return nil, errors.New("native error JSON returned a nil pointer with non-zero length")
 	}
-	defer api.bytesFree(bytes)
+	activeBuffers.Add(1)
+	defer func() {
+		api.bytesFree(bytes)
+		activeBuffers.Add(-1)
+	}()
 	return append([]byte(nil), unsafe.Slice(bytes.ptr, bytes.len)...), nil
 }
 
@@ -396,8 +461,19 @@ func (e *Error) Close() {
 		if e.ptr != nil {
 			api.errorFree(e.ptr)
 			e.ptr = nil
+			activeErrors.Add(-1)
 		}
 	})
+}
+
+func newError(ptr *cError) *Error {
+	if ptr == nil {
+		return nil
+	}
+	nativeError := &Error{ptr: ptr}
+	activeErrors.Add(1)
+	runtime.SetFinalizer(nativeError, finalizeError)
+	return nativeError
 }
 
 func extractVerifiedLibrary(
