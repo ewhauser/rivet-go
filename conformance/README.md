@@ -59,21 +59,44 @@ gateway. They require an actor to be absent from the runner
 - an engine alarm rehydrates the actor and `OnAlarm` sees state persisted
   before sleep;
 - clearing an alarm keeps the actor asleep past the old deadline, and two rapid
-  schedules fire only the later timestamp;
-- a persisted alarm survives replacement of the engine process and wakes on
-  the reconnected runner;
-- a sleep requested inside a blocked action cannot overtake that action's
-  completion; and
+  schedules do not fire at the earlier timestamp and fire only the later one;
+- a persisted alarm survives replacement of the engine process with the exact
+  original timestamp and wakes on the reconnected runner;
+- an awake alarm runs once, alarms remain serialized behind a long action, an
+  alarm can request sleep, and a rehydrated `OnStart` can schedule the next
+  alarm;
+- sleep requested inside blocked action, HTTP, or WebSocket work cannot
+  overtake that work's client-visible completion; and
 - one real gateway WebSocket remains connected across actor eviction, buffers
-  a client message sent while the actor is asleep, replays it after a scheduled
-  alarm wake, receives targeted and broadcast traffic on the same socket, and
-  invokes `OnDisconnect` only for the later real close.
+  ordered client messages sent while the actor is asleep, uses those messages
+  to rehydrate the actor before its later alarm, receives targeted and
+  broadcast traffic on the same socket, and invokes `OnDisconnect` only for
+  the later real close. The stopped generation sees an unsaved mutation while
+  the rehydrated generation reloads the earlier persisted value.
+
+When a WebSocket handler itself requests sleep, the intent is admitted before
+that handler returns but applied after its FIFO acknowledgement. Frames sent
+in that boundary window are therefore handled in order by the old generation;
+frames sent after engine-visible sleep rehydrate and run on the new generation.
+The test drains the exact sequence so a loss or duplicate fails the next
+expected observation.
 
 Alarm assertions use engine timestamps and `eventually`, never a fixed sleep
-as the success condition. Ordinary wake tests use 20-second and 25-second
-deadlines, require at least 10 seconds to remain after engine-visible sleep,
-and use a 90-second wake bound. Short 5-second and 10-second deadlines were not
-stable near v2.3.10 shutdown settlement under repeated race runs.
+as the success condition. The pinned workflow poll tick is 16 seconds.
+Negative clear, overwrite, and one-shot observations cover one full tick plus
+a 5-second margin. Positive alarms use 20-second sleep, 35-second hibernation,
+45-second replacement, or 60-second restart schedules and a 90-second bound;
+the bound covers the requested schedule, one poll tick, delivery margin, and
+runner scheduling under `-race`. The 20-second message-driven WebSocket wake
+bound is independent of alarm polling and covers gateway delivery plus actor
+allocation.
+
+The pinned engine delivers an alarm update and a later sleep intent as
+separate workflow signals. Its signal fallback polls every 1.5 seconds, and
+those signals can otherwise be observed out of checkpoint order. The FFI
+holds serialized alarm completion for 4 seconds: two poll intervals plus a
+1-second scheduling margin. Clear and overwrite use a 12-second earlier
+deadline so that deadline remains safely beyond this settlement window.
 
 The restart case uses one original 60-second schedule. After replacing the
 engine process it proves a post-restart envoy ping, waits through the pin's

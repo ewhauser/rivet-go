@@ -440,6 +440,19 @@ serialized actor callback after core and the engine wake a sleeping actor, and
 its resulting state is saved before `AlarmHandled`. Rapid replacement is
 latest-wins and clear removes only the reserved Go alarm.
 
+Alarm and sleep commands carry an operation ID plus the originating actor
+generation. Schedule and clear return only after the native schedule mutation
+has completed and the pin's separately delivered workflow signal has had two
+1.5-second poll intervals plus a 1-second margin to settle. Without that
+ordering, the engine can process the later sleep checkpoint first and reject
+the lower alarm checkpoint as stale. Sleep returns after the exact generation
+admits the intent;
+the later `ActorStop` is the proof that core drained and evicted it. This split
+avoids making a handler wait for an eviction that cannot begin until that
+handler returns. An absent `OnAlarm` produces a structured
+`callback_not_found` `AlarmHandled` result, and alarms share the pinned core's
+60-second ordinary-action deadline.
+
 `Context.Sleep` is an intent, not an immediate goroutine cancellation. Work
 already admitted to the actor's serial worker completes first: the initiating
 action/HTTP/WebSocket handler returns, successful action or alarm state is
@@ -451,8 +464,8 @@ Graceful runner shutdown reaches core actors as sleep: eligible WebSockets are
 hibernated, `OnStop` completes, and neither a transport close nor
 `OnDisconnect` is exposed. This supersedes M4's runner-close expectation; the
 shutdown fallback still closes any transport left after the grace deadline.
-The real-engine mid-flight case observes the action-complete marker before the
-stop hook and actor eviction.
+The real-engine mid-flight cases observe the action result, HTTP response, and
+WebSocket replies before the stop hook and actor eviction.
 
 Core hides hibernating gateway/request IDs, persists both message indexes and
 request metadata, restores `CommandStartActor.hibernatingRequests`, and drops
@@ -466,15 +479,24 @@ is detached without a transport close, and the restored `WsOpen` is marked
 If a client disappears while fully asleep, v2.3.10 may prune it during core
 startup settlement before Go can observe a disconnect.
 
+Sleep admitted from inside a WebSocket handler is applied after that handler's
+FIFO acknowledgement. Same-socket frames accepted in this boundary window run
+in order on the old generation; frames sent after engine-visible sleep wake
+and run on the new generation. The conformance case fixes this pin-specific
+outcome and rejects loss or duplicate delivery on either side of eviction.
+
 The M5 real-engine suite covers alarm wake with pre-sleep state, clear,
-latest-wins replacement, engine-restart alarm durability, mid-flight sleep
-ordering, repeated sleep/wake state, and a same-socket hibernation cycle with
-post-wake client-to-actor and actor-to-client traffic. It uses timestamp-based
-`eventually` checks, a required 10-second future margin after engine-visible
-sleep, and a 90-second wake bound. Repeated race runs showed that 5-second and
-10-second deadlines were too close to v2.3.10 shutdown settlement. The stable
-cases use 20-second and 25-second deadlines. Restart durability uses an
-original 60-second schedule, waits through the pin's 22-second envoy liveness
+latest-wins replacement, engine-restart alarm identity and durability,
+mid-flight action/HTTP/WebSocket drain ordering, unsaved-state loss, repeated
+sleep/wake generations, and a same-socket hibernation cycle with ordered
+messages on both sides of eviction and post-wake actor-to-client traffic. The
+pinned workflow worker polls every 16 seconds, so negative alarm observations
+cover one complete tick plus a 5-second margin. Positive schedules are 20,
+35, 45, or 60 seconds according to the scenario; canceled/superseded alarms
+use 12 seconds so their local deadline remains beyond the 4-second transport
+settlement. A 90-second bound includes the schedule, one tick, delivery margin,
+and `-race` scheduling. Restart durability uses an original 60-second schedule,
+waits through the pin's 22-second envoy liveness
 window, demand-rehydrates once to make the pin reconcile its persisted core
 schedule after abrupt engine replacement, and resleeps without rescheduling
 before the alarm wake.
