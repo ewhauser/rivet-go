@@ -2,10 +2,13 @@
 package main
 
 import (
+	"bytes"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -233,10 +236,17 @@ func render(results []result, root, engine, archive string) (string, error) {
 	npmVersion := command("npm", "--version")
 	rustVersion := command("rustc", "--version")
 	cargoVersion := command("cargo", "--version")
-	gitCommit := commandAt(root, "git", "rev-parse", "HEAD")
+	runnerCommit := archivedMatch(root, archive, `(?m)^([0-9a-f]{40})$`)
+	if runnerCommit == "unknown" {
+		runnerCommit = commandAt(root, "git", "rev-parse", "HEAD")
+	}
 	tsVersion, tsIntegrity := packageLockVersion(filepath.Join(root, "bench/runner-ts/package-lock.json"), "node_modules/rivetkit")
 	rustPin := rustLockPin(filepath.Join(root, "bench/runner-rust/Cargo.lock"))
-	ffiChecksum := strings.TrimSpace(readOptional(filepath.Join(root, "internal/ffi/lib/darwin_arm64/checksums.txt")))
+	ffiPath := "internal/ffi/lib/darwin_arm64/librivetkit_go_ffi.dylib"
+	ffiChecksum := archivedMatch(root, archive, `(?m)^([0-9a-f]{64})\s+.*librivetkit_go_ffi\.dylib$`)
+	if ffiChecksum == "unknown" {
+		ffiChecksum = fileSHA256(filepath.Join(root, ffiPath))
+	}
 	startedAt := earliestStart(results)
 
 	var b strings.Builder
@@ -251,8 +261,8 @@ func render(results []result, root, engine, archive string) (string, error) {
 	fmt.Fprintf(&b, "| Machine | %s; %s logical CPUs; %.0f GiB RAM |\n", chip, logicalCPU, memoryBytes/(1<<30))
 	fmt.Fprintf(&b, "| OS | macOS %s (%s) |\n", osVersion, osBuild)
 	fmt.Fprintf(&b, "| Engine | `%s` |\n", engineVersion)
-	fmt.Fprintf(&b, "| Go | `%s`; runner commit `%s` |\n", goVersion, gitCommit)
-	fmt.Fprintf(&b, "| Go native library | committed darwin/arm64 release dylib; `%s` |\n", strings.ReplaceAll(ffiChecksum, "|", "\\|"))
+	fmt.Fprintf(&b, "| Go | `%s`; runner commit `%s` |\n", goVersion, runnerCommit)
+	fmt.Fprintf(&b, "| Go native library | committed `%s`; SHA-256 `%s` |\n", ffiPath, ffiChecksum)
 	fmt.Fprintf(&b, "| TypeScript | Node `%s`, npm `%s`, `NODE_ENV=production`, no Node flags; `rivetkit@%s` integrity `%s` |\n", nodeVersion, npmVersion, tsVersion, tsIntegrity)
 	fmt.Fprintf(&b, "| Rust | `%s`; `%s`; `rivetkit` %s; `cargo build --release --locked` |\n", rustVersion, cargoVersion, rustPin)
 	fmt.Fprintln(&b, "| Logging | error level for all runners |")
@@ -276,7 +286,7 @@ func render(results []result, root, engine, archive string) (string, error) {
 
 	for _, scenario := range []string{"s1", "s2", "s3", "s4"} {
 		fmt.Fprintf(&b, "## %s\n\n", scenarioNames[scenario])
-		fmt.Fprintln(&b, "| SDK | Persistence | Run | Operations | Throughput ops/s | p50 ms | p95 ms | p99 ms | max ms | Errors | Correct | Engine CPU avg/max | Runner CPU avg/max | Runner RSS avg/max MiB |")
+		fmt.Fprintln(&b, "| SDK | Persistence | Run | Operations | Throughput ops/s | p50 ms | p95 ms | p99 ms | max ms | Loadgen errors | Correct | Engine CPU avg/max | Runner CPU avg/max | Runner RSS avg/max MiB |")
 		fmt.Fprintln(&b, "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---|---|---|---|---|")
 		for _, item := range results {
 			if item.Scenario != scenario {
@@ -302,6 +312,7 @@ func render(results []result, root, engine, archive string) (string, error) {
 	fmt.Fprintln(&b, "- **The client path is neutral.** One Go load generator talks only to the engine gateway over loopback HTTP and WebSockets. It never imports a Go, TypeScript, or Rust actor client.")
 	fmt.Fprintln(&b, "- **The gateway IP limiter is sharded, not removed.** Engine v2.3.10 hard-codes 10,000 requests/minute per client IP and trusts `X-Forwarded-For` as a reverse-proxy input. Each HTTP load worker uses one stable loopback identity, identically for every SDK, so that abuse-control ceiling does not cap the runner test. Every non-2xx response remains an error.")
 	fmt.Fprintln(&b, "- **Correctness gates validity.** Measured and warmup errors must both be zero. Counter totals are reconciled after S1/S2, every S4 first result must be 1, and every S3 payload must match. Invalid cells are rejected by the report generator.")
+	fmt.Fprintln(&b, "- **Internal diagnostics are reported separately.** The zero `Loadgen errors` cells count operation-visible HTTP/WebSocket errors, not every error-level record from the runner and engine processes. The archived logs contain pinned-engine background telemetry, SQLite-worker, signal-lag, and WebSocket-teardown diagnostics, plus pinned-Rust lifecycle diagnostics. They did not break any operation or reconciliation gate, but they may consume CPU and are part of the result rather than being silently discarded; exact counts appear below.")
 	fmt.Fprintln(&b, "- **Freshness and ordering.** The engine is restarted with a new filesystem data directory before each SDK suite. Variants and repetitions within an SDK share that suite's engine process but use fresh uniquely keyed actors. All benchmark invocations are sequential.")
 	fmt.Fprintln(&b, "- **S4 is deliberately count-bounded.** It reports exactly the requested 50 fresh actors. Its actual elapsed duration and throughput are reported; a forced 60-second pacing window would measure the pacer rather than cold start.")
 	fmt.Fprintln(&b, "- **CPU attribution is sampled.** Engine and runner `%CPU`/RSS come from one-second `ps` samples during the measured interval. A process near 100% may be saturating one core even when the whole machine has idle cores. The report flags likely engine-limited rows below.")
@@ -322,11 +333,69 @@ func render(results []result, root, engine, archive string) (string, error) {
 		}
 	}
 	fmt.Fprintln(&b)
+	fmt.Fprintln(&b, "### Archived internal error logs")
+	fmt.Fprintln(&b)
+	fmt.Fprintln(&b, "These counts are error-level log records, grouped by exact message patterns. They are not added to load-generator errors because they are background or teardown diagnostics rather than failed measured operations.")
+	fmt.Fprintln(&b)
+	fmt.Fprintln(&b, internalErrorTable(root, archive))
+	fmt.Fprintln(&b)
 	fmt.Fprintln(&b, "## Go CPU profiles")
 	fmt.Fprintln(&b)
 	fmt.Fprintf(&b, "Profiling-only S1 and S3 runs are excluded from every table above. Their pprof data and text tops are in `%s/go-s1-cpu.pprof`, `%s/go-s3-cpu.pprof`, and the adjacent `*-pprof-top.txt` files.\n", archive, archive)
 
 	return b.String(), nil
+}
+
+func internalErrorTable(root, archive string) string {
+	type logSpec struct {
+		name       string
+		errorToken string
+		patterns   []string
+	}
+	enginePatterns := []string{
+		"sqlite worker close channel dropped without clean close",
+		"websocket failed",
+		"http req ingress metrics failed",
+		"http req egress metrics failed, likely corrupt now",
+		"long signal recv time",
+	}
+	runnerPatterns := []string{
+		"shutdown serialize-state enqueue failed",
+		"serializeState callback returned error",
+		"serializeState timed out",
+		"failed to dispatch websocket close event",
+	}
+	specs := []logSpec{
+		{"engine-go.log", "level=error", enginePatterns},
+		{"engine-typescript.log", "level=error", enginePatterns},
+		{"engine-rust.log", "level=error", enginePatterns},
+		{"runner-go-persist.log", " ERROR ", runnerPatterns},
+		{"runner-typescript-persist.log", " ERROR ", runnerPatterns},
+		{"runner-typescript-no-persist.log", " ERROR ", runnerPatterns},
+		{"runner-rust-persist.log", " ERROR ", runnerPatterns},
+		{"runner-rust-no-persist.log", " ERROR ", runnerPatterns},
+	}
+
+	var b strings.Builder
+	fmt.Fprintln(&b, "| Archived log | Error-level records | Exact-pattern breakdown |")
+	fmt.Fprintln(&b, "|---|---:|---|")
+	for _, spec := range specs {
+		data, _ := os.ReadFile(filepath.Join(root, archive, spec.name))
+		total := bytes.Count(data, []byte(spec.errorToken))
+		var parts []string
+		for _, pattern := range spec.patterns {
+			count := bytes.Count(data, []byte(pattern))
+			if count != 0 {
+				parts = append(parts, fmt.Sprintf("`%s`: %d", pattern, count))
+			}
+		}
+		breakdown := "none"
+		if len(parts) != 0 {
+			breakdown = strings.Join(parts, "; ")
+		}
+		fmt.Fprintf(&b, "| `%s` | %d | %s |\n", spec.name, total, breakdown)
+	}
+	return strings.TrimRight(b.String(), "\n")
 }
 
 func summaryTable(groups map[groupKey][]result) string {
@@ -340,7 +409,7 @@ func summaryTable(groups map[groupKey][]result) string {
 		return resultLess(a, b)
 	})
 	var b strings.Builder
-	fmt.Fprintln(&b, "| Scenario | SDK | Persistence | Throughput ops/s r1/r2 (delta) | p50 ms r1/r2 (delta) | p95 ms r1/r2 (delta) | p99 ms r1/r2 (delta) | max ms r1/r2 | Errors r1/r2 | Engine CPU avg r1/r2 | Runner CPU avg r1/r2 | Valid |")
+	fmt.Fprintln(&b, "| Scenario | SDK | Persistence | Throughput ops/s r1/r2 (delta) | p50 ms r1/r2 (delta) | p95 ms r1/r2 (delta) | p99 ms r1/r2 (delta) | max ms r1/r2 | Loadgen errors r1/r2 | Engine CPU avg r1/r2 | Runner CPU avg r1/r2 | Valid |")
 	fmt.Fprintln(&b, "|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---|")
 	for _, key := range keys {
 		runs := groups[key]
@@ -445,6 +514,18 @@ func rustLockPin(path string) string {
 	return fmt.Sprintf("v%s from `%s`", match[1], match[2])
 }
 
+func archivedMatch(root, archive, expression string) string {
+	data, err := os.ReadFile(filepath.Join(root, archive, "environment.txt"))
+	if err != nil {
+		return "unknown"
+	}
+	match := regexp.MustCompile(expression).FindSubmatch(data)
+	if len(match) != 2 {
+		return "unknown"
+	}
+	return string(match[1])
+}
+
 func command(name string, args ...string) string {
 	output, err := exec.Command(name, args...).CombinedOutput()
 	if err != nil {
@@ -463,7 +544,15 @@ func commandAt(directory, name string, args ...string) string {
 	return strings.TrimSpace(string(output))
 }
 
-func readOptional(path string) string {
-	data, _ := os.ReadFile(path)
-	return string(data)
+func fileSHA256(path string) string {
+	file, err := os.Open(path)
+	if err != nil {
+		return fmt.Sprintf("unavailable (%v)", err)
+	}
+	defer file.Close()
+	hash := sha256.New()
+	if _, err := io.Copy(hash, file); err != nil {
+		return fmt.Sprintf("unavailable (%v)", err)
+	}
+	return fmt.Sprintf("%x", hash.Sum(nil))
 }

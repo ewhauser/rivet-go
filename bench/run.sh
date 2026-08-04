@@ -265,8 +265,8 @@ mkdir -p "$ARCHIVE_DIR"
 cp "$RAW_DIR"/*.json "$ARCHIVE_DIR/"
 cp "$PROFILE_DIR"/* "$ARCHIVE_DIR/"
 cp "$LOG_DIR"/*.log "$ARCHIVE_DIR/"
-go tool pprof -top -nodecount=25 "$GO_RUNNER" "$PROFILE_DIR/go-s1-cpu.pprof" >"$ARCHIVE_DIR/go-s1-pprof-top.txt"
-go tool pprof -top -nodecount=25 "$GO_RUNNER" "$PROFILE_DIR/go-s3-cpu.pprof" >"$ARCHIVE_DIR/go-s3-pprof-top.txt"
+go tool pprof -top -cum -nodefraction=0 -nodecount=80 "$GO_RUNNER" "$PROFILE_DIR/go-s1-cpu.pprof" >"$ARCHIVE_DIR/go-s1-pprof-top.txt"
+go tool pprof -top -cum -nodefraction=0 -nodecount=80 "$GO_RUNNER" "$PROFILE_DIR/go-s3-cpu.pprof" >"$ARCHIVE_DIR/go-s3-pprof-top.txt"
 
 {
 	"$ENGINE_BIN" --version
@@ -279,6 +279,7 @@ go tool pprof -top -nodecount=25 "$GO_RUNNER" "$PROFILE_DIR/go-s3-cpu.pprof" >"$
 	sysctl -n machdep.cpu.brand_string
 	sysctl -n hw.memsize
 	git -C "$ROOT_DIR" rev-parse HEAD
+	shasum -a 256 "$ROOT_DIR/internal/ffi/lib/darwin_arm64/librivetkit_go_ffi.dylib"
 } >"$ARCHIVE_DIR/environment.txt"
 
 "$REPORT" \
