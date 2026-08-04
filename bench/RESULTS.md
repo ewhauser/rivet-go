@@ -142,6 +142,19 @@ The `r1/r2 (delta)` cells show both repetitions and the signed percentage change
 
 ## Caveats
 
+**This is a comparison of binding architectures, not languages.** All three
+runners embed the same Rust `rivetkit-core` (verified: the npm rivetkit
+2.3.10 install ships it as `rivetkit-napi.darwin-arm64.node`). The Rust SDK
+calls it directly (no boundary); TypeScript hosts JS handlers over napi,
+where core calls back into V8 only per handler invocation and protocol
+bookkeeping stays in Rust; Go hosts handlers over purego with a deliberately
+callback-free event pump, so every event and command crosses the boundary as
+serialized MessagePack with thread handoffs. The S3 gap tracks
+boundary-crossing count (three per echo in Go, roughly one in TypeScript),
+which is the measured price of the no-callback FFI design — an architectural
+choice documented in docs/PLAN.md, not a language-runtime difference.
+
+
 - **Persistence is labeled, not assumed.** The strict `persist` rows await a state save before returning the increment result in every SDK. Go's public action adapter performs this save automatically after a successful handler, so an additional `ctx.Save` would double-save. TypeScript's state proxy normally requests deferred persistence; this actor also awaits `saveState({ immediate: true })`. Rust explicitly awaits `Ctx::save_state`. The `no-persist` rows use actor-generation-local values and exist only for TypeScript and Rust because Go exposes no no-persist successful action.
 - **The native paths differ.** Go crosses a purego C ABI and MessagePack event-pump hop for each event before using the pinned Rust core. TypeScript crosses N-API between JavaScript and the same core and performs JavaScript/CBOR work. Rust calls the core natively. Those costs are the SDK implementations being measured, but this is not a language-only comparison.
 - **Pinned Rust needs the database marker for state.** The standalone git dependency enables `sqlite-remote`, but its registry selects that backend only when `Actor::HAS_DATABASE` is true. Both Rust actors set the marker and issue no application SQL. Omitting it makes new actors fail with `SQLite is unavailable` at this pin.
