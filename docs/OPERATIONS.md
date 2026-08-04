@@ -93,6 +93,12 @@ directory, mid-stream client disconnect, sleep/wake churn, a stalled WebSocket
 client, and a sacrificial action panic. A successful duration alone is not a
 pass.
 
+The soak gives its final runner drain 60 seconds so actors accumulated across
+a long restart history can stop across multiple pinned 16-second workflow
+ticks. This is a harness setting, not a change to the SDK's 10-second default;
+successful and forced application deadlines are verified separately by process
+conformance.
+
 The seed is printed before engine startup and selects deterministic counter
 value streams and per-producer intent sequences. Reusing the seed and flags
 replays those streams and the fixed chaos cadence. A default temporary data
