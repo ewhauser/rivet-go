@@ -25,7 +25,7 @@ Generated from two sequential repetitions per cell on 2026-08-04T14:46:03Z. Raw 
 
 ## Post-hibernation-fix
 
-The Go SDK previously registered every actor with WebSocket hibernation enabled, while the pinned TypeScript and Rust SDKs default it to false. A latency investigation observed one engine hibernation acknowledgement per Go echo message and measured only about 36 us in Go's in-runner critical path. In an interleaved Go-only A/B that changed only this flag, S3 client p50 moved from 8.243 ms to 6.459 ms, about 1.8 ms. The earlier conclusion that Go was roughly 22% behind in S3 because of its callback-free FFI design was therefore a configuration mismatch, not a measured runner-performance cost.
+The Go SDK previously registered every actor with WebSocket hibernation enabled, while the pinned TypeScript and Rust SDKs default it to false. An uncommitted latency investigation observed one engine hibernation acknowledgement per Go echo message and measured only about 36 us in Go's in-runner critical path. In interleaved Go-only investigation runs that changed only this flag, S3 client p50 moved from 8.243 ms to 6.459 ms, about 1.8 ms. Those flag-only A/B runs and the 36 us internal measurement are not part of the committed archive below. The earlier conclusion that Go was roughly 22% behind in S3 because of its callback-free FFI design was therefore a configuration mismatch, not a measured runner-performance cost.
 
 The table below averages the two same-run persistent repetitions for S1 and S4 and the two non-persistence S3 repetitions. All three S3 echo actors use non-hibernating WebSockets.
 
@@ -40,6 +40,8 @@ The table below averages the two same-run persistent repetitions for S1 and S4 a
 | S4 | Go | 16.2 | 60.623 | 1.8% |
 | S4 | TypeScript | 17.5 | 55.647 | 3.8% |
 | S4 | Rust | 16.4 | 59.199 | 1.4% |
+
+In the corrected same-run S3 rows, Go and TypeScript are essentially even for this loopback workload: their averaged throughput differs by 0.5% and averaged p50 by 0.5%. Both differences are smaller than the respective run-to-run movements shown in the summary table, and the engine-limited caveat below still applies.
 
 ## Summary
 
@@ -124,7 +126,7 @@ The `r1/r2 (delta)` cells show both repetitions and the signed percentage change
 
 ## Caveats
 
-- **The corrected S3 comparison uses matching WebSocket configuration.** Go, TypeScript, and Rust all run the echo actor with hibernation disabled. The earlier Go-only hibernation setting caused an engine acknowledgement on every message and explained the reported S3 latency gap; the interleaved flag-only A/B moved Go p50 from 8.243 ms to 6.459 ms, while Go's measured in-runner critical path was about 36 us. The post-fix S3 rows measure the SDK paths after removing that mismatch, so they do not support attributing the old gap to Go's callback-free FFI design.
+- **The corrected S3 comparison uses matching WebSocket configuration.** Go, TypeScript, and Rust all run the echo actor with hibernation disabled. The earlier Go-only hibernation setting caused an engine acknowledgement on every message and explained the reported S3 latency gap. Uncommitted investigation runs produced the 8.243 ms versus 6.459 ms flag-only A/B and the roughly 36 us Go critical-path measurement; those observations are not in this archive. The committed post-fix S3 rows measure the SDK paths after removing that mismatch, so they do not support attributing the old gap to Go's callback-free FFI design.
 - **Persistence is labeled, not assumed.** The strict `persist` rows await a state save before returning the increment result in every SDK. Go's public action adapter performs this save automatically after a successful handler, so an additional `ctx.Save` would double-save. TypeScript's state proxy normally requests deferred persistence; this actor also awaits `saveState({ immediate: true })`. Rust explicitly awaits `Ctx::save_state`. The `no-persist` rows use actor-generation-local values and exist only for TypeScript and Rust because Go exposes no no-persist successful action.
 - **The native paths differ.** Go crosses a purego C ABI and MessagePack event-pump hop for each event before using the pinned Rust core. TypeScript crosses N-API between JavaScript and the same core and performs JavaScript/CBOR work. Rust calls the core natively. Those costs are the SDK implementations being measured, but this is not a language-only comparison.
 - **Pinned Rust needs the database marker for state.** The standalone git dependency enables `sqlite-remote`, but its registry selects that backend only when `Actor::HAS_DATABASE` is true. Both Rust actors set the marker and issue no application SQL. Omitting it makes new actors fail with `SQLite is unavailable` at this pin.
