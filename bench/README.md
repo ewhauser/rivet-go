@@ -28,3 +28,10 @@ Run the complete, sequential evaluation with:
 All runners use error-level logging. Raw JSON is written below the ignored
 `bench/results/`; a dated provenance copy and Go S1/S3 CPU profiles are kept
 under `bench/results-archive/`.
+
+Engine `v2.3.10` hard-codes a 10,000 request/minute limit per client IP. The
+load generator assigns one stable loopback `X-Forwarded-For` identity to each
+HTTP worker, matching the engine's documented reverse-proxy path. This keeps
+the public abuse-control ceiling from becoming an artificial throughput cap;
+the same identity mapping is used for every SDK and correctness still rejects
+all non-2xx responses.

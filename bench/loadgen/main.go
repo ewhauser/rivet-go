@@ -206,7 +206,7 @@ func (c *gatewayClient) createActor(ctx context.Context, name, label string) (st
 	return response.Actor.ActorID, nil
 }
 
-func (c *gatewayClient) action(ctx context.Context, actorID, action string, args []any) (int64, error) {
+func (c *gatewayClient) action(ctx context.Context, actorID, action string, args []any, clientSlot int) (int64, error) {
 	payload := struct {
 		Args []any `json:"args"`
 	}{Args: args}
@@ -214,13 +214,17 @@ func (c *gatewayClient) action(ctx context.Context, actorID, action string, args
 		Output int64 `json:"output"`
 	}
 	path := "/gateway/" + url.PathEscape(actorID) + "/action/" + url.PathEscape(action)
-	if err := c.requestJSON(ctx, http.MethodPost, path, payload, &response); err != nil {
+	if err := c.requestJSONFrom(ctx, http.MethodPost, path, payload, &response, benchmarkClientIP(clientSlot)); err != nil {
 		return 0, err
 	}
 	return response.Output, nil
 }
 
 func (c *gatewayClient) requestJSON(ctx context.Context, method, path string, input, output any) error {
+	return c.requestJSONFrom(ctx, method, path, input, output, "")
+}
+
+func (c *gatewayClient) requestJSONFrom(ctx context.Context, method, path string, input, output any, clientIP string) error {
 	encoded, err := json.Marshal(input)
 	if err != nil {
 		return fmt.Errorf("encode request: %w", err)
@@ -231,6 +235,13 @@ func (c *gatewayClient) requestJSON(ctx context.Context, method, path string, in
 	}
 	request.Header.Set("Authorization", "Bearer dev")
 	request.Header.Set("Content-Type", "application/json")
+	if clientIP != "" {
+		// The pinned guard has a hard-coded 10,000 requests/minute limiter per
+		// client IP and, like a deployed reverse proxy, trusts X-Forwarded-For.
+		// Assign one stable loopback identity to each load worker so the public
+		// abuse-control ceiling does not become the benchmark result.
+		request.Header.Set("X-Forwarded-For", clientIP)
+	}
 	response, err := c.http.Do(request)
 	if err != nil {
 		return err
@@ -252,6 +263,13 @@ func (c *gatewayClient) requestJSON(ctx context.Context, method, path string, in
 		}
 	}
 	return nil
+}
+
+func benchmarkClientIP(slot int) string {
+	if slot < 0 {
+		slot = -slot
+	}
+	return fmt.Sprintf("127.%d.%d.%d", 1+(slot/60_000)%200, 1+(slot/250)%240, 1+slot%240)
 }
 
 type phaseCounts struct {
@@ -276,7 +294,7 @@ func actionPhase(
 			defer workers.Done()
 			for time.Now().Before(deadline) {
 				started := time.Now()
-				output, err := client.action(ctx, actorIDs[actorIndex], "increment", []any{1})
+				output, err := client.action(ctx, actorIDs[actorIndex], "increment", []any{1}, worker)
 				elapsed := time.Since(started)
 				if err != nil {
 					if record != nil {
@@ -315,7 +333,7 @@ func runActionScenario(ctx context.Context, cfg config, client *gatewayClient, a
 	actionPhase(ctx, client, actorIDs, concurrency, cfg.warmup, warmupRecord)
 	baselines := make([]int64, len(actorIDs))
 	for i, actorID := range actorIDs {
-		value, err := client.action(ctx, actorID, "get", []any{})
+		value, err := client.action(ctx, actorID, "get", []any{}, 10_000+i)
 		if err != nil {
 			warmupRecord.failure(fmt.Errorf("get warmup baseline for actor %d: %w", i, err))
 			continue
@@ -341,7 +359,7 @@ func runActionScenario(ctx context.Context, cfg config, client *gatewayClient, a
 	for i, actorID := range actorIDs {
 		count := counts.byActor[i].Load()
 		expected += baselines[i] + count
-		value, getErr := client.action(ctx, actorID, "get", []any{})
+		value, getErr := client.action(ctx, actorID, "get", []any{}, 20_000+i)
 		if getErr != nil {
 			record.failure(fmt.Errorf("get measured total for actor %d: %w", i, getErr))
 			correct = false
@@ -371,7 +389,7 @@ func runColdStart(ctx context.Context, cfg config, client *gatewayClient) (*resu
 			warmupRecord.failure(err)
 			continue
 		}
-		if output, err := client.action(ctx, actorID, "increment", []any{1}); err != nil {
+		if output, err := client.action(ctx, actorID, "increment", []any{1}, i%64); err != nil {
 			warmupRecord.failure(err)
 		} else if output != 1 {
 			warmupRecord.failure(fmt.Errorf("warmup fresh counter returned %d, want 1", output))
@@ -392,7 +410,7 @@ func runColdStart(ctx context.Context, cfg config, client *gatewayClient) (*resu
 			record.failure(createErr)
 			continue
 		}
-		output, actionErr := client.action(ctx, actorID, "increment", []any{1})
+		output, actionErr := client.action(ctx, actorID, "increment", []any{1}, i%64)
 		if actionErr != nil {
 			record.failure(actionErr)
 			continue
