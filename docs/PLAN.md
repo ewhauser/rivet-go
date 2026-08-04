@@ -581,9 +581,12 @@ interleaved loopback A/B changing only this flag moved Go client p50 from
 8.243 ms to 6.459 ms; the hibernating path emitted an engine acknowledgement
 for every message. This is about 1.8 ms of observed p50 overhead, not evidence
 that the callback-free FFI event pump is intrinsically that far behind.
+Default sockets also skip the private Go-to-Rust `WsMessageAck` command and
+Rust FIFO/index bookkeeping; only opt-in sockets retain that M5 machinery.
 
 New decode surfaces: ABI 6 adds one bounded string-to-boolean map to the
-existing MessagePack `RunnerConfig`. Its cardinality is bounded by the
-existing 1,024 actor-name limit, and Rust rejects keys that are not present in
-`actor_names`. It adds no event, command, blob, or unbounded allocation
-surface. No fuzz or deliberately malformed-input test was added.
+existing MessagePack `RunnerConfig`. Go registration and Rust startup enforce
+the 1,024 actor-name limit, the Go shape scanner accepts the exact-bound map,
+and Rust rejects keys that are not present in `actor_names`. It adds no event,
+command, blob, or unbounded allocation surface. No fuzz or deliberately
+malformed-input test was added.

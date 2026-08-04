@@ -21,7 +21,8 @@ behavior, not a benchmark optimization.
 All three S3 echo actors use the pinned default of non-hibernating raw
 WebSockets. Go spells this out as `HibernateWebSockets: false`; TypeScript and
 Rust leave their corresponding actor options at the same false default. This
-keeps per-message hibernation acknowledgements out of the echo comparison.
+keeps private boundary acknowledgement bookkeeping and per-message engine
+hibernation acknowledgements out of the echo comparison.
 
 Run the complete, sequential evaluation with:
 

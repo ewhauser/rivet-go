@@ -27,7 +27,7 @@ pub struct RkSubmitResult {
 
 #[no_mangle]
 pub extern "C" fn rk_abi_version() -> u32 {
-    1
+    if cfg!(rk_abi_5) { 5 } else { 1 }
 }
 
 #[no_mangle]

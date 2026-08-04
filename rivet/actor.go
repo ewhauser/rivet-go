@@ -20,7 +20,9 @@ import (
 type Actor[T any] struct {
 	// HibernateWebSockets keeps raw gateway WebSockets connected while this
 	// actor sleeps. It is opt-in because the pinned engine acknowledges every
-	// message on hibernatable connections, adding per-message latency.
+	// message on hibernatable connections. A recorded single-machine loopback
+	// echo comparison observed about 1.8 ms higher client p50 with hibernation;
+	// that magnitude is workload-specific and is not a network-latency estimate.
 	HibernateWebSockets bool
 	OnStart             func(*Context[T]) error
 	OnStop              func(*Context[T]) error
@@ -101,7 +103,8 @@ func (c *Context[T]) ClearSchedule() error {
 }
 
 // Sleep requests engine-managed eviction after the current handler and
-// already accepted actor work complete. Hibernatable WebSockets stay open.
+// already accepted actor work complete. Raw WebSockets stay open only when the
+// actor opted in to HibernateWebSockets; default sockets close during sleep.
 func (c *Context[T]) Sleep() error {
 	if c == nil || c.session == nil {
 		return errors.New("actor context is unavailable")

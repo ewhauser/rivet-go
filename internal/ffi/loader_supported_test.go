@@ -30,38 +30,46 @@ func TestLoadAndABIVersion(t *testing.T) {
 	}
 }
 
-func TestLoaderRejectsABI1Library(t *testing.T) {
-	filename := "librivetkit_go_ffi_abi1.so"
-	switch runtime.GOOS {
-	case "darwin":
-		filename = "librivetkit_go_ffi_abi1.dylib"
-	case "windows":
-		filename = "rivetkit_go_ffi_abi1.dll"
-	}
-	libraryPath := filepath.Join(t.TempDir(), filename)
-	command := exec.Command(
-		"rustc",
-		"--crate-type=cdylib",
-		filepath.Join("testdata", "abi1_fixture.rs"),
-		"-o",
-		libraryPath,
-	)
-	if output, err := command.CombinedOutput(); err != nil {
-		t.Fatalf("build ABI-1 fixture: %v: %s", err, output)
-	}
-	handle, err := openLibrary(libraryPath)
-	if err != nil {
-		t.Fatalf("open ABI-1 fixture: %v", err)
-	}
-	defer func() {
-		if err := closeLibrary(handle); err != nil {
-			t.Errorf("close ABI-1 fixture: %v", err)
-		}
-	}()
-	var candidate nativeAPI
-	err = candidate.bindAndValidate(handle)
-	if err == nil || !strings.Contains(err.Error(), "library reports 1") {
-		t.Fatalf("ABI-1 validation error = %v", err)
+func TestLoaderRejectsOlderABILibraries(t *testing.T) {
+	for _, version := range []uint32{1, 5} {
+		t.Run(fmt.Sprintf("ABI%d", version), func(t *testing.T) {
+			filename := fmt.Sprintf("librivetkit_go_ffi_abi%d.so", version)
+			switch runtime.GOOS {
+			case "darwin":
+				filename = fmt.Sprintf("librivetkit_go_ffi_abi%d.dylib", version)
+			case "windows":
+				filename = fmt.Sprintf("rivetkit_go_ffi_abi%d.dll", version)
+			}
+			libraryPath := filepath.Join(t.TempDir(), filename)
+			arguments := []string{
+				"--crate-type=cdylib",
+				filepath.Join("testdata", "abi1_fixture.rs"),
+				"-o",
+				libraryPath,
+			}
+			if version == 5 {
+				arguments = append([]string{"--cfg", "rk_abi_5"}, arguments...)
+			}
+			command := exec.Command("rustc", arguments...)
+			if output, err := command.CombinedOutput(); err != nil {
+				t.Fatalf("build ABI-%d fixture: %v: %s", version, err, output)
+			}
+			handle, err := openLibrary(libraryPath)
+			if err != nil {
+				t.Fatalf("open ABI-%d fixture: %v", version, err)
+			}
+			defer func() {
+				if err := closeLibrary(handle); err != nil {
+					t.Errorf("close ABI-%d fixture: %v", version, err)
+				}
+			}()
+			var candidate nativeAPI
+			err = candidate.bindAndValidate(handle)
+			want := fmt.Sprintf("library reports %d", version)
+			if err == nil || !strings.Contains(err.Error(), want) {
+				t.Fatalf("ABI-%d validation error = %v", version, err)
+			}
+		})
 	}
 }
 

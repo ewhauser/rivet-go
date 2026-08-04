@@ -1684,8 +1684,8 @@ func TestWebSocketEventsAreActorOrderedAndCommandsDoNotUsePoller(t *testing.T) {
 		t.Fatalf("start command = %#v", command)
 	}
 	runner.emit(
-		wire.Event{Kind: wire.EventWSOpen, AID: "socket-aid", WSID: "ws-a", Path: "/chat"},
-		wire.Event{Kind: wire.EventWSOpen, AID: "socket-aid", WSID: "ws-b", Path: "/chat"},
+		wire.Event{Kind: wire.EventWSOpen, AID: "socket-aid", WSID: "ws-a", Path: "/chat", CanHibernate: true},
+		wire.Event{Kind: wire.EventWSOpen, AID: "socket-aid", WSID: "ws-b", Path: "/chat", CanHibernate: true},
 	)
 	for _, wsID := range []string{"ws-a", "ws-b"} {
 		if got := <-seen; got != "open:"+wsID {
@@ -1739,6 +1739,53 @@ func TestWebSocketEventsAreActorOrderedAndCommandsDoNotUsePoller(t *testing.T) {
 	}
 }
 
+func TestNonHibernatingWebSocketMessageSkipsBoundaryAcknowledgement(t *testing.T) {
+	runner := newFakeRunner()
+	handled := make(chan struct{}, 1)
+	handler := dispatchHandler{
+		wsMessage: func(context.Context, *ActorSession, wire.Event, any) error {
+			handled <- struct{}{}
+			return nil
+		},
+	}
+	p := NewWithHandlers(runner, map[string]ActorHandler{"socket": handler})
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() { result <- p.Run(ctx) }()
+	waitPumpStarted(t, p)
+
+	runner.emit(wire.Event{
+		Kind: wire.EventActorStart, AID: "default-aid", Generation: 1, Name: "socket",
+	})
+	if command := nextCommand(t, runner); command.Kind != wire.CommandActorStartResult {
+		t.Fatalf("start command = %#v", command)
+	}
+	runner.emit(wire.Event{
+		Kind: wire.EventWSOpen, AID: "default-aid", WSID: "default-ws", Path: "/chat",
+	})
+	if command := nextCommand(t, runner); command.Kind != wire.CommandWSOpenResult {
+		t.Fatalf("open command = %#v", command)
+	}
+	runner.emit(wire.Event{
+		Kind: wire.EventWSMessage, WSID: "default-ws", Data: []byte("message"), MessageIndex: 9,
+	})
+	select {
+	case <-handled:
+	case <-time.After(time.Second):
+		t.Fatal("default WebSocket message was not handled")
+	}
+	select {
+	case command := <-runner.submitted:
+		t.Fatalf("default WebSocket submitted an unnecessary command: %#v", command)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	cancel()
+	if err := <-result; err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+}
+
 func TestWebSocketHandlerPanicRequestsActorErrorStopAndPeerSurvives(t *testing.T) {
 	runner := newFakeRunner()
 	handlers := map[string]ActorHandler{
@@ -1764,7 +1811,7 @@ func TestWebSocketHandlerPanicRequestsActorErrorStopAndPeerSurvives(t *testing.T
 	)
 	nextCommand(t, runner)
 	nextCommand(t, runner)
-	runner.emit(wire.Event{Kind: wire.EventWSOpen, AID: "panic-aid", WSID: "ws-panic", Path: "/"})
+	runner.emit(wire.Event{Kind: wire.EventWSOpen, AID: "panic-aid", WSID: "ws-panic", Path: "/", CanHibernate: true})
 	nextCommand(t, runner)
 	runner.emit(wire.Event{Kind: wire.EventWSMessage, WSID: "ws-panic", Data: []byte("boom"), MessageIndex: 1})
 	first := nextCommand(t, runner)
@@ -1814,7 +1861,7 @@ func TestWebSocketIDCanBeReusedAfterCloseWithoutStaleCorrelation(t *testing.T) {
 	nextCommand(t, runner)
 	code := uint16(1000)
 	for attempt := range 2 {
-		runner.emit(wire.Event{Kind: wire.EventWSOpen, AID: "socket-aid", WSID: "reused", Path: "/"})
+		runner.emit(wire.Event{Kind: wire.EventWSOpen, AID: "socket-aid", WSID: "reused", Path: "/", CanHibernate: true})
 		if got := <-seen; got != "open:reused" {
 			t.Fatalf("attempt %d open observation = %q", attempt, got)
 		}

@@ -25,6 +25,7 @@ const (
 	defaultRunnerName   = "rivet-go"
 	defaultLogLevel     = "info"
 	internalAlarmAction = "__rivet_go_alarm"
+	maxRegisteredActors = 1_024
 )
 
 // Config controls engine registration. Version is the engine-visible runner
@@ -106,6 +107,9 @@ func Register[T any](registry *Registry, name string, actor Actor[T]) error {
 	}
 	if _, exists := registry.actors[name]; exists {
 		return fmt.Errorf("actor %q is already registered", name)
+	}
+	if len(registry.actors) >= maxRegisteredActors {
+		return fmt.Errorf("registry must contain at most %d actors", maxRegisteredActors)
 	}
 	registry.actors[name] = &actorAdapter[T]{definition: actor}
 	return nil

@@ -891,6 +891,7 @@ func TestDefaultWebSocketClosesOnSleep(t *testing.T) {
 	engine := startEngine(t, engineBinary)
 
 	connected := make(chan bool, 1)
+	messageSeen := make(chan struct{}, 1)
 	disconnected := make(chan struct{}, 1)
 	stopped := make(chan struct{}, 1)
 	registry := rivet.NewRegistry()
@@ -898,6 +899,15 @@ func TestDefaultWebSocketClosesOnSleep(t *testing.T) {
 		OnConnect: func(_ *rivet.Context[struct{}], connection *rivet.Connection) error {
 			connected <- connection.CanHibernate()
 			return nil
+		},
+		OnMessage: func(_ *rivet.Context[struct{}], connection *rivet.Connection, message rivet.Message) {
+			if message.Binary || string(message.Data) != "default-probe" {
+				return
+			}
+			if err := connection.SendText("default-echo"); err != nil {
+				return
+			}
+			messageSeen <- struct{}{}
 		},
 		OnDisconnect: func(*rivet.Context[struct{}], *rivet.Connection) {
 			disconnected <- struct{}{}
@@ -925,6 +935,13 @@ func TestDefaultWebSocketClosesOnSleep(t *testing.T) {
 		}
 	case <-time.After(websocketTestTimeout):
 		t.Fatal("default WebSocket actor did not observe OnConnect")
+	}
+	client.write(t, websocket.TextMessage, []byte("default-probe"))
+	waitTextFrame(t, client, "default-echo")
+	select {
+	case <-messageSeen:
+	case <-time.After(websocketTestTimeout):
+		t.Fatal("default WebSocket actor did not handle the message probe")
 	}
 
 	assertSuccessfulAction(t, gatewayAction(

@@ -107,7 +107,7 @@ instance ID, `gen` = generation; both assigned by core.
 | `HttpRequestChunk` | req_id, body, finish | — (feeds request body reader) |
 | `HttpRequestAbort` | req_id | abort handler ctx |
 | `WsOpen` | aid, ws_id, path, headers, can_hibernate, resumed | `WsOpenResult { ws_id, accept / reject }` |
-| `WsMessage` | ws_id, data, binary, msg_index | `WsMessageAck { ws_id, msg_index }` (hibernation bookkeeping) |
+| `WsMessage` | ws_id, data, binary, msg_index | `WsMessageAck { ws_id, msg_index }` only when the matching `WsOpen.can_hibernate` is true |
 | `WsClose` | ws_id, code?, reason? | — |
 | `KvResult` | kv_id, ok payload / error | — (completes pending Go future) |
 | `StatePersisted` | aid, gen, state_version | — (completes pending save) |
@@ -611,10 +611,13 @@ acknowledge the message index before advancing. In the recorded loopback A/B,
 changing only this actor option moved Go S3 client p50 from 8.243 ms to
 6.459 ms, about 1.8 ms. Applications should opt in when preserving a socket
 through sleep matters more than the per-message acknowledgement cost.
+For a false `WsOpen.can_hibernate`, Rust allocates no acknowledgement FIFO and
+Go submits no `WsMessageAck`; pinned core also omits the engine-wire message
+acknowledgement. The message callback remains actor-serialized in Go.
 
 New decode surfaces: the ABI 6 actor-hibernation map is the only new decoder
-input. The existing 1,024 actor limit bounds its cardinality, values are
-booleans, and unknown actor keys are rejected before the registry starts. It
-adds no event/command variant, binary blob, nested container, or new native
-allocation ownership rule. No fuzz or deliberately malformed-input test was
-added.
+input. Go registration and Rust startup both enforce the 1,024 actor limit,
+the shape scanner accepts a valid map at that exact bound, values are booleans,
+and unknown actor keys are rejected before the registry starts. It adds no
+event/command variant, binary blob, nested container, or new native allocation
+ownership rule. No fuzz or deliberately malformed-input test was added.

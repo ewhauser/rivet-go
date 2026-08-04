@@ -23,10 +23,14 @@ on the same client connection. Hibernation itself does not call
 
 Hibernation adds work to every message. Core persists the hibernatable
 connection's message index and the engine sends a matching acknowledgement.
-In the loopback latency investigation that motivated the opt-in default,
-changing only this flag moved Go S3 client p50 from 8.243 ms to 6.459 ms. The
-observed cost was therefore about 1.8 ms p50 per echo on that machine and
-workload; it is not a universal network-latency estimate.
+The Go-to-Rust boundary also retains a FIFO acknowledgement until the handler
+returns. Default sockets skip both that boundary bookkeeping and the engine
+acknowledgement. In the uncommitted loopback latency investigation that
+motivated the opt-in default, changing only this flag moved Go S3 client p50
+from 8.243 ms to 6.459 ms. The observed cost was therefore about 1.8 ms p50 per
+echo on that machine and workload; it is not a universal network-latency
+estimate, and those investigation-only A/B runs are not in the benchmark
+archive.
 
 Enable hibernation for long-lived clients that must remain connected across
 actor sleep. Leave it disabled for latency-sensitive sockets that can

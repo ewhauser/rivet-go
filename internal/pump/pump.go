@@ -1579,15 +1579,18 @@ func (w *actorWorker) run(start wire.Event) {
 				}
 			}
 		case wire.EventWSMessage:
+			needsAcknowledgement := w.pump.websocketCanHibernate(event.WSID)
 			messageError := invokeWebSocketMessage(w.ctx, w.handler, w.session, event, state)
 			w.pump.recordHandlerPanic(messageError, "OnMessage", w.session)
-			if err := w.pump.submitInternal(w.ctx, wire.Command{
-				Kind:         wire.CommandWSMessageAck,
-				WSID:         event.WSID,
-				MessageIndex: event.MessageIndex,
-			}); err != nil {
-				w.pump.reportWorkerError(fmt.Errorf("submit WsMessageAck: %w", err))
-				return
+			if needsAcknowledgement {
+				if err := w.pump.submitInternal(w.ctx, wire.Command{
+					Kind:         wire.CommandWSMessageAck,
+					WSID:         event.WSID,
+					MessageIndex: event.MessageIndex,
+				}); err != nil {
+					w.pump.reportWorkerError(fmt.Errorf("submit WsMessageAck: %w", err))
+					return
+				}
 			}
 			if messageError != nil && messageError.Code == "handler_panic" {
 				w.requestErrorStop()
@@ -1885,6 +1888,13 @@ func (p *Pump) websocketActor(wsID string) *actorWorker {
 		return nil
 	}
 	return p.actor(owner.identity.aid, owner.identity.generation)
+}
+
+func (p *Pump) websocketCanHibernate(wsID string) bool {
+	p.wsMu.Lock()
+	owner, ok := p.websockets[wsID]
+	p.wsMu.Unlock()
+	return ok && owner.canHibernate
 }
 
 func (p *Pump) removeWebSocket(wsID string) *actorWorker {

@@ -111,6 +111,35 @@ func TestValidateShapeAcceptsMaximumM3HTTPChunkAndHeaderSchema(t *testing.T) {
 	}
 }
 
+func TestValidateShapeAcceptsMaximumActorManifestAndHibernationMap(t *testing.T) {
+	names := make([]string, 0, maxArrayEntries)
+	actions := make(map[string][]string, maxMapEntries)
+	hibernation := make(map[string]bool, maxMapEntries)
+	for index := range maxArrayEntries {
+		name := fmt.Sprintf("actor-%04d", index)
+		names = append(names, name)
+		actions[name] = []string{}
+		hibernation[name] = index%2 == 0
+	}
+	data, err := EncodeRunnerConfig(RunnerConfig{
+		EngineEndpoint:           "http://127.0.0.1:6420",
+		Namespace:                "default",
+		RunnerName:               "maximum-manifest",
+		Version:                  1,
+		TotalSlots:               1,
+		ActorNames:               names,
+		ActorActions:             actions,
+		ActorHibernateWebSockets: hibernation,
+		LogLevel:                 "info",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := validateShape(data); err != nil {
+		t.Fatalf("valid maximum actor manifest rejected: %v", err)
+	}
+}
+
 func TestValidateShapeCoversEveryMessagePackTypeFamily(t *testing.T) {
 	zeros := func(count int) []byte { return make([]byte, count) }
 	withPayload := func(prefix []byte, count int) []byte {

@@ -3,6 +3,7 @@ package rivet
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"reflect"
 	"strings"
 	"testing"
@@ -34,7 +35,7 @@ func TestRegisterBuildsSortedManifestAndRejectsDuplicates(t *testing.T) {
 	if err := Register(registry, "alpha", Actor[int]{}); err != nil {
 		t.Fatalf("Register alpha: %v", err)
 	}
-	if err := Register(registry, "alpha", Actor[int]{}); err == nil {
+	if err := Register(registry, "alpha", Actor[int]{HibernateWebSockets: true}); err == nil {
 		t.Fatal("duplicate Register succeeded")
 	}
 	names, actions, hibernateWebSockets, handlers := registry.snapshotActors()
@@ -49,6 +50,28 @@ func TestRegisterBuildsSortedManifestAndRejectsDuplicates(t *testing.T) {
 	}
 	if !reflect.DeepEqual(hibernateWebSockets, map[string]bool{"alpha": false, "zeta": true}) {
 		t.Fatalf("actor WebSocket hibernation manifest = %#v", hibernateWebSockets)
+	}
+}
+
+func TestRegisterEnforcesActorManifestBound(t *testing.T) {
+	registry := NewRegistry()
+	for index := range maxRegisteredActors {
+		name := fmt.Sprintf("actor-%04d", index)
+		if err := Register(registry, name, Actor[struct{}]{}); err != nil {
+			t.Fatalf("Register %s: %v", name, err)
+		}
+	}
+	if err := Register(registry, "actor-over-limit", Actor[struct{}]{}); err == nil ||
+		!strings.Contains(err.Error(), "at most 1024 actors") {
+		t.Fatalf("over-limit actor registration error = %v", err)
+	}
+	if err := Register(registry, "actor-0000", Actor[struct{}]{HibernateWebSockets: true}); err == nil ||
+		!strings.Contains(err.Error(), "already registered") {
+		t.Fatalf("duplicate registration at bound error = %v", err)
+	}
+	_, _, hibernation, _ := registry.snapshotActors()
+	if hibernation["actor-0000"] {
+		t.Fatal("rejected duplicate changed the actor hibernation manifest")
 	}
 }
 

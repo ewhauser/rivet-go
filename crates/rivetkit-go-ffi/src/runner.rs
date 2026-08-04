@@ -761,6 +761,24 @@ mod tests {
                 .code,
             "invalid_config"
         );
+
+        let mut config = valid_config();
+        for index in 0..1_024 {
+            let name = format!("actor-{index:04}");
+            config.actor_names.push(name.clone());
+            config.actor_actions.insert(name.clone(), Vec::new());
+            config
+                .actor_hibernate_websockets
+                .insert(name, index % 2 == 0);
+        }
+        assert!(validate_config(&config).is_ok());
+        config.actor_names.push("actor-over-limit".to_owned());
+        assert_eq!(
+            validate_config(&config)
+                .expect_err("over-limit actor manifest")
+                .code,
+            "invalid_config"
+        );
     }
 
     #[test]

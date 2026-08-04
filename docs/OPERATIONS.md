@@ -207,9 +207,10 @@ pin-specific notes in `docs/FFI-BOUNDARY.md`:
   generation. Hibernation itself suppresses `OnDisconnect`.
 - Raw WebSocket hibernation is opt-in per actor through
   `Actor.HibernateWebSockets`. The false default matches the pinned TypeScript,
-  Rust, and core defaults and avoids the engine acknowledgement on every
-  message. Enabling it preserves sockets across sleep but added about 1.8 ms
-  client-observed p50 per loopback echo in the recorded investigation.
+  Rust, and core defaults and avoids both private boundary acknowledgement
+  bookkeeping and the engine acknowledgement on every message. Enabling it
+  preserves sockets across sleep but added about 1.8 ms client-observed p50
+  per loopback echo in the recorded investigation.
 - After abrupt engine replacement, an already-sleeping actor may need one
   demand rehydration to reconcile its persisted alarm. A client that vanished
   while fully asleep may be pruned before Go observes `OnDisconnect`.
