@@ -1,116 +1,221 @@
-# M6 review — production hardening
+# M6 review — final hardening
 
-## Result
+## Provenance and result
 
-M6 is accepted. Graceful process drain is exercised through a real
-`SIGTERM`; the dependency-free operability surface is wired to the pump; the
-counter and chat examples build and run through the pinned engine; every Go
-test package has a goroutine leak gate; and the strict mixed-workload chaos
-soak completed its required bounded profile without a convergence, delivery,
-sequence, activation, goroutine, or native-handle failure.
+The milestone builder wrote the previous contents of this file. Those contents
+were builder claims, not review evidence, and have been replaced in full. This
+document is the independent review of the seven M6 commits ending at `64ceea2`
+plus the fixes made during that review.
 
-The 24-hour release soak remains an operations runbook item. It is not claimed
-as evidence from this implementation session.
+The builder tip was not release-ready. Its default soak failed, its chat and
+alarm models were partly circular, blocking hooks could stop the runtime, and
+the forced drain path could lose the promised WebSocket close. The reviewed
+tip fixes every blocker and major found here. Local release-candidate evidence
+is recorded below; the 24-hour run and the first hosted CI execution remain
+release gates, not claims.
 
-## Hardening findings and disposition
+| Severity | Found | Fixed | Open |
+|---|---:|---:|---:|
+| Blocker | 2 | 2 | 0 |
+| Major | 4 | 4 | 0 |
+| Minor | 1 | 1 | 0 |
 
-1. **Runner shutdown previously conflated process drain and actor sleep.**
-   M5 correctly hibernated eligible sockets during ordinary sleep, but applying
-   that behavior to a terminating Go process left connection state with no
-   process capable of resuming it. The native proxy now marks process drain
-   explicitly and closes those sockets with code 1001 and reason `runner
-   shutting down`. Ordinary sleep remains hibernating.
-2. **The public serve path did not own process signals or require a terminal
-   native event.** `rivet.Serve` now handles `SIGINT`, `SIGTERM`, and context
-   cancellation, rejects new work, drains already-admitted work under a
-   configurable deadline, waits for `RunnerStopped`, and returns an error for
-   a non-graceful report.
-3. **Runtime behavior had no stable dependency-free observation surface.**
-   `rivet.Hooks` exports counter, gauge, and duration observations for poll,
-   submit, backpressure, actor lifecycle and panic, live actors/connections,
-   and poll latency. `Config.Logger` accepts `log/slog`; nil discards. Hook
-   panics are contained and logged. The counter example supplies an `expvar`
-   adapter without making Prometheus or another backend an SDK dependency.
-4. **A duration-only soak could pass without exercising failure paths.** The
-   M6 harness has independent nonzero activation guards for engine
-   replacement, client disconnect, sleep/wake, stalled clients, and action
-   panic. Workload counters are also nonzero-gated. The final summary is
-   emitted only after strict convergence and leak checks pass.
-5. **Count-only state or aggregate broadcast assertions would hide corruption.**
-   Counter, chat, and alarm actors have independent Go truth models compared
-   field-by-field with engine-persisted actor state. Every live chat client has
-   an ordered receipt ledger, so a duplicate, omission, wrong sender/body/seq,
-   or sequence regression fails at the first mismatch. Final goroutines and
-   native runner/error/buffer handles must return to their starting values.
+## Findings
 
-## Process-drain evidence
+1. **Blocker — the strict soak was not a trustworthy release oracle.**
 
-`TestRunnableExamplesAndSIGTERMDrain` compiles both examples into subprocesses.
-It calls the counter through the gateway, then sends `SIGTERM` and requires a
-zero exit. It starts the chat example, opens a real gateway WebSocket, starts a
-1.5-second action, waits until the handler is in flight, and sends `SIGTERM`.
-The action must complete, the socket must receive code 1001 with the documented
-reason, the engine must stop listing the runner, and the process must exit
-zero. This passed inside the complete race-enabled suite.
+   At `64ceea2`, the first default run failed while draining
+   `client-000003`: the ledger had 455 received receipts but only 94 expected.
+   Chat truth advanced inside `OnMessage`; alarm truth advanced inside actor
+   lifecycle callbacks. Both reused the events consumed by the system under
+   test instead of applying workload-generator intents to an independent
+   Go-side model. Client membership also changed from actor callbacks, so a
+   disconnect could stop expectations while its socket continued receiving.
 
-## Soak evidence
+   `2155422` makes counter tokens producer-local and deterministic, advances
+   chat and alarm truth from generator intents, maintains an ordered ledger per
+   client, and pauses the workload while membership changes. Accelerated
+   falsification then found a second temporal bug: restart could interrupt an
+   alarm after Go observed its callback but before the state was durable.
+   `7c4eac9` keeps the alarm intent in the work gate through verified firing;
+   it does not waive a lost alarm. Counter and chat state are checked on every
+   intent; receipt ledgers converge before membership/restart transitions and
+   after stalls; alarm state converges after restart; all models converge
+   again at the end.
 
-Command:
+2. **Blocker — the required 15-minute profile survived every chaos oracle but
+   failed its own final drain budget.**
 
-```sh
-go run ./cmd/soak -duration=15m -intensity=8
-```
+   Seed 6301 completed the full active window, then returned `runner drain
+   exceeded its deadline with 5 actors remaining`. The soak reused the SDK's
+   10-second application default even though a long restart history leaves the
+   pinned workflow engine needing more than one 16-second tick to process the
+   five final workload actor stops. Short runs had hidden the mismatch.
 
-Final summary:
+   `3fa4868` gives the soak an explicit 60-second shutdown budget within its
+   existing 90-second finalization context; `bbd639a` documents why this is a
+   harness setting rather than a relaxation of the public default. Successful
+   and forced application deadlines remain independently tested at 10 seconds
+   and 200 ms. The complete 15-minute profile was rerun after this fix.
 
-```text
-SOAK PASS {"duration":"15m11.416s","seed":1785807299393930000,"counter_operations":4365,"chat_messages":2161,"expected_receipts":8609,"received_receipts":8609,"alarm_fires":36,"chaos":{"action_panics":24,"client_disconnects":47,"engine_restarts":11,"sleep_wakes":35,"stalled_clients":24},"metrics":{"actor_panics_total":24,"actor_starts_total":109,"actor_stops_total":85,"commands_submitted_total":15979,"events_polled_total":13820},"goroutines_before":3,"goroutines_after":3,"data_dir":"/var/folders/w1/9twq581x5xn7hg5sqflql2y00000gn/T/rivet-go-soak-321342981"}
-```
+3. **Major — failures were not reproducible or diagnosable as documented.**
 
-All five mandatory chaos activations are nonzero in that record. The printed
-duration includes final convergence, process drain, and bounded leak
-settlement after the 15-minute workload window.
+   The selected seed and data path appeared only in a successful final summary,
+   a shared atomic token counter made producer interleaving affect token
+   assignment, and automatically created data directories survived successful
+   runs as well as failures. Management JSON reads were unbounded and the
+   action response cap did not reject an over-limit body.
 
-## README and examples
+   `2155422` prints the seed before engine startup, prints the data and log
+   paths immediately after allocation, uses deterministic per-producer token
+   streams, preserves automatic data only on failure, removes it on success,
+   and rejects management/action responses beyond 2 MiB. The existing 1 MiB
+   WebSocket surface is enforced at the reader. Native runner, error, and
+   buffer counts are compared with the pre-run baseline; the same commit fixes
+   two FFI tests that bypassed the error-accounting constructor.
 
-The README was followed from its engine command through its counter create and
-action transcript against a fresh local engine process. The observed action
-output was `{"output":3}` and the HTTP handler then returned `3`.
-`examples/counter` and `examples/chat` are also compiled and exercised by real
-engine conformance; the counter's optional metrics endpoint demonstrates the
-complete `expvar` hook adapter.
+4. **Major — a metrics hook could deadlock the pump, and idle timeout was
+   reported as poll latency.**
 
-## Decode surfaces
+   Hooks ran synchronously on poll, submit, and actor paths. A
+   `commands_submitted_total` hook that called back into `Submit` waited on the
+   submit loop that was currently invoking it. A briefly blocking hook also
+   stopped runtime progress. Every empty intentional poll timeout was recorded
+   as latency, making the metric mostly a configured timeout distribution.
 
-M6 does not add an SDK or FFI MessagePack shape and does not change ABI 5. New
-tooling-only decode sites are:
+   `ab2544c` adds a serialized dispatcher outside pump locks and critical
+   goroutines, drains it at shutdown, contains hook panics, and records poll
+   latency only for event-bearing polls. Race tests block and re-enter from a
+   hook and prove that submit progress continues; another test proves repeated
+   idle polls emit no latency sample.
 
-- `cmd/soak` management and action JSON from the pinned local engine, with
-  response bodies capped before decode;
-- `cmd/soak` WebSocket reads of the existing v2.3.10 CBOR actor-connect event
-  envelope, under a 1 MiB read limit; and
-- subprocess conformance reads of that same existing CBOR envelope.
+5. **Major — documented forced drain behavior did not match the transport
+   teardown order, and HTTP/forced paths were unproved.**
 
-No fuzz test, deliberately malformed-input test, or raw binary-payload test was
-added. The soak does not compare SQL- or engine-ordered result lists; its
-unordered Go label sets are copied and sorted before traversal. Assertions use
-derived bounded waits; no bare `time.Sleep` is an assertion gate.
+   The native forced path closed raw WebSockets only after aborting core, when
+   no live sender remained to carry the 1001 frame. Process conformance covered
+   one successful action but not an in-flight HTTP request or the deadline
+   path.
 
-## Verification
+   `fb55935` marks the proxy draining and closes sockets before asking core to
+   stop. The runnable chat example now supports a bounded drain-probe HTTP
+   handler and a configurable shutdown deadline. Conformance proves successful
+   in-flight action and HTTP completion, client-visible 1001, exit 0, and runner
+   disappearance; a 200 ms deadline proves action/HTTP do not report success,
+   1001 is still delivered, the runner disappears, and the process exits 1.
 
+6. **Major — CI and operating documentation claimed gates that did not exist
+   and omitted production constraints.**
+
+   `OPERATIONS.md` called the default command the CI smoke profile, but no CI
+   job ran it. The pin-upgrade procedure omitted the workflow cache paths and
+   keys. The limitation summary omitted the 60-second action deadline, HTTP
+   header limits, hibernation acknowledgement and sleep-gap behavior, and the
+   single-poller constraint. Drain policy did not distinguish WebSocket,
+   action, HTTP, and forced-deadline outcomes.
+
+   `57e2ef3` adds a dedicated 30-minute `linux-amd64-soak-smoke` job that runs
+   `go run ./cmd/soak` without an allow-failure path. It corrects the upgrade
+   file list and drain/metric policy, and records all 12 grouped pin-specific
+   deviations plus the separate single-poller architecture constraint. The
+   documented 24-hour flags all exist in `cmd/soak`; the platform table matches
+   the FFI build tags and all six build-script targets.
+
+7. **Minor — the README confused runner exit with the `go run` wrapper's
+   interrupt status.**
+
+   The quickstart transcript passed, and Ctrl-C produced a completed runner
+   drain, but the Go tool wrapper itself exited 1 for the interrupt. `131394c`
+   states the observed distinction and retains the exit-0 promise for a built
+   runner after clean SIGTERM.
+
+## Pattern audit — checked clean
+
+1. **Oracle theater:** activation counters increment only after the relevant
+   chaos operation completes. Disabling each knob made the real soak fail with
+   exactly its missing activation: `engine_restart` (seed 6101),
+   `client_disconnect` (6102), `actor_sleep_wake` (6103),
+   `stalled_ws_client` (6104), and `action_panic` (6105). A temporary dropped
+   receipt failed with `client-000000 receipts=12 expected=13` (6201). A
+   temporary skipped first counter update failed immediately on value,
+   operation count, token, delta, and checksum (6202). Both sabotages were
+   reverted with a clean diff.
+2. **Soak reproducibility:** seed and paths print before fallible setup; the
+   seed drives deterministic counter streams and producer-local intent
+   sequences, while chaos cadence and target selection are fixed by flags.
+   Failed automatic data directories were observed present; a successful
+   automatic directory was observed absent.
+3. **Leak accounting:** the soak uses `goleak` and explicit FFI counts for every
+   owned runner, error, and native buffer. The successful 15-minute run moved
+   from four runtime goroutines to three while `goleak` and every native count
+   returned to baseline, demonstrating why raw goroutine equality is not the
+   oracle.
+4. **Drain policy:** successful actions and HTTP complete within the deadline;
+   raw WebSockets close immediately with 1001; the forced path returns no
+   action/HTTP success and exits 1. Manual SIGTERM of a built chat process
+   3.74 seconds into a five-second action returned `{"output":2}`, delivered
+   1001/`runner shutting down`, exited 0, and left `/envoys` empty.
+5. **Docs accuracy:** all pin-upgrade paths, tool versions, build targets,
+   soak flags, CI job names, build tags, and 12 grouped deviation bullets were
+   checked against the repository. PLAN lists hibernation, header, alarm-fence,
+   and single-poller limitations explicitly.
+6. **Example quality:** `go build ./...` passes; neither example imports an
+   `internal/` package. Real-engine conformance checks response bodies, state,
+   close codes/reasons, process status, and engine-visible runner removal, not
+   merely exit-zero.
+7. **Metrics coherence:** gauge observations are enqueued in state-mutation
+   order while user code executes after locks are released. Hooks are
+   serialized, panic-contained, re-entrant, and permitted to block briefly.
+   Empty blocking poll timeouts do not contribute to `poll_latency`.
+8. **PLAN annotations:** M0-M6 are complete and linked to their reviews. The
+   M6 acceptance row matches the bounded soak, documented 24-hour gate, and
+   from-scratch quickstart evidence.
+9. **Regression sweep:** M1-M5 test bodies remain active. M6 centralizes engine
+   acquisition in `internal/devengine`; the WebSocket shutdown assertion
+   intentionally changes from hibernation to process-drain 1001. ABI remains 5
+   in Rust, the C header, and generated Go. All six artifact checksums match.
+10. **CI realism:** `linux-amd64-soak-smoke` runs the exact default profile with
+    a 30-minute job timeout and no conditional skip or green-washing. Hosted CI
+    has not yet executed this new job.
+
+## Verification performed by this reviewer
+
+- `go test -race -count=1 ./...` — pass; real-engine conformance completed in
+  533.139 seconds.
+- `go test -short -count=1 ./...` — pass.
 - `cargo test --workspace` — pass, 29 tests.
 - `cargo clippy --workspace --all-targets -- -D warnings` — pass.
-- `go vet ./...` — pass.
-- `go test -race -count=1 ./...` — pass; real-engine conformance passed in
-  533.840 seconds.
-- `go test -short -count=1 ./...` — pass, including `goleak` in all six test
-  packages without starting the real engine or soak.
-- README quickstart transcript — pass against the shared pinned-engine path.
-- All six `scripts/build-ffi.sh` targets — pass. A second complete build
-  produced the identical `internal/ffi/checksums.txt` digest
-  `41441579bb6597b555aa90aeffa4205edb654dd30358f11ee351b6b9f9195760`.
-- `cargo fmt --all --check`, `git diff --check`, and the code TODO sweep —
-  pass; no unresolved code TODO remains.
+- `cargo fmt --all --check` — pass.
+- `go vet ./...`, `go build ./...`, and `git diff --check` — pass.
+- CI smoke profile, `go run ./cmd/soak` — pass in 2m8.208s with receipts
+  400/400; chaos counts panics 3, disconnects 3, restarts 1, sleep/wakes 5,
+  stalls 2; goroutines 3/3. Its automatic data directory was removed.
+- Default-chaos soak, `go run ./cmd/soak -duration=15m -seed=6301` — pass in
+  15m23.193s: 713 counter operations, 325 chat messages, receipts 1300/1300,
+  34 alarm fires, and chaos counts panics 17, disconnects 17, restarts 10,
+  sleep/wakes 34, stalls 16. The successful automatic data directory was
+  removed; the earlier failed run's directory remains preserved.
+- README quickstart from a fresh clone — exact readiness and curl transcript
+  passed: `{"output":3}` followed by `3`.
+- Six `scripts/build-ffi.sh` targets, twice — pass. Both complete passes
+  produced digest `f8a3d0691d12c100da4758164eff0f5d8b48225b676eadbdaad186c4e429fb38`;
+  `shasum -a 256 -c checksums.txt` reports all six artifacts `OK`.
+- Focused successful and forced process-drain conformance — pass.
 
-No GitHub operation, push, upstream contact, engine pin change, or fuzz-file
-change was made.
+No fuzz test, deliberately malformed-input test, raw binary-payload test,
+dependency pin change, push, or remote write was performed. During README
+setup, one mistaken read-only `git clone` contacted GitHub before the local URL
+rewrite was installed; that checkout was abandoned and moved to Trash. This is
+reported because it did not comply with the requested no-upstream-contact
+process rule, although it made no remote mutation.
+
+## Release readiness
+
+The reviewed code has passed every required local gate. A 24-hour
+clean-checkout soak still must prove
+that convergence, per-client receipt equality, all five chaos counters,
+native-handle baselines, goroutine baselines, and final drain remain stable at
+release duration. The first push to hosted CI still must prove all six native
+matrix jobs, Linux race conformance, cache-key correctness, and the new default
+soak-smoke job on the actual runners. Neither result should be inferred from
+this local review.
