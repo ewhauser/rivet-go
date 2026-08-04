@@ -2,11 +2,11 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
-use crossbeam_channel::{Sender, bounded};
+use crossbeam_channel::Sender;
 use rivet_error::{RivetError, RivetErrorKind};
 use rivetkit_core::actor::ShutdownKind;
 use rivetkit_core::{
@@ -207,7 +207,51 @@ struct WsAcknowledgements {
 
 struct PendingWsAcknowledgement {
     msg_index: u16,
-    completion: Option<Sender<()>>,
+    completion: Option<Arc<WsMessageCompletion>>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WsMessageCompletionState {
+    Pending,
+    Completed,
+    Cancelled,
+}
+
+struct WsMessageCompletion {
+    state: Mutex<WsMessageCompletionState>,
+    changed: Condvar,
+}
+
+impl WsMessageCompletion {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(WsMessageCompletionState::Pending),
+            changed: Condvar::new(),
+        }
+    }
+
+    fn complete(&self) {
+        *self.state.lock().expect("WebSocket completion poisoned") =
+            WsMessageCompletionState::Completed;
+        self.changed.notify_one();
+    }
+
+    fn cancel(&self) {
+        *self.state.lock().expect("WebSocket completion poisoned") =
+            WsMessageCompletionState::Cancelled;
+        self.changed.notify_one();
+    }
+
+    fn wait(&self, timeout: Duration) -> WsMessageCompletionState {
+        let state = self.state.lock().expect("WebSocket completion poisoned");
+        let (state, _) = self
+            .changed
+            .wait_timeout_while(state, timeout, |state| {
+                *state == WsMessageCompletionState::Pending
+            })
+            .expect("WebSocket completion poisoned while waiting");
+        *state
+    }
 }
 
 #[derive(Clone, Default)]
@@ -1445,8 +1489,8 @@ impl ActorProxy {
             .actor_exact(&actor_identity)
             .and_then(|actor| actor.operations.begin());
         let (completion, completed) = if can_hibernate {
-            let (tx, rx) = bounded(1);
-            (Some(tx), Some(rx))
+            let completion = Arc::new(WsMessageCompletion::new());
+            (Some(completion.clone()), Some(completion))
         } else {
             (None, None)
         };
@@ -1479,15 +1523,21 @@ impl ActorProxy {
             })
             .map_err(|_| anyhow!("Go event queue is closed"))?;
         if let Some(completed) = completed {
-            let waited =
-                tokio::task::block_in_place(|| completed.recv_timeout(WS_MESSAGE_ACK_TIMEOUT));
-            if waited.is_err() {
-                self.close_ws(
-                    ws_id,
-                    Some(1011),
-                    Some("ws.handler_ack_timed_out".to_owned()),
-                );
-                return Err(anyhow!("Go WebSocket handler acknowledgement timed out"));
+            match tokio::task::block_in_place(|| completed.wait(WS_MESSAGE_ACK_TIMEOUT)) {
+                WsMessageCompletionState::Completed => {}
+                WsMessageCompletionState::Cancelled => {
+                    return Err(anyhow!(
+                        "WebSocket closed before Go handler acknowledgement"
+                    ));
+                }
+                WsMessageCompletionState::Pending => {
+                    self.close_ws(
+                        ws_id,
+                        Some(1011),
+                        Some("ws.handler_ack_timed_out".to_owned()),
+                    );
+                    return Err(anyhow!("Go WebSocket handler acknowledgement timed out"));
+                }
             }
         }
         Ok(())
@@ -1552,7 +1602,7 @@ impl ActorProxy {
             return;
         };
         if let Some(completion) = acknowledged.completion {
-            let _ = completion.send(());
+            completion.complete();
         }
     }
 
@@ -2063,12 +2113,17 @@ fn shutdown_reason(reason: ShutdownKind) -> &'static str {
 }
 
 fn clear_ws_acknowledgements(active: &ActiveWebSocket) {
-    active
+    let completions = active
         .acknowledgements
         .lock()
         .expect("WebSocket acknowledgement table poisoned")
         .pending
-        .clear();
+        .drain(..)
+        .filter_map(|pending| pending.completion)
+        .collect::<Vec<_>>();
+    for completion in completions {
+        completion.cancel();
+    }
 }
 
 fn cbor_empty_args() -> Vec<u8> {
@@ -2458,6 +2513,45 @@ mod tests {
                 .expect("callback completed after acknowledgement")
                 .expect("message callback task")
                 .is_ok()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn closing_websocket_cancels_hibernating_message_wait() {
+        let (events, event_rx) = bounded(4);
+        let proxy = ActorProxy::new(events, CorrelationTable::default());
+        let (outbound, _receiver) = tokio::sync::mpsc::channel(1);
+        proxy.websockets.lock().expect("WebSocket table").insert(
+            "ws".to_owned(),
+            ActiveWebSocket {
+                actor: ActorIdentity::new("actor", 1),
+                can_hibernate: true,
+                ws: WebSocket::new(),
+                outbound,
+                acknowledgements: Arc::new(Mutex::new(WsAcknowledgements::default())),
+            },
+        );
+
+        let callback_proxy = proxy.clone();
+        let callback = tokio::spawn(async move {
+            callback_proxy.websocket_message(
+                "ws",
+                WsMessage::Text("close before ack".to_owned()),
+                1,
+            )
+        });
+        assert!(matches!(
+            event_rx.recv_timeout(Duration::from_secs(1)),
+            Ok(Event::WsMessage { msg_index: 1, .. })
+        ));
+
+        proxy.close_ws("ws", Some(1000), Some("test close".to_owned()));
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), callback)
+                .await
+                .expect("callback completed after close")
+                .expect("message callback task")
+                .is_err()
         );
     }
 

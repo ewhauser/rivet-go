@@ -197,3 +197,34 @@ from 66.9% to 57.3% (**-14.4%**). Quick S1 improved from 265.6 to 279.8
 ops/s (**+5.3%**), with lower p50 and CPU. The adjacent A/B result confirms
 that the reduced scheduler contention improves useful work as well as CPU
 efficiency, so the one-worker configuration was kept.
+
+### 8. Replace per-message acknowledgement channels with direct completions — kept
+
+Native sampling identified crossbeam channel receive as the hottest resolved
+Rust symbol. Each hibernatable WebSocket message allocated a bounded crossbeam
+channel solely to park one callback until its exact `WsMessageAck`. The attempt
+replaced that channel with an actor-local completion containing only a mutex,
+condition variable, and three states: pending, completed, or cancelled. The
+pending FIFO still carries the exact `u16` message index. A matching ack wakes
+only its callback; WebSocket close explicitly cancels every pending completion;
+and the existing 60-second timeout still closes with the same 1011 reason.
+
+| Scenario | Run | Throughput ops/s | p50 ms | Runner CPU avg | Correct |
+|---|---:|---:|---:|---:|---|
+| S3 | 1 | 3,942.7 | 8.091 | 56.0% | yes |
+| S3 | 2 | 3,752.5 | 8.495 | 54.1% | yes |
+| S1 quick | 1 | 280.2 | 14.391 | 5.4% | yes |
+
+The S3 pair averaged 3,847.6 msg/s, 8.293 ms p50, and 55.1% runner CPU.
+Against the kept one-worker pair, throughput improved **2.1%**, p50 improved
+**2.1%**, and runner CPU fell **3.9%**. Quick S1 was flat at 279.8 versus
+280.2 ops/s.
+
+An immediately following crossbeam-channel control measured 3,829.7 and
+3,623.4 msg/s, 8.311 and 8.823 ms p50, and 58.2% and 56.0% runner CPU; its
+quick S1 measured 287.5 ops/s, 14.327 ms p50, and 5.5% runner CPU. Against
+that adjacent control, direct completions improved average S3 throughput from
+3,726.6 to 3,847.6 msg/s (**+3.2%**), p50 from 8.567 to 8.293 ms
+(**-3.2%**), and CPU from 57.1% to 55.1% (**-3.5%**). Quick S1 moved
+**-2.5%**, inside its engine-bound variation. The consistent S3 throughput,
+latency, and CPU gains justify keeping the direct completion.
