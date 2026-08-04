@@ -1,6 +1,6 @@
 # Rivet runner performance results
 
-Generated from two sequential repetitions per cell on 2026-08-04T05:15:48Z. Raw JSON, logs, process samples, and Go CPU profiles are committed under `bench/results-archive/2026-08-03`.
+Generated from two sequential repetitions per cell on 2026-08-04T07:32:26Z. Raw JSON, logs, process samples, and Go CPU profiles are committed under `bench/results-archive/2026-08-04-post-optimization`.
 
 ## Machine and pins
 
@@ -9,8 +9,8 @@ Generated from two sequential repetitions per cell on 2026-08-04T05:15:48Z. Raw 
 | Machine | Apple M3 Max; 16 logical CPUs; 64 GiB RAM |
 | OS | macOS 26.5.2 (25F84) |
 | Engine | `Rivet 2.3.10; Git SHA: 957d4e482f404913ca1955d8ecc357533f6fd081; Build Timestamp: 2026-08-03T14:25:23.388170000Z; Rustc Version: 1.97.0; Rustc Host: aarch64-apple-darwin; Cargo Target: aarch64-apple-darwin; Cargo Profile: release` |
-| Go | `go version go1.26.5 darwin/arm64`; runner commit `23cdbb9c12396128089c88f19e5c3411bfd39635` |
-| Go native library | committed `internal/ffi/lib/darwin_arm64/librivetkit_go_ffi.dylib`; SHA-256 `513cf94b1459eca96038228ff72bab12fd5a65adc37001112f58169ca3cd9bbb` |
+| Go | `go version go1.26.5 darwin/arm64`; runner commit `71f731c8d7cddfdc397802352c84b73809942d62` |
+| Go native library | committed `internal/ffi/lib/darwin_arm64/librivetkit_go_ffi.dylib`; SHA-256 `f65addc87c6a54d819330366a616dce267bdb74250bc8c5153b9a88be6131393` |
 | TypeScript | Node `v26.5.0`, npm `11.17.0`, `NODE_ENV=production`, no Node flags; `rivetkit@2.3.10` integrity `sha512-E+H0lBc3O8dK9Pj7W2XW3VwrCnfpwYYm5LlsZyHrmk5bCrJIBdnEFdZXn5nsYMz0waCfP1ieyP6d1tdvBG76Dg==` |
 | Rust | `rustc 1.97.0 (2d8144b78 2026-07-07) (Homebrew)`; `cargo 1.97.0 (c980f4866 2026-06-30) (Homebrew)`; `rivetkit` v2.3.10 from `git+https://github.com/rivet-dev/rivet?tag=v2.3.10#957d4e482f404913ca1955d8ecc357533f6fd081`; `cargo build --release --locked` |
 | Logging | error level for all runners |
@@ -23,86 +23,122 @@ Generated from two sequential repetitions per cell on 2026-08-04T05:15:48Z. Raw 
 - **S4 cold start:** 50 fresh actors, sequentially measured from create request through the first persisted or volatile `increment(1)` result. S4 is count-bounded because pacing 50 samples to 60 seconds would fabricate throughput.
 - S1-S3 use at least 10 seconds of excluded warmup and a 60-second measured window. S4 uses at least 10 seconds of excluded fresh-actor warmup and then exactly 50 measured actors. Latency uses an HDR histogram with three significant figures. All requests use the same Go HTTP/WebSocket gateway client.
 
+## Post-optimization comparison
+
+The comparison below averages the two reportable persistent repetitions in
+this archive and the committed first-run archive at
+`bench/results-archive/2026-08-03`. S3 has no persistence variant.
+
+| Scenario | Go throughput before/after | Change | Go p50 before/after | Change | Go runner CPU before/after | Change |
+|---|---:|---:|---:|---:|---:|---:|
+| S1 | 288.2 / 285.9 ops/s | -0.8% | 14.555 / 14.611 ms | +0.4% | 6.9% / 5.8% | -16.5% |
+| S3 | 3,622.8 / 3,641.5 msg/s | +0.5% | 8.787 / 8.747 ms | -0.5% | 66.6% / 53.0% | -20.5% |
+| S4 | 16.2 / 16.4 ops/s | +1.1% | 59.599 / 60.303 ms | +1.2% | 1.9% / 1.6% | -18.1% |
+
+The kept changes reduce Go runner CPU consistently without materially moving
+reportable throughput or latency. In S3, the final Go runner uses 20.5% less
+CPU for 0.5% more messages per second, reducing its CPU multiple over
+TypeScript from 2.05x to 1.62x. The remaining final S3 gap is 21.6% throughput
+and 27.7% p50 latency versus TypeScript.
+
+Final same-run persistent averages:
+
+| Scenario | SDK | Throughput ops/s | p50 ms | Runner CPU avg |
+|---|---|---:|---:|---:|
+| S1 | Go | 285.9 | 14.611 | 5.8% |
+| S1 | TypeScript | 304.8 | 14.407 | 10.4% |
+| S1 | Rust | 286.4 | 14.899 | 3.6% |
+| S3 | Go | 3,641.5 | 8.747 | 53.0% |
+| S3 | TypeScript | 4,647.0 | 6.849 | 32.7% |
+| S3 | Rust | 4,732.0 | 6.725 | 19.2% |
+| S4 | Go | 16.4 | 60.303 | 1.6% |
+| S4 | TypeScript | 17.6 | 55.423 | 4.7% |
+| S4 | Rust | 16.3 | 59.807 | 1.7% |
+
+Rust S3 rose from 3,775.7 to 4,732.0 msg/s between archives despite no Rust
+runner change in the Go optimization commits. That cross-run movement is not
+credited to this work; same-run rows are the fair final cross-SDK comparison.
+
 ## Summary
 
 The `r1/r2 (delta)` cells show both repetitions and the signed percentage change from run 1 to run 2. CPU is process `%CPU`, where 100% is one fully occupied logical core.
 
 | Scenario | SDK | Persistence | Throughput ops/s r1/r2 (delta) | p50 ms r1/r2 (delta) | p95 ms r1/r2 (delta) | p99 ms r1/r2 (delta) | max ms r1/r2 | Loadgen errors r1/r2 | Engine CPU avg r1/r2 | Runner CPU avg r1/r2 | Valid |
 |---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---|
-| S1 | Go | persist | 289.5/287.0 (-0.8%) | 14.703/14.407 (-2.0%) | 338.687/339.711 (+0.3%) | 2715.647/2715.647 (+0.0%) | 13475.839/15048.703 | 0/0 | 131.1/132.0 | 6.9/6.9 | true/true |
-| S1 | TypeScript | persist | 304.3/308.6 (+1.4%) | 14.343/14.639 (+2.1%) | 336.895/337.407 (+0.2%) | 2689.023/2672.639 (-0.6%) | 14581.759/15007.743 | 0/0 | 128.2/128.7 | 10.3/10.3 | true/true |
-| S1 | Rust | persist | 288.1/286.4 (-0.6%) | 14.719/14.951 (+1.6%) | 337.663/340.479 (+0.8%) | 2697.215/2709.503 (+0.5%) | 15007.743/15007.743 | 0/0 | 130.9/133.4 | 3.4/3.5 | true/true |
-| S1 | TypeScript | no-persist | 289.3/335.5 (+16.0%) | 7.291/5.751 (-21.1%) | 337.151/179.327 (-46.8%) | 2723.839/2654.207 (-2.6%) | 15007.743/15007.743 | 0/0 | 134.8/136.4 | 4.8/5.5 | true/true |
-| S1 | Rust | no-persist | 311.6/336.2 (+7.9%) | 13.479/8.067 (-40.2%) | 179.583/177.407 (-1.2%) | 2693.119/2670.591 (-0.8%) | 14950.399/15007.743 | 0/0 | 139.2/141.7 | 2.9/3.1 | true/true |
-| S2 | Go | persist | 271.8/262.7 (-3.4%) | 16.463/16.687 (+1.4%) | 691.199/695.807 (+0.7%) | 5427.199/6619.135 (+22.0%) | 15007.743/15007.743 | 0/0 | 136.7/135.4 | 7.1/6.8 | true/true |
-| S2 | TypeScript | persist | 269.7/261.6 (-3.0%) | 16.719/16.735 (+0.1%) | 690.687/694.783 (+0.6%) | 5480.447/5459.967 (-0.4%) | 15007.743/15089.663 | 0/0 | 132.9/137.8 | 10.5/10.2 | true/true |
-| S2 | Rust | persist | 273.9/261.2 (-4.6%) | 16.463/16.623 (+1.0%) | 694.271/696.831 (+0.4%) | 5451.775/5554.175 (+1.9%) | 15007.743/15007.743 | 0/0 | 135.6/136.8 | 3.5/3.4 | true/true |
-| S2 | TypeScript | no-persist | 359.9/311.7 (-13.4%) | 14.767/15.047 (+1.9%) | 662.015/679.935 (+2.7%) | 4104.191/5390.335 (+31.3%) | 15089.663/15056.895 | 0/0 | 129.0/142.1 | 5.8/5.3 | true/true |
-| S2 | Rust | no-persist | 370.8/328.0 (-11.5%) | 14.687/14.991 (+2.1%) | 472.063/674.303 (+42.8%) | 4102.143/5345.279 (+30.3%) | 15007.743/15097.855 | 0/0 | 135.0/138.5 | 3.5/3.2 | true/true |
-| S3 | Go | not-applicable | 3615.8/3629.7 (+0.4%) | 8.767/8.807 (+0.5%) | 9.751/9.711 (-0.4%) | 10.319/10.095 (-2.2%) | 112.447/93.119 | 0/0 | 461.0/455.9 | 66.6/66.7 | true/true |
-| S3 | TypeScript | not-applicable | 4659.9/4633.0 (-0.6%) | 6.803/6.891 (+1.3%) | 7.735/7.795 (+0.8%) | 8.139/8.155 (+0.2%) | 91.967/107.583 | 0/0 | 440.1/437.1 | 32.4/32.6 | true/true |
-| S3 | Rust | not-applicable | 3734.7/3816.7 (+2.2%) | 8.455/8.319 (-1.6%) | 11.391/11.031 (-3.2%) | 13.335/12.287 (-7.9%) | 34.047/23.967 | 0/0 | 896.0/895.1 | 20.5/20.7 | true/true |
-| S4 | Go | persist | 16.6/15.8 (-4.7%) | 57.951/61.247 (+5.7%) | 73.215/73.919 (+1.0%) | 78.079/75.199 (-3.7%) | 78.079/75.199 | 0/0 | 106.5/113.2 | 1.9/2.0 | true/true |
-| S4 | TypeScript | persist | 17.6/16.9 (-3.9%) | 54.623/56.991 (+4.3%) | 66.943/69.759 (+4.2%) | 69.759/70.911 (+1.7%) | 69.759/70.911 | 0/0 | 101.5/113.5 | 4.4/4.5 | true/true |
-| S4 | Rust | persist | 16.4/15.8 (-3.3%) | 60.639/61.151 (+0.8%) | 70.975/71.871 (+1.3%) | 76.031/74.367 (-2.2%) | 76.031/74.367 | 0/0 | 107.8/113.0 | 1.5/1.5 | true/true |
-| S4 | TypeScript | no-persist | 19.2/17.8 (-7.3%) | 51.871/55.903 (+7.8%) | 54.271/58.687 (+8.1%) | 60.607/68.159 (+12.5%) | 60.607/68.159 | 0/0 | 116.9/125.0 | 4.0/4.3 | true/true |
-| S4 | Rust | no-persist | 17.7/16.6 (-6.4%) | 56.479/60.255 (+6.7%) | 61.503/63.391 (+3.1%) | 67.711/71.039 (+4.9%) | 67.711/71.039 | 0/0 | 119.2/125.8 | 1.6/1.5 | true/true |
+| S1 | Go | persist | 286.1/285.6 (-0.2%) | 14.583/14.639 (+0.4%) | 338.431/336.639 (-0.5%) | 2695.167/2689.023 (-0.2%) | 13590.527/15007.743 | 0/0 | 131.7/131.9 | 5.8/5.8 | true/true |
+| S1 | TypeScript | persist | 303.5/306.1 (+0.9%) | 14.479/14.335 (-1.0%) | 335.871/179.199 (-46.6%) | 2684.927/2684.927 (+0.0%) | 14934.015/14917.631 | 0/0 | 125.4/128.6 | 10.2/10.5 | true/true |
+| S1 | Rust | persist | 285.5/287.2 (+0.6%) | 14.783/15.015 (+1.6%) | 335.359/339.199 (+1.1%) | 2695.167/2693.119 (-0.1%) | 15007.743/15007.743 | 0/0 | 130.5/133.5 | 3.6/3.6 | true/true |
+| S1 | TypeScript | no-persist | 284.9/333.0 (+16.9%) | 9.599/5.427 (-43.5%) | 341.759/326.143 (-4.6%) | 2711.551/2674.687 (-1.4%) | 15007.743/15007.743 | 0/0 | 140.8/136.4 | 4.9/5.6 | true/true |
+| S1 | Rust | no-persist | 284.2/331.2 (+16.5%) | 13.743/7.059 (-48.6%) | 335.359/177.535 (-47.1%) | 2721.791/2678.783 (-1.6%) | 15007.743/15007.743 | 0/0 | 138.3/136.5 | 2.7/3.1 | true/true |
+| S2 | Go | persist | 273.1/261.5 (-4.2%) | 16.215/16.527 (+1.9%) | 691.711/693.247 (+0.2%) | 5513.215/5451.775 (-1.1%) | 15007.743/15073.279 | 0/0 | 138.8/139.8 | 5.9/5.7 | true/true |
+| S2 | TypeScript | persist | 270.6/262.7 (-2.9%) | 16.479/16.703 (+1.4%) | 693.247/692.223 (-0.1%) | 5439.487/5533.695 (+1.7%) | 15106.047/15065.087 | 0/0 | 132.3/133.3 | 10.5/10.3 | true/true |
+| S2 | Rust | persist | 272.5/261.1 (-4.2%) | 16.319/16.911 (+3.6%) | 687.615/697.855 (+1.5%) | 5435.391/5472.255 (+0.7%) | 15007.743/15007.743 | 0/0 | 134.9/137.4 | 3.6/3.5 | true/true |
+| S2 | TypeScript | no-persist | 359.8/312.2 (-13.2%) | 14.599/15.015 (+2.8%) | 657.919/675.839 (+2.7%) | 4100.095/5382.143 (+31.3%) | 15007.743/15007.743 | 0/0 | 135.7/144.1 | 6.2/5.2 | true/true |
+| S2 | Rust | no-persist | 363.3/313.8 (-13.6%) | 14.655/15.071 (+2.8%) | 354.047/673.791 (+90.3%) | 4169.727/5431.295 (+30.3%) | 15007.743/15097.855 | 0/0 | 139.3/146.7 | 3.7/3.1 | true/true |
+| S3 | Go | not-applicable | 3623.0/3659.9 (+1.0%) | 8.759/8.735 (-0.3%) | 9.759/9.639 (-1.2%) | 10.351/9.983 (-3.6%) | 106.495/118.975 | 0/0 | 465.2/462.2 | 52.8/53.2 | true/true |
+| S3 | TypeScript | not-applicable | 4603.7/4690.4 (+1.9%) | 6.891/6.807 (-1.2%) | 7.831/7.707 (-1.6%) | 8.351/8.011 (-4.1%) | 94.463/118.143 | 0/0 | 438.5/436.2 | 32.5/32.9 | true/true |
+| S3 | Rust | not-applicable | 4701.9/4762.2 (+1.3%) | 6.747/6.703 (-0.7%) | 7.695/7.627 (-0.9%) | 8.039/7.915 (-1.5%) | 111.807/74.111 | 0/0 | 437.0/433.3 | 19.1/19.3 | true/true |
+| S4 | Go | persist | 16.8/16.0 (-4.3%) | 59.007/61.599 (+4.4%) | 70.463/69.055 (-2.0%) | 75.903/74.303 (-2.1%) | 75.903/74.303 | 0/0 | 109.7/117.3 | 1.6/1.6 | true/true |
+| S4 | TypeScript | persist | 17.8/17.3 (-2.7%) | 54.335/56.511 (+4.0%) | 65.471/67.711 (+3.4%) | 72.191/70.463 (-2.4%) | 72.191/70.463 | 0/0 | 106.2/114.0 | 4.8/4.5 | true/true |
+| S4 | Rust | persist | 16.7/15.9 (-5.0%) | 58.591/61.023 (+4.2%) | 71.487/75.391 (+5.5%) | 75.327/78.783 (+4.6%) | 75.327/78.783 | 0/0 | 111.6/117.0 | 1.7/1.7 | true/true |
+| S4 | TypeScript | no-persist | 19.5/17.5 (-10.4%) | 50.943/56.255 (+10.4%) | 53.695/64.063 (+19.3%) | 62.495/67.647 (+8.2%) | 62.495/67.647 | 0/0 | 118.9/124.1 | 4.3/4.1 | true/true |
+| S4 | Rust | no-persist | 17.6/16.4 (-6.8%) | 56.703/60.767 (+7.2%) | 59.391/64.735 (+9.0%) | 59.807/72.063 (+20.5%) | 59.807/72.063 | 0/0 | 120.7/126.8 | 1.7/1.6 | true/true |
 
 ## S1 hot actor actions
 
 | SDK | Persistence | Run | Operations | Throughput ops/s | p50 ms | p95 ms | p99 ms | max ms | Loadgen errors | Correct | Engine CPU avg/max | Runner CPU avg/max | Runner RSS avg/max MiB |
 |---|---|---:|---:|---:|---:|---:|---:|---:|---:|---|---|---|---|---|
-| Go | persist | 1 | 17755 | 289.5 | 14.703 | 338.687 | 2715.647 | 13475.839 | 0 | true (21721/21721) | 131.1/143.7 | 6.9/8.2 | 70.5/71.6 |
-| Go | persist | 2 | 17606 | 287.0 | 14.407 | 339.711 | 2715.647 | 15048.703 | 0 | true (20700/20700) | 132.0/228.7 | 6.9/8.1 | 74.9/76.0 |
-| TypeScript | persist | 1 | 18868 | 304.3 | 14.343 | 336.895 | 2689.023 | 14581.759 | 0 | true (22843/22843) | 128.2/189.9 | 10.3/16.3 | 505.7/756.8 |
-| TypeScript | persist | 2 | 18894 | 308.6 | 14.639 | 337.407 | 2672.639 | 15007.743 | 0 | true (22358/22358) | 128.7/137.5 | 10.3/16.8 | 983.4/1008.3 |
-| Rust | persist | 1 | 17719 | 288.1 | 14.719 | 337.663 | 2697.215 | 15007.743 | 0 | true (21527/21527) | 130.9/157.6 | 3.4/4.3 | 24.3/25.4 |
-| Rust | persist | 2 | 17699 | 286.4 | 14.951 | 340.479 | 2709.503 | 15007.743 | 0 | true (20869/20869) | 133.4/160.7 | 3.5/4.3 | 28.6/29.8 |
-| TypeScript | no-persist | 1 | 17724 | 289.3 | 7.291 | 337.151 | 2723.839 | 15007.743 | 0 | true (19027/19027) | 134.8/166.2 | 4.8/13.7 | 386.7/661.3 |
-| TypeScript | no-persist | 2 | 20587 | 335.5 | 5.751 | 179.327 | 2654.207 | 15007.743 | 0 | true (24607/24607) | 136.4/281.9 | 5.5/25.7 | 930.0/964.4 |
-| Rust | no-persist | 1 | 19133 | 311.6 | 13.479 | 179.583 | 2693.119 | 14950.399 | 0 | true (21956/21956) | 139.2/207.5 | 2.9/3.8 | 22.8/24.1 |
-| Rust | no-persist | 2 | 20631 | 336.2 | 8.067 | 177.407 | 2670.591 | 15007.743 | 0 | true (24700/24700) | 141.7/208.9 | 3.1/3.8 | 27.7/28.6 |
+| Go | persist | 1 | 17737 | 286.1 | 14.583 | 338.431 | 2695.167 | 13590.527 | 0 | true (21657/21657) | 131.7/146.9 | 5.8/6.7 | 70.4/71.6 |
+| Go | persist | 2 | 17533 | 285.6 | 14.639 | 336.639 | 2689.023 | 15007.743 | 0 | true (20734/20734) | 131.9/143.6 | 5.8/6.7 | 74.8/76.0 |
+| TypeScript | persist | 1 | 18900 | 303.5 | 14.479 | 335.871 | 2684.927 | 14934.015 | 0 | true (22656/22656) | 125.4/144.2 | 10.2/14.3 | 504.4/751.5 |
+| TypeScript | persist | 2 | 18796 | 306.1 | 14.335 | 179.199 | 2684.927 | 14917.631 | 0 | true (22275/22275) | 128.6/161.7 | 10.5/25.5 | 979.8/1005.6 |
+| Rust | persist | 1 | 17737 | 285.5 | 14.783 | 335.359 | 2695.167 | 15007.743 | 0 | true (21505/21505) | 130.5/149.7 | 3.6/4.6 | 24.5/25.7 |
+| Rust | persist | 2 | 17687 | 287.2 | 15.015 | 339.199 | 2693.119 | 15007.743 | 0 | true (20941/20941) | 133.5/172.5 | 3.6/4.2 | 28.9/30.0 |
+| TypeScript | no-persist | 1 | 17448 | 284.9 | 9.599 | 341.759 | 2711.551 | 15007.743 | 0 | true (18676/18676) | 140.8/215.2 | 4.9/7.9 | 380.0/643.0 |
+| TypeScript | no-persist | 2 | 20448 | 333.0 | 5.427 | 326.143 | 2674.687 | 15007.743 | 0 | true (24426/24426) | 136.4/179.2 | 5.6/14.4 | 920.2/952.9 |
+| Rust | no-persist | 1 | 17623 | 284.2 | 13.743 | 335.359 | 2721.791 | 15007.743 | 0 | true (18888/18888) | 138.3/175.7 | 2.7/3.4 | 22.8/24.6 |
+| Rust | no-persist | 2 | 20645 | 331.2 | 7.059 | 177.535 | 2678.783 | 15007.743 | 0 | true (24777/24777) | 136.5/181.2 | 3.1/4.1 | 28.0/29.3 |
 
 ## S2 spread actions
 
 | SDK | Persistence | Run | Operations | Throughput ops/s | p50 ms | p95 ms | p99 ms | max ms | Loadgen errors | Correct | Engine CPU avg/max | Runner CPU avg/max | Runner RSS avg/max MiB |
 |---|---|---:|---:|---:|---:|---:|---:|---:|---:|---|---|---|---|---|
-| Go | persist | 1 | 16822 | 271.8 | 16.463 | 691.199 | 5427.199 | 15007.743 | 0 | true (19596/19596) | 136.7/155.8 | 7.1/8.2 | 84.8/89.5 |
-| Go | persist | 2 | 16357 | 262.7 | 16.687 | 695.807 | 6619.135 | 15007.743 | 0 | true (19076/19076) | 135.4/158.6 | 6.8/8.5 | 95.9/96.4 |
-| TypeScript | persist | 1 | 16839 | 269.7 | 16.719 | 690.687 | 5480.447 | 15007.743 | 0 | true (19635/19635) | 132.9/149.2 | 10.5/14.0 | 1046.6/1052.0 |
-| TypeScript | persist | 2 | 16397 | 261.6 | 16.735 | 694.783 | 5459.967 | 15089.663 | 0 | true (19207/19207) | 137.8/262.3 | 10.2/12.8 | 1076.9/1079.8 |
-| Rust | persist | 1 | 16987 | 273.9 | 16.463 | 694.271 | 5451.775 | 15007.743 | 0 | true (19792/19792) | 135.6/202.0 | 3.5/5.0 | 38.4/43.0 |
-| Rust | persist | 2 | 16347 | 261.2 | 16.623 | 696.831 | 5554.175 | 15007.743 | 0 | true (19076/19076) | 136.8/203.8 | 3.4/4.5 | 49.2/49.6 |
-| TypeScript | no-persist | 1 | 22419 | 359.9 | 14.767 | 662.015 | 4104.191 | 15089.663 | 0 | true (26057/26057) | 129.0/160.9 | 5.8/17.2 | 1093.3/1118.9 |
-| TypeScript | no-persist | 2 | 19429 | 311.7 | 15.047 | 679.935 | 5390.335 | 15056.895 | 0 | true (23018/23018) | 142.1/208.8 | 5.3/12.3 | 1148.9/1152.2 |
-| Rust | no-persist | 1 | 22783 | 370.8 | 14.687 | 472.063 | 4102.143 | 15007.743 | 0 | true (26423/26423) | 135.0/163.7 | 3.5/4.0 | 39.4/41.7 |
-| Rust | no-persist | 2 | 20396 | 328.0 | 14.991 | 674.303 | 5345.279 | 15097.855 | 0 | true (23380/23380) | 138.5/193.6 | 3.2/4.0 | 48.2/48.7 |
+| Go | persist | 1 | 16919 | 273.1 | 16.215 | 691.711 | 5513.215 | 15007.743 | 0 | true (19696/19696) | 138.8/262.6 | 5.9/7.2 | 84.5/89.3 |
+| Go | persist | 2 | 16308 | 261.5 | 16.527 | 693.247 | 5451.775 | 15073.279 | 0 | true (19032/19032) | 139.8/218.8 | 5.7/7.6 | 95.5/96.0 |
+| TypeScript | persist | 1 | 16906 | 270.6 | 16.479 | 693.247 | 5439.487 | 15106.047 | 0 | true (19692/19692) | 132.3/160.3 | 10.5/14.0 | 1045.8/1052.3 |
+| TypeScript | persist | 2 | 16312 | 262.7 | 16.703 | 692.223 | 5533.695 | 15065.087 | 0 | true (19097/19097) | 133.3/170.9 | 10.3/12.9 | 1079.2/1081.5 |
+| Rust | persist | 1 | 16965 | 272.5 | 16.319 | 687.615 | 5435.391 | 15007.743 | 0 | true (19774/19774) | 134.9/156.6 | 3.6/4.5 | 38.5/43.2 |
+| Rust | persist | 2 | 16184 | 261.1 | 16.911 | 697.855 | 5472.255 | 15007.743 | 0 | true (18926/18926) | 137.4/151.8 | 3.5/4.4 | 46.4/46.8 |
+| TypeScript | no-persist | 1 | 22485 | 359.8 | 14.599 | 657.919 | 4100.095 | 15007.743 | 0 | true (26124/26124) | 135.7/182.9 | 6.2/18.2 | 1083.0/1107.5 |
+| TypeScript | no-persist | 2 | 19371 | 312.2 | 15.015 | 675.839 | 5382.143 | 15007.743 | 0 | true (22896/22896) | 144.1/238.2 | 5.2/9.6 | 1139.6/1143.0 |
+| Rust | no-persist | 1 | 22435 | 363.3 | 14.655 | 354.047 | 4169.727 | 15007.743 | 0 | true (26145/26145) | 139.3/302.0 | 3.7/4.4 | 39.1/42.4 |
+| Rust | no-persist | 2 | 19533 | 313.8 | 15.071 | 673.791 | 5431.295 | 15097.855 | 0 | true (22870/22870) | 146.7/261.0 | 3.1/4.0 | 46.6/48.5 |
 
 ## S3 WebSocket echo
 
 | SDK | Persistence | Run | Operations | Throughput ops/s | p50 ms | p95 ms | p99 ms | max ms | Loadgen errors | Correct | Engine CPU avg/max | Runner CPU avg/max | Runner RSS avg/max MiB |
 |---|---|---:|---:|---:|---:|---:|---:|---:|---:|---|---|---|---|---|
-| Go | not-applicable | 1 | 216970 | 3615.8 | 8.767 | 9.751 | 10.319 | 112.447 | 0 | true (216970/216970) | 461.0/713.9 | 66.6/68.3 | 95.3/97.2 |
-| Go | not-applicable | 2 | 217807 | 3629.7 | 8.807 | 9.711 | 10.095 | 93.119 | 0 | true (217807/217807) | 455.9/482.5 | 66.7/67.6 | 94.2/94.2 |
-| TypeScript | not-applicable | 1 | 279615 | 4659.9 | 6.803 | 7.735 | 8.139 | 91.967 | 0 | true (279615/279615) | 440.1/697.8 | 32.4/39.3 | 1089.6/1094.4 |
-| TypeScript | not-applicable | 2 | 278001 | 4633.0 | 6.891 | 7.795 | 8.155 | 107.583 | 0 | true (278001/278001) | 437.1/538.9 | 32.6/37.9 | 1089.0/1089.2 |
-| Rust | not-applicable | 1 | 224099 | 3734.7 | 8.455 | 11.391 | 13.335 | 34.047 | 0 | true (224099/224099) | 896.0/904.9 | 20.5/21.4 | 49.9/49.9 |
-| Rust | not-applicable | 2 | 229020 | 3816.7 | 8.319 | 11.031 | 12.287 | 23.967 | 0 | true (229020/229020) | 895.1/908.4 | 20.7/21.4 | 50.0/50.0 |
+| Go | not-applicable | 1 | 217402 | 3623.0 | 8.759 | 9.759 | 10.351 | 106.495 | 0 | true (217402/217402) | 465.2/742.2 | 52.8/54.2 | 94.8/96.7 |
+| Go | not-applicable | 2 | 219615 | 3659.9 | 8.735 | 9.639 | 9.983 | 118.975 | 0 | true (219615/219615) | 462.2/529.8 | 53.2/54.1 | 93.7/93.8 |
+| TypeScript | not-applicable | 1 | 276241 | 4603.7 | 6.891 | 7.831 | 8.351 | 94.463 | 0 | true (276241/276241) | 438.5/675.7 | 32.5/40.3 | 1089.7/1094.5 |
+| TypeScript | not-applicable | 2 | 281442 | 4690.4 | 6.807 | 7.707 | 8.011 | 118.143 | 0 | true (281442/281442) | 436.2/453.9 | 32.9/38.2 | 1088.6/1088.6 |
+| Rust | not-applicable | 1 | 282132 | 4701.9 | 6.747 | 7.695 | 8.039 | 111.807 | 0 | true (282132/282132) | 437.0/646.9 | 19.1/19.7 | 47.0/47.0 |
+| Rust | not-applicable | 2 | 285750 | 4762.2 | 6.703 | 7.627 | 7.915 | 74.111 | 0 | true (285750/285750) | 433.3/532.8 | 19.3/19.7 | 47.1/47.1 |
 
 ## S4 cold start
 
 | SDK | Persistence | Run | Operations | Throughput ops/s | p50 ms | p95 ms | p99 ms | max ms | Loadgen errors | Correct | Engine CPU avg/max | Runner CPU avg/max | Runner RSS avg/max MiB |
 |---|---|---:|---:|---:|---:|---:|---:|---:|---:|---|---|---|---|---|
-| Go | persist | 1 | 50 | 16.6 | 57.951 | 73.215 | 78.079 | 78.079 | 0 | true (50/50) | 106.5/111.1 | 1.9/2.1 | 102.7/104.2 |
-| Go | persist | 2 | 50 | 15.8 | 61.247 | 73.919 | 75.199 | 75.199 | 0 | true (50/50) | 113.2/114.8 | 2.0/2.2 | 118.2/120.3 |
-| TypeScript | persist | 1 | 50 | 17.6 | 54.623 | 66.943 | 69.759 | 69.759 | 0 | true (50/50) | 101.5/104.7 | 4.4/4.5 | 1165.3/1173.1 |
-| TypeScript | persist | 2 | 50 | 16.9 | 56.991 | 69.759 | 70.911 | 70.911 | 0 | true (50/50) | 113.5/115.6 | 4.5/4.6 | 1271.5/1279.3 |
-| Rust | persist | 1 | 50 | 16.4 | 60.639 | 70.975 | 76.031 | 76.031 | 0 | true (50/50) | 107.8/109.4 | 1.5/1.7 | 55.7/57.2 |
-| Rust | persist | 2 | 50 | 15.8 | 61.151 | 71.871 | 74.367 | 74.367 | 0 | true (50/50) | 113.0/115.9 | 1.5/1.6 | 68.9/70.3 |
-| TypeScript | no-persist | 1 | 50 | 19.2 | 51.871 | 54.271 | 60.607 | 60.607 | 0 | true (50/50) | 116.9/118.3 | 4.0/4.3 | 1238.4/1247.4 |
-| TypeScript | no-persist | 2 | 50 | 17.8 | 55.903 | 58.687 | 68.159 | 68.159 | 0 | true (50/50) | 125.0/126.6 | 4.3/4.4 | 1348.5/1357.2 |
-| Rust | no-persist | 1 | 50 | 17.7 | 56.479 | 61.503 | 67.711 | 67.711 | 0 | true (50/50) | 119.2/120.4 | 1.6/1.6 | 60.2/61.2 |
-| Rust | no-persist | 2 | 50 | 16.6 | 60.255 | 63.391 | 71.039 | 71.039 | 0 | true (50/50) | 125.8/127.6 | 1.5/1.6 | 74.1/75.5 |
+| Go | persist | 1 | 50 | 16.8 | 59.007 | 70.463 | 75.903 | 75.903 | 0 | true (50/50) | 109.7/111.9 | 1.6/1.8 | 100.7/101.7 |
+| Go | persist | 2 | 50 | 16.0 | 61.599 | 69.055 | 74.303 | 74.303 | 0 | true (50/50) | 117.3/119.6 | 1.6/1.7 | 116.0/118.6 |
+| TypeScript | persist | 1 | 50 | 17.8 | 54.335 | 65.471 | 72.191 | 72.191 | 0 | true (50/50) | 106.2/108.9 | 4.8/5.2 | 1167.8/1175.3 |
+| TypeScript | persist | 2 | 50 | 17.3 | 56.511 | 67.711 | 70.463 | 70.463 | 0 | true (50/50) | 114.0/115.6 | 4.5/4.8 | 1276.8/1284.9 |
+| Rust | persist | 1 | 50 | 16.7 | 58.591 | 71.487 | 75.327 | 75.327 | 0 | true (50/50) | 111.6/112.0 | 1.7/1.8 | 55.9/56.9 |
+| Rust | persist | 2 | 50 | 15.9 | 61.023 | 75.391 | 78.783 | 78.783 | 0 | true (50/50) | 117.0/119.7 | 1.7/1.8 | 69.4/70.9 |
+| TypeScript | no-persist | 1 | 50 | 19.5 | 50.943 | 53.695 | 62.495 | 62.495 | 0 | true (50/50) | 118.9/119.7 | 4.3/4.4 | 1222.4/1231.4 |
+| TypeScript | no-persist | 2 | 50 | 17.5 | 56.255 | 64.063 | 67.647 | 67.647 | 0 | true (50/50) | 124.1/125.1 | 4.1/4.3 | 1328.6/1336.6 |
+| Rust | no-persist | 1 | 50 | 17.6 | 56.703 | 59.391 | 59.807 | 59.807 | 0 | true (50/50) | 120.7/122.0 | 1.7/1.8 | 57.7/58.7 |
+| Rust | no-persist | 2 | 50 | 16.4 | 60.767 | 64.735 | 72.063 | 72.063 | 0 | true (50/50) | 126.8/127.6 | 1.6/1.6 | 71.8/73.3 |
 
 ## Caveats
 
@@ -123,42 +159,42 @@ The `r1/r2 (delta)` cells show both repetitions and the signed percentage change
 
 These repetitions averaged at least 90% engine CPU and more engine CPU than runner CPU; treat runner-to-runner differences there as potentially engine-capped:
 
-- S1 Go persist run 1: engine 131.1%, runner 6.9%
-- S1 Go persist run 2: engine 132.0%, runner 6.9%
-- S1 TypeScript persist run 1: engine 128.2%, runner 10.3%
-- S1 TypeScript persist run 2: engine 128.7%, runner 10.3%
-- S1 Rust persist run 1: engine 130.9%, runner 3.4%
-- S1 Rust persist run 2: engine 133.4%, runner 3.5%
-- S1 TypeScript no-persist run 1: engine 134.8%, runner 4.8%
-- S1 TypeScript no-persist run 2: engine 136.4%, runner 5.5%
-- S1 Rust no-persist run 1: engine 139.2%, runner 2.9%
-- S1 Rust no-persist run 2: engine 141.7%, runner 3.1%
-- S2 Go persist run 1: engine 136.7%, runner 7.1%
-- S2 Go persist run 2: engine 135.4%, runner 6.8%
-- S2 TypeScript persist run 1: engine 132.9%, runner 10.5%
-- S2 TypeScript persist run 2: engine 137.8%, runner 10.2%
-- S2 Rust persist run 1: engine 135.6%, runner 3.5%
-- S2 Rust persist run 2: engine 136.8%, runner 3.4%
-- S2 TypeScript no-persist run 1: engine 129.0%, runner 5.8%
-- S2 TypeScript no-persist run 2: engine 142.1%, runner 5.3%
-- S2 Rust no-persist run 1: engine 135.0%, runner 3.5%
-- S2 Rust no-persist run 2: engine 138.5%, runner 3.2%
-- S3 Go not-applicable run 1: engine 461.0%, runner 66.6%
-- S3 Go not-applicable run 2: engine 455.9%, runner 66.7%
-- S3 TypeScript not-applicable run 1: engine 440.1%, runner 32.4%
-- S3 TypeScript not-applicable run 2: engine 437.1%, runner 32.6%
-- S3 Rust not-applicable run 1: engine 896.0%, runner 20.5%
-- S3 Rust not-applicable run 2: engine 895.1%, runner 20.7%
-- S4 Go persist run 1: engine 106.5%, runner 1.9%
-- S4 Go persist run 2: engine 113.2%, runner 2.0%
-- S4 TypeScript persist run 1: engine 101.5%, runner 4.4%
-- S4 TypeScript persist run 2: engine 113.5%, runner 4.5%
-- S4 Rust persist run 1: engine 107.8%, runner 1.5%
-- S4 Rust persist run 2: engine 113.0%, runner 1.5%
-- S4 TypeScript no-persist run 1: engine 116.9%, runner 4.0%
-- S4 TypeScript no-persist run 2: engine 125.0%, runner 4.3%
-- S4 Rust no-persist run 1: engine 119.2%, runner 1.6%
-- S4 Rust no-persist run 2: engine 125.8%, runner 1.5%
+- S1 Go persist run 1: engine 131.7%, runner 5.8%
+- S1 Go persist run 2: engine 131.9%, runner 5.8%
+- S1 TypeScript persist run 1: engine 125.4%, runner 10.2%
+- S1 TypeScript persist run 2: engine 128.6%, runner 10.5%
+- S1 Rust persist run 1: engine 130.5%, runner 3.6%
+- S1 Rust persist run 2: engine 133.5%, runner 3.6%
+- S1 TypeScript no-persist run 1: engine 140.8%, runner 4.9%
+- S1 TypeScript no-persist run 2: engine 136.4%, runner 5.6%
+- S1 Rust no-persist run 1: engine 138.3%, runner 2.7%
+- S1 Rust no-persist run 2: engine 136.5%, runner 3.1%
+- S2 Go persist run 1: engine 138.8%, runner 5.9%
+- S2 Go persist run 2: engine 139.8%, runner 5.7%
+- S2 TypeScript persist run 1: engine 132.3%, runner 10.5%
+- S2 TypeScript persist run 2: engine 133.3%, runner 10.3%
+- S2 Rust persist run 1: engine 134.9%, runner 3.6%
+- S2 Rust persist run 2: engine 137.4%, runner 3.5%
+- S2 TypeScript no-persist run 1: engine 135.7%, runner 6.2%
+- S2 TypeScript no-persist run 2: engine 144.1%, runner 5.2%
+- S2 Rust no-persist run 1: engine 139.3%, runner 3.7%
+- S2 Rust no-persist run 2: engine 146.7%, runner 3.1%
+- S3 Go not-applicable run 1: engine 465.2%, runner 52.8%
+- S3 Go not-applicable run 2: engine 462.2%, runner 53.2%
+- S3 TypeScript not-applicable run 1: engine 438.5%, runner 32.5%
+- S3 TypeScript not-applicable run 2: engine 436.2%, runner 32.9%
+- S3 Rust not-applicable run 1: engine 437.0%, runner 19.1%
+- S3 Rust not-applicable run 2: engine 433.3%, runner 19.3%
+- S4 Go persist run 1: engine 109.7%, runner 1.6%
+- S4 Go persist run 2: engine 117.3%, runner 1.6%
+- S4 TypeScript persist run 1: engine 106.2%, runner 4.8%
+- S4 TypeScript persist run 2: engine 114.0%, runner 4.5%
+- S4 Rust persist run 1: engine 111.6%, runner 1.7%
+- S4 Rust persist run 2: engine 117.0%, runner 1.7%
+- S4 TypeScript no-persist run 1: engine 118.9%, runner 4.3%
+- S4 TypeScript no-persist run 2: engine 124.1%, runner 4.1%
+- S4 Rust no-persist run 1: engine 120.7%, runner 1.7%
+- S4 Rust no-persist run 2: engine 126.8%, runner 1.6%
 
 ### Archived internal error logs
 
@@ -166,15 +202,35 @@ These counts are error-level log records, grouped by exact message patterns. The
 
 | Archived log | Error-level records | Exact-pattern breakdown |
 |---|---:|---|
-| `engine-go.log` | 1445 | `sqlite worker close channel dropped without clean close`: 1318; `websocket failed`: 96; `http req ingress metrics failed`: 24; `http req egress metrics failed, likely corrupt now`: 2; `long signal recv time`: 5 |
-| `engine-typescript.log` | 226 | `websocket failed`: 64; `http req ingress metrics failed`: 42; `http req egress metrics failed, likely corrupt now`: 5; `long signal recv time`: 115 |
-| `engine-rust.log` | 2718 | `sqlite worker close channel dropped without clean close`: 2552; `websocket failed`: 64; `http req ingress metrics failed`: 36; `http req egress metrics failed, likely corrupt now`: 4; `long signal recv time`: 62 |
+| `engine-go.log` | 1444 | `sqlite worker close channel dropped without clean close`: 1314; `websocket failed`: 96; `http req ingress metrics failed`: 24; `long signal recv time`: 10 |
+| `engine-typescript.log` | 208 | `websocket failed`: 64; `http req ingress metrics failed`: 43; `http req egress metrics failed, likely corrupt now`: 4; `long signal recv time`: 97 |
+| `engine-rust.log` | 2705 | `sqlite worker close channel dropped without clean close`: 2550; `websocket failed`: 64; `http req ingress metrics failed`: 35; `http req egress metrics failed, likely corrupt now`: 3; `long signal recv time`: 53 |
 | `runner-go-persist.log` | 0 | none |
 | `runner-typescript-persist.log` | 0 | none |
 | `runner-typescript-no-persist.log` | 0 | none |
-| `runner-rust-persist.log` | 715 | `shutdown serialize-state enqueue failed`: 633; `serializeState callback returned error`: 16; `serializeState timed out`: 2; `failed to dispatch websocket close event`: 64 |
-| `runner-rust-no-persist.log` | 625 | `shutdown serialize-state enqueue failed`: 598; `serializeState callback returned error`: 25; `serializeState timed out`: 2 |
+| `runner-rust-persist.log` | 720 | `shutdown serialize-state enqueue failed`: 628; `serializeState callback returned error`: 27; `serializeState timed out`: 1; `failed to dispatch websocket close event`: 64 |
+| `runner-rust-no-persist.log` | 619 | `shutdown serialize-state enqueue failed`: 597; `serializeState callback returned error`: 19; `serializeState timed out`: 3 |
 
 ## Go CPU profiles
 
-Profiling-only S1 and S3 runs are excluded from every table above. Their pprof data and text tops are in `bench/results-archive/2026-08-03/go-s1-cpu.pprof`, `bench/results-archive/2026-08-03/go-s3-cpu.pprof`, and the adjacent `*-pprof-top.txt` files.
+Profiling-only S1 and S3 runs are excluded from every table above. Their pprof data and text tops are in `bench/results-archive/2026-08-04-post-optimization/go-s1-cpu.pprof`, `bench/results-archive/2026-08-04-post-optimization/go-s3-cpu.pprof`, and the adjacent `*-pprof-top.txt` files.
+
+The fixed 30-second S3 profile accumulated 15.44 seconds of runner samples,
+down from 19.14 seconds in the archived first run. Absolute samples moved as
+follows:
+
+| Profile entry | First run | Post-optimization | Change |
+|---|---:|---:|---:|
+| Opaque native (`<unknown>`) | 11.58 s | 7.97 s | -31.2% |
+| `runtime.cgocall` | 2.48 s | 2.42 s | -2.4% |
+| `Runner.Poll` cumulative | 1.34 s | 1.41 s | +5.2% |
+| `Runner.Submit` cumulative | 1.16 s | 1.02 s | -12.1% |
+| `runtime.pthread_cond_wait` | 2.62 s | 2.49 s | -5.0% |
+| `runtime.pthread_cond_signal` | 1.59 s | 1.93 s | +21.4% |
+
+The total sample reduction is 19.3%, led by 3.61 fewer seconds in opaque
+native work. FFI call overhead itself is essentially unchanged, consistent
+with retaining one poll and two submits per echo. Scheduler signaling is now a
+larger share and even rises in absolute time, while serialization remains below
+one percent; neither serialization work nor the inactive 64-event cap is a
+supported next target.

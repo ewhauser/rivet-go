@@ -228,3 +228,100 @@ that adjacent control, direct completions improved average S3 throughput from
 (**-3.2%**), and CPU from 57.1% to 55.1% (**-3.5%**). Quick S1 moved
 **-2.5%**, inside its engine-bound variation. The consistent S3 throughput,
 latency, and CPU gains justify keeping the direct completion.
+
+### 9. Pin the Go submitter to one OS thread — reverted
+
+All native submits already flow through one Go goroutine. The attempt pinned
+that goroutine to one OS thread, mirroring the required poller pin, while
+leaving submit batching and queue admission unchanged.
+
+| Scenario | Run | Throughput ops/s | p50 ms | Runner CPU avg | Correct |
+|---|---:|---:|---:|---:|---|
+| S3 | 1 | 3,706.1 | 8.615 | 83.4% | yes |
+| S3 | 2 | 3,551.0 | 8.999 | 81.2% | yes |
+| S1 quick | 1 | 279.5 | 14.143 | 6.5% | yes |
+
+Against the current kept pair, S3 throughput changed from 3,847.6 to 3,628.6
+msg/s (**-5.7%**), p50 from 8.293 to 8.807 ms (**+6.2%**), and runner CPU
+from 55.1% to 82.3% (**+49.4%**). Quick S1 throughput was flat. The extra
+thread affinity increased purego scheduler handoff cost instead of reducing it,
+so the submitter pin was reverted.
+
+## Final full-suite result
+
+The final three-SDK run used fresh engine data for each SDK, two reportable
+repetitions per cell, and the same ordering and correctness gates as the first
+run. Every cell was valid. Raw results, logs, and fresh Go profiles are in
+`bench/results-archive/2026-08-04-post-optimization`.
+
+Final persistent averages (S3 has no persistence variant):
+
+| Scenario | SDK | Throughput ops/s | p50 ms | Runner CPU avg |
+|---|---|---:|---:|---:|
+| S1 | Go | 285.9 | 14.611 | 5.8% |
+| S1 | TypeScript | 304.8 | 14.407 | 10.4% |
+| S1 | Rust | 286.4 | 14.899 | 3.6% |
+| S3 | Go | 3,641.5 | 8.747 | 53.0% |
+| S3 | TypeScript | 4,647.0 | 6.849 | 32.7% |
+| S3 | Rust | 4,732.0 | 6.725 | 19.2% |
+| S4 | Go | 16.4 | 60.303 | 1.6% |
+| S4 | TypeScript | 17.6 | 55.423 | 4.7% |
+| S4 | Rust | 16.3 | 59.807 | 1.7% |
+
+Against the archived first-run Go averages, final S3 throughput changed from
+3,622.8 to 3,641.5 msg/s (**+0.5%**), p50 from 8.787 to 8.747 ms
+(**-0.5%**), and runner CPU from 66.6% to 53.0% (**-20.5%**). S1 throughput
+changed **-0.8%**, p50 **+0.4%**, and CPU **-16.5%**. S4 throughput changed
+**+1.1%**, p50 **+1.2%**, and CPU **-18.1%**. The kept set therefore makes
+the Go runner materially more CPU-efficient without a reportable throughput
+or latency regression, but it does not close the full-suite S3 speed gap:
+Go remains 21.6% behind TypeScript in throughput with 27.7% higher p50.
+
+Rust S3 moved from 3,775.7 to 4,732.0 msg/s between archives without any Rust
+benchmark-runner change in the Go optimization commits. That cross-run drift
+is not credited to this work; the final same-run table is the fair cross-SDK
+comparison.
+
+## Final Go profile comparison
+
+The fixed 30-second S3 profile accumulated 15.44 seconds of runner samples,
+down from 19.14 seconds in the archived first run (**-19.3%**). Absolute
+samples moved as follows:
+
+| Profile entry | First run | Post-optimization | Change |
+|---|---:|---:|---:|
+| Opaque native (`<unknown>`) | 11.58 s | 7.97 s | -31.2% |
+| `runtime.cgocall` | 2.48 s | 2.42 s | -2.4% |
+| `Runner.Poll` cumulative | 1.34 s | 1.41 s | +5.2% |
+| `Runner.Submit` cumulative | 1.16 s | 1.02 s | -12.1% |
+| `runtime.pthread_cond_wait` | 2.62 s | 2.49 s | -5.0% |
+| `runtime.pthread_cond_signal` | 1.59 s | 1.93 s | +21.4% |
+
+The 3.61-second reduction in opaque native samples accounts for the result;
+FFI call overhead itself is essentially unchanged because the final path still
+uses one poll and two submits per echo. Scheduler signaling is now a larger
+remaining cost. Serialization remains below one percent, and the measured
+event and command batch densities remain 1.000, so neither serialization nor
+the inactive 64-event cap is supported as a next target.
+
+The kept changes do not alter the C ABI, wire schema, FFI threading contract,
+bounded submit admission, per-actor ordering, exact-index acknowledgements, or
+hibernation bookkeeping. No boundary deviation note or ABI bump is required.
+There are no new decode surfaces.
+
+## Verification
+
+- `go test -race -count=1 ./...` passed in full; the conformance package
+  completed in 525.958 seconds.
+- `cargo test --workspace` passed: 30 unit tests and all doc tests.
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings`
+  passed.
+- `go vet ./...` passed.
+- `scripts/build-ffi.sh` rebuilt all six targets twice. Both complete passes
+  produced zero diff against the committed header, ABI constant, checksums,
+  and native libraries.
+- `go run ./cmd/soak` passed the default two-minute CI smoke profile: 209
+  counter operations, 100 chat messages, all 400 expected receipts, five alarm
+  fires, three intentional action panics, three client disconnects, one engine
+  restart, five sleep/wakes, two stalled clients, and three goroutines before
+  and after.
