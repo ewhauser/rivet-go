@@ -631,10 +631,12 @@ func TestWebSocketLifecycleRacesAndHookBroadcasts(t *testing.T) {
 	waitForActor(t, engine.endpoint, shutdownActor.ActorID, false, func(actor actorRecord) bool {
 		return actor.ConnectableTS == nil && actor.SleepTS != nil && actor.DestroyTS == nil
 	})
-	assertNoWebSocketFrame(t, shutdownClient, 500*time.Millisecond)
+	shutdownDisconnect := waitWebSocketHook(t, disconnected, "runner-shutdown")
+	assertCloseObservation(t, shutdownDisconnect, 1001, "runner shutting down")
+	assertGatewayWebSocketClose(t, shutdownClient, 1001, "runner shutting down")
 	countMu.Lock()
-	if disconnectCounts["runner-shutdown"] != 0 {
-		t.Fatalf("runner shutdown OnDisconnect count = %d, want 0", disconnectCounts["runner-shutdown"])
+	if disconnectCounts["runner-shutdown"] != 1 {
+		t.Fatalf("runner shutdown OnDisconnect count = %d, want 1", disconnectCounts["runner-shutdown"])
 	}
 	countMu.Unlock()
 }

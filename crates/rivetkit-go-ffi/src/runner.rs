@@ -592,6 +592,7 @@ async fn finish_shutdown(
 ) {
     let started = Instant::now();
     let actors_before = handle.status().active_actor_count as u32;
+    actor_proxy.begin_shutdown();
     cancellation.cancel();
     let graceful = match tokio::time::timeout(
         Duration::from_millis(u64::from(deadline_ms)),

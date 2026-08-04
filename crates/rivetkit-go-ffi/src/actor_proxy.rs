@@ -1,7 +1,7 @@
 //! Callback-free proxy from rivetkit-core actor factories to the Go pump.
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -335,6 +335,7 @@ pub(crate) struct ActorProxy {
     stop_intents: Arc<Mutex<HashSet<ActorIdentity>>>,
     active_http: Arc<Mutex<HashSet<u64>>>,
     http_responses: Arc<Mutex<HashMap<u64, HttpResponseAssembly>>>,
+    runner_draining: Arc<AtomicBool>,
 }
 
 impl ActorProxy {
@@ -350,6 +351,7 @@ impl ActorProxy {
             stop_intents: Arc::new(Mutex::new(HashSet::new())),
             active_http: Arc::new(Mutex::new(HashSet::new())),
             http_responses: Arc::new(Mutex::new(HashMap::new())),
+            runner_draining: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -564,6 +566,7 @@ impl ActorProxy {
     }
 
     pub(crate) fn drain_shutdown(&self) {
+        self.begin_shutdown();
         self.pending.clear();
         self.pending_ws_open.clear();
         self.close_all_websockets(Some(1001), Some("runner shutting down".to_owned()));
@@ -575,6 +578,10 @@ impl ActorProxy {
             .lock()
             .expect("HTTP response table poisoned")
             .clear();
+    }
+
+    pub(crate) fn begin_shutdown(&self) {
+        self.runner_draining.store(true, Ordering::Release);
     }
 
     async fn run_actor(&self, start: ActorStart) -> Result<()> {
@@ -628,13 +635,16 @@ impl ActorProxy {
             )
             .await;
         match &result {
-            Ok(true) => self.hibernate_actor_websockets(&identity),
-            Ok(false) | Err(_) => {
-                self.close_actor_websockets(
-                    &identity,
-                    Some(1001),
-                    Some("actor stopped".to_owned()),
-                );
+            Ok(true) if !self.runner_draining.load(Ordering::Acquire) => {
+                self.hibernate_actor_websockets(&identity);
+            }
+            Ok(_) | Err(_) => {
+                let reason = if self.runner_draining.load(Ordering::Acquire) {
+                    "runner shutting down"
+                } else {
+                    "actor stopped"
+                };
+                self.close_actor_websockets(&identity, Some(1001), Some(reason.to_owned()));
             }
         }
         self.restoring_websockets

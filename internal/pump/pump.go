@@ -1307,10 +1307,15 @@ func (p *Pump) handleInternalEvent(event wire.Event) error {
 		if worker == nil {
 			return fmt.Errorf("ActorStop for unknown actor %s generation %d", event.AID, event.Generation)
 		}
+		runnerDraining := p.shuttingDown.Load()
+		closeReason := "actor stopped"
+		if runnerDraining {
+			closeReason = "runner shutting down"
+		}
 		closeEvents, hibernateCommands := p.detachActorWebSockets(
 			worker.session.identity,
-			event.Reason == "sleep",
-			"actor stopped",
+			event.Reason == "sleep" && !runnerDraining,
+			closeReason,
 		)
 		if len(hibernateCommands) != 0 {
 			submitCtx, cancel := context.WithTimeout(context.Background(), p.wsSubmitLimit)
