@@ -37,10 +37,16 @@ func TestCounterTruthComparesEveryField(t *testing.T) {
 
 func TestChatReceiptLedgersAreOrderedAndExactlyOnce(t *testing.T) {
 	oracle := newChatOracle()
-	oracle.connect("alpha")
+	oracle.observeConnect("alpha")
+	if err := oracle.startExpecting("alpha"); err != nil {
+		t.Fatal(err)
+	}
+	receipt, err := oracle.expectIntent("one", []string{"alpha"})
+	if err != nil {
+		t.Fatal(err)
+	}
 	state := chatState{Sequence: 1, Messages: 1, LastToken: "one", Checksum: tokenHash("one") + 1}
-	receipt := chatReceipt{Sequence: 1, Token: "one"}
-	if err := oracle.onMessage(state, receipt); err != nil {
+	if err := oracle.observeMessage(state, receipt); err != nil {
 		t.Fatal(err)
 	}
 	if err := oracle.record("alpha", receipt); err != nil {
@@ -51,6 +57,20 @@ func TestChatReceiptLedgersAreOrderedAndExactlyOnce(t *testing.T) {
 	}
 	if err := oracle.record("alpha", receipt); err == nil || !strings.Contains(err.Error(), "duplicate") {
 		t.Fatalf("duplicate receipt error = %v", err)
+	}
+}
+
+func TestChatReceiptLedgerDetectsMissingReceipt(t *testing.T) {
+	oracle := newChatOracle()
+	oracle.observeConnect("alpha")
+	if err := oracle.startExpecting("alpha"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := oracle.expectIntent("one", []string{"alpha"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := oracle.convergence("alpha"); err == nil || !strings.Contains(err.Error(), "receipts=0 expected=1") {
+		t.Fatalf("missing receipt error = %v", err)
 	}
 }
 

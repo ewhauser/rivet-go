@@ -13,7 +13,6 @@ import (
 	"runtime"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -36,6 +35,11 @@ type soakConfig struct {
 	stallDuration      time.Duration
 	panicInterval      time.Duration
 	alarmDelay         time.Duration
+	engineRestarts     bool
+	clientDisconnects  bool
+	sleepWakes         bool
+	stalledClients     bool
+	actionPanics       bool
 }
 
 type soakSummary struct {
@@ -50,7 +54,7 @@ type soakSummary struct {
 	Metrics           map[string]int64 `json:"metrics"`
 	GoroutinesBefore  int              `json:"goroutines_before"`
 	GoroutinesAfter   int              `json:"goroutines_after"`
-	DataDir           string           `json:"data_dir"`
+	DataDir           string           `json:"data_dir,omitempty"`
 }
 
 func main() {
@@ -59,6 +63,8 @@ func main() {
 		fmt.Fprintln(os.Stderr, "soak:", err)
 		os.Exit(2)
 	}
+	fmt.Fprintf(os.Stderr, "SOAK START seed=%d duration=%s intensity=%d clients=%d counters=%d\n",
+		config.seed, config.duration, config.intensity, config.clients, config.counters)
 	summary, err := runSoak(context.Background(), config)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "SOAK FAIL:", err)
@@ -79,13 +85,18 @@ func parseFlags() (soakConfig, error) {
 	flag.IntVar(&config.clients, "clients", 4, "number of live chat WebSocket clients")
 	flag.IntVar(&config.counters, "counters", 3, "number of counter actors")
 	flag.Int64Var(&config.seed, "seed", 0, "random seed; zero chooses and prints one")
-	flag.StringVar(&config.dataDir, "data-dir", "", "engine data directory; empty creates a preserved temporary directory")
+	flag.StringVar(&config.dataDir, "data-dir", "", "engine data directory; empty preserves a temporary directory only on failure")
 	flag.DurationVar(&config.restartInterval, "restart-interval", 45*time.Second, "engine restart interval")
 	flag.DurationVar(&config.disconnectInterval, "disconnect-interval", 12*time.Second, "client disconnect interval")
 	flag.DurationVar(&config.stallInterval, "stall-interval", 20*time.Second, "stalled client interval")
 	flag.DurationVar(&config.stallDuration, "stall-duration", 3*time.Second, "duration for each stalled client")
 	flag.DurationVar(&config.panicInterval, "panic-interval", 30*time.Second, "sacrificial action panic interval")
 	flag.DurationVar(&config.alarmDelay, "alarm-delay", 20*time.Second, "durable alarm delay")
+	flag.BoolVar(&config.engineRestarts, "engine-restarts", true, "enable engine replacement chaos (disabling makes the activation oracle fail)")
+	flag.BoolVar(&config.clientDisconnects, "client-disconnects", true, "enable client disconnect chaos (disabling makes the activation oracle fail)")
+	flag.BoolVar(&config.sleepWakes, "sleep-wakes", true, "enable alarm-driven sleep/wake churn (disabling makes the activation oracle fail)")
+	flag.BoolVar(&config.stalledClients, "stalled-clients", true, "enable stalled WebSocket clients (disabling makes the activation oracle fail)")
+	flag.BoolVar(&config.actionPanics, "action-panics", true, "enable sacrificial action panics (disabling makes the activation oracle fail)")
 	flag.Parse()
 	if config.duration <= 0 {
 		return config, errors.New("duration must be positive")
@@ -133,11 +144,10 @@ type soakRun struct {
 	alarmActor   string
 	counterIDs   []string
 	counterTruth []counterState
-	operationID  atomic.Uint64
 	chaosMu      sync.Mutex
 }
 
-func runSoak(parent context.Context, config soakConfig) (soakSummary, error) {
+func runSoak(parent context.Context, config soakConfig) (summary soakSummary, runErr error) {
 	ctx, stopSignals := signal.NotifyContext(parent, os.Interrupt, syscall.SIGTERM)
 	defer stopSignals()
 
@@ -155,6 +165,7 @@ func runSoak(parent context.Context, config soakConfig) (soakSummary, error) {
 		return soakSummary{}, fmt.Errorf("acquire engine %s: %w", devengine.Tag, err)
 	}
 	dataDir := config.dataDir
+	autoDataDir := dataDir == ""
 	if dataDir == "" {
 		dataDir, err = os.MkdirTemp("", "rivet-go-soak-")
 		if err != nil {
@@ -169,6 +180,20 @@ func runSoak(parent context.Context, config soakConfig) (soakSummary, error) {
 	if err != nil {
 		return soakSummary{}, err
 	}
+	fmt.Fprintf(os.Stderr, "SOAK DATA seed=%d data_dir=%s engine_log=%s\n", config.seed, dataDir, engine.LogPath)
+	defer func() {
+		if runErr != nil {
+			runErr = fmt.Errorf("%w\nseed=%d\ndata_dir=%s\nengine_log=%s", runErr, config.seed, dataDir, engine.LogPath)
+			return
+		}
+		if autoDataDir {
+			if err := os.RemoveAll(dataDir); err != nil {
+				runErr = fmt.Errorf("remove successful soak data directory %s: %w", dataDir, err)
+				return
+			}
+			summary.DataDir = ""
+		}
+	}()
 	if err := engine.Start(ctx); err != nil {
 		return soakSummary{}, err
 	}
@@ -369,7 +394,7 @@ func (r *soakRun) registry() (*rivet.Registry, error) {
 			if label == "" {
 				return errors.New("chat client has no x-client-label")
 			}
-			r.chatOracle.connect(label)
+			r.chatOracle.observeConnect(label)
 			return connection.SendText("ready:" + label)
 		},
 		OnMessage: func(ctx *rivet.Context[chatState], connection *rivet.Connection, message rivet.Message) {
@@ -393,25 +418,18 @@ func (r *soakRun) registry() (*rivet.Registry, error) {
 				r.errors.report(fmt.Errorf("broadcast chat receipt: %w", err))
 				return
 			}
-			if err := r.chatOracle.onMessage(*ctx.State(), receipt); err != nil {
+			if err := r.chatOracle.observeMessage(*ctx.State(), receipt); err != nil {
 				r.errors.report(err)
 			}
 		},
 		OnDisconnect: func(_ *rivet.Context[chatState], connection *rivet.Connection) {
 			label := headerValue(connection.Headers(), "x-client-label")
-			r.chatOracle.disconnect(label)
+			r.chatOracle.observeDisconnect(label)
 		},
 	}); err != nil {
 		return nil, err
 	}
 	if err := rivet.Register(registry, "soak-alarm", rivet.Actor[alarmState]{
-		OnStart: func(ctx *rivet.Context[alarmState]) error {
-			ctx.State().Starts++
-			if err := ctx.Save(context.Background()); err != nil {
-				return err
-			}
-			return r.alarmOracle.onStart(*ctx.State())
-		},
 		Actions: rivet.Actions[alarmState]{
 			"arm": rivet.Action(func(ctx *rivet.Context[alarmState], args alarmArgs) (alarmState, error) {
 				ctx.State().Armed++
@@ -422,13 +440,13 @@ func (r *soakRun) registry() (*rivet.Registry, error) {
 				if err := ctx.Sleep(); err != nil {
 					return alarmState{}, err
 				}
-				if err := r.alarmOracle.onArm(*ctx.State(), args.Nonce); err != nil {
-					return alarmState{}, err
-				}
 				return *ctx.State(), nil
 			}),
 			"resleep": rivet.Action(func(ctx *rivet.Context[alarmState], _ struct{}) (alarmState, error) {
 				return *ctx.State(), ctx.Sleep()
+			}),
+			"snapshot": rivet.Action(func(ctx *rivet.Context[alarmState], _ struct{}) (alarmState, error) {
+				return *ctx.State(), nil
 			}),
 			"settle": rivet.Action(func(ctx *rivet.Context[alarmState], _ struct{}) (alarmState, error) {
 				return *ctx.State(), ctx.ClearSchedule()
@@ -437,9 +455,6 @@ func (r *soakRun) registry() (*rivet.Registry, error) {
 		OnAlarm: func(ctx *rivet.Context[alarmState]) error {
 			ctx.State().Fired++
 			ctx.State().LastFiredNonce = ctx.State().LastNonce
-			if err := r.alarmOracle.onFire(*ctx.State()); err != nil {
-				return err
-			}
 			select {
 			case r.alarmOracle.fired <- ctx.State().LastFiredNonce:
 			default:
@@ -513,17 +528,20 @@ func (r *soakRun) startWorkload(ctx context.Context, wait *sync.WaitGroup) {
 		defer wait.Done()
 		r.runChat(ctx, chatRate)
 	}()
-	wait.Add(1)
-	go func() {
-		defer wait.Done()
-		r.runAlarms(ctx)
-	}()
+	if r.config.sleepWakes {
+		wait.Add(1)
+		go func() {
+			defer wait.Done()
+			r.runAlarms(ctx)
+		}()
+	}
 	r.startChaos(ctx, wait)
 }
 
 func (r *soakRun) runCounter(ctx context.Context, index int, rng *rand.Rand, interval time.Duration) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
+	var iteration uint64
 	for {
 		if err := r.gate.acquire(ctx); err != nil {
 			return
@@ -532,8 +550,9 @@ func (r *soakRun) runCounter(ctx context.Context, index int, rng *rand.Rand, int
 		if delta == 0 {
 			delta = 1
 		}
+		iteration++
 		args := counterArgs{
-			Token: fmt.Sprintf("counter-%d-%012d", index, r.operationID.Add(1)),
+			Token: fmt.Sprintf("counter-%d-%012d", index, iteration),
 			Delta: delta,
 		}
 		expected := truthCounterUpdate(r.counterTruth[index], args)
@@ -565,6 +584,7 @@ func (r *soakRun) runChat(ctx context.Context, interval time.Duration) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	clientIndex := 0
+	var sequence uint64
 	for {
 		if err := r.gate.acquire(ctx); err != nil {
 			return
@@ -577,13 +597,16 @@ func (r *soakRun) runChat(ctx context.Context, interval time.Duration) {
 		}
 		label := labels[clientIndex%len(labels)]
 		clientIndex++
-		token := fmt.Sprintf("chat-%012d", r.operationID.Add(1))
-		err := r.clients.client(label).write(token)
+		sequence++
+		token := fmt.Sprintf("chat-%012d", sequence)
+		_, err := r.chatOracle.expectIntent(token, labels)
+		if err == nil {
+			err = r.clients.client(label).write(token)
+		}
 		if err == nil {
 			messageCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
 			err = waitUntil(messageCtx, 25*time.Millisecond, func() (bool, error) {
-				state := r.chatOracle.stateTruth()
-				return state.LastToken == token, nil
+				return r.chatOracle.observed(token), nil
 			})
 			cancel()
 		}
@@ -611,11 +634,24 @@ func (r *soakRun) runAlarms(ctx context.Context) {
 		cycle++
 		nonce := fmt.Sprintf("alarm-%012d", cycle)
 		args := alarmArgs{Nonce: nonce, DelayMillis: r.config.alarmDelay.Milliseconds()}
+		expected := r.alarmOracle.expectArm(nonce)
 		actionCtx, cancel := context.WithTimeout(ctx, 45*time.Second)
 		actual, err := gatewayAction[alarmState](actionCtx, r.api, r.alarmActor, "arm", args)
 		cancel()
+		firedEarly := false
 		if err == nil {
-			err = compareAlarm(actual, r.alarmOracle.truth())
+			select {
+			case fired := <-r.alarmOracle.fired:
+				expected, err = r.alarmOracle.expectFire(fired)
+				if err == nil {
+					firedEarly = true
+					r.activations.sleepWakes.Add(1)
+				}
+			default:
+			}
+		}
+		if err == nil {
+			err = compareAlarm(actual, expected)
 		}
 		r.gate.release()
 		if err != nil {
@@ -624,14 +660,17 @@ func (r *soakRun) runAlarms(ctx context.Context) {
 			}
 			return
 		}
+		if firedEarly {
+			continue
+		}
 		alarmTimer := time.NewTimer(r.config.alarmDelay + 45*time.Second)
 		select {
 		case fired := <-r.alarmOracle.fired:
 			if !alarmTimer.Stop() {
 				<-alarmTimer.C
 			}
-			if fired != nonce {
-				r.errors.report(fmt.Errorf("alarm fired nonce=%q want=%q", fired, nonce))
+			if _, err := r.alarmOracle.expectFire(fired); err != nil {
+				r.errors.report(err)
 				return
 			}
 			r.activations.sleepWakes.Add(1)
@@ -651,10 +690,18 @@ func (r *soakRun) runAlarms(ctx context.Context) {
 }
 
 func (r *soakRun) startChaos(ctx context.Context, wait *sync.WaitGroup) {
-	r.periodicChaos(ctx, wait, min(5*time.Second, r.config.panicInterval), r.config.panicInterval, r.panicChaos)
-	r.periodicChaos(ctx, wait, r.config.disconnectInterval, r.config.disconnectInterval, r.disconnectChaos)
-	r.periodicChaos(ctx, wait, r.config.stallInterval, r.config.stallInterval, r.stallChaos)
-	r.periodicChaos(ctx, wait, r.config.restartInterval, r.config.restartInterval, r.restartChaos)
+	if r.config.actionPanics {
+		r.periodicChaos(ctx, wait, min(5*time.Second, r.config.panicInterval), r.config.panicInterval, r.panicChaos)
+	}
+	if r.config.clientDisconnects {
+		r.periodicChaos(ctx, wait, r.config.disconnectInterval, r.config.disconnectInterval, r.disconnectChaos)
+	}
+	if r.config.stalledClients {
+		r.periodicChaos(ctx, wait, r.config.stallInterval, r.config.stallInterval, r.stallChaos)
+	}
+	if r.config.engineRestarts {
+		r.periodicChaos(ctx, wait, r.config.restartInterval, r.config.restartInterval, r.restartChaos)
+	}
 }
 
 func (r *soakRun) periodicChaos(
@@ -693,6 +740,10 @@ func (r *soakRun) periodicChaos(
 func (r *soakRun) disconnectChaos(ctx context.Context, iteration int) error {
 	r.chaosMu.Lock()
 	defer r.chaosMu.Unlock()
+	if err := r.gate.pause(ctx); err != nil {
+		return fmt.Errorf("pause before disconnect chaos: %w", err)
+	}
+	defer r.gate.resume()
 	if err := r.clients.disconnectAndReplace(ctx, iteration); err != nil {
 		return fmt.Errorf("disconnect chaos: %w", err)
 	}
@@ -779,8 +830,19 @@ func (r *soakRun) restartChaos(ctx context.Context, _ int) error {
 	if err != nil {
 		return fmt.Errorf("rehydrate alarm actor after engine restart: %w", err)
 	}
-	if err := compareAlarm(actual, r.alarmOracle.truth()); err != nil {
-		return err
+	if err := waitUntil(ctx, 25*time.Millisecond, func() (bool, error) {
+		compareErr := compareAlarm(actual, r.alarmOracle.truth())
+		if compareErr == nil {
+			return true, nil
+		}
+		actual, err = gatewayAction[alarmState](ctx, r.api, r.alarmActor, "snapshot", struct{}{})
+		if err != nil {
+			return false, err
+		}
+		compareErr = compareAlarm(actual, r.alarmOracle.truth())
+		return compareErr == nil, compareErr
+	}); err != nil {
+		return fmt.Errorf("alarm model did not converge after restart: %w", err)
 	}
 	r.activations.engineRestarts.Add(1)
 	return nil
@@ -815,6 +877,24 @@ func (r *soakRun) finalOracles(ctx context.Context) error {
 	if chatActual.Messages == 0 {
 		return errors.New("chat actor handled zero messages")
 	}
+	for {
+		truth := r.alarmOracle.truth()
+		if truth.Fired > truth.Armed {
+			return fmt.Errorf("alarm truth fired=%d exceeds armed=%d", truth.Fired, truth.Armed)
+		}
+		if truth.Fired == truth.Armed {
+			break
+		}
+		select {
+		case nonce := <-r.alarmOracle.fired:
+			if _, err := r.alarmOracle.expectFire(nonce); err != nil {
+				return err
+			}
+			r.activations.sleepWakes.Add(1)
+		case <-ctx.Done():
+			return fmt.Errorf("wait for final alarm intent to fire: %w", ctx.Err())
+		}
+	}
 	alarmActual, err := gatewayAction[alarmState](ctx, r.api, r.alarmActor, "settle", struct{}{})
 	if err != nil {
 		return err
@@ -822,7 +902,7 @@ func (r *soakRun) finalOracles(ctx context.Context) error {
 	if err := compareAlarm(alarmActual, r.alarmOracle.truth()); err != nil {
 		return err
 	}
-	if alarmActual.Armed == 0 || alarmActual.Fired == 0 {
+	if r.config.sleepWakes && (alarmActual.Armed == 0 || alarmActual.Fired == 0) {
 		return fmt.Errorf("alarm convergence has armed=%d fired=%d", alarmActual.Armed, alarmActual.Fired)
 	}
 	if err := r.activations.validate(); err != nil {

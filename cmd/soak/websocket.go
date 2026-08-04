@@ -87,7 +87,7 @@ func dialWSClient(
 		wake:   make(chan struct{}),
 		done:   make(chan struct{}),
 	}
-	conn.SetReadLimit((1 << 20) + (64 << 10))
+	conn.SetReadLimit(1 << 20)
 	// The dial context bounds only connection establishment. The read loop is
 	// owned by the client and ends when close closes the socket; using a short
 	// chaos-operation context here would silently stop receipt accounting.
@@ -265,13 +265,14 @@ func (m *clientManager) connect(ctx context.Context) (*wsClient, error) {
 		return nil, err
 	}
 	if err := waitUntil(ctx, 50*time.Millisecond, func() (bool, error) {
-		m.oracle.mu.Lock()
-		defer m.oracle.mu.Unlock()
-		ledger := m.oracle.ledgers[label]
-		return ledger != nil && ledger.active, nil
+		return m.oracle.connected(label), nil
 	}); err != nil {
 		_ = client.close(ctx)
 		return nil, fmt.Errorf("wait for client %s OnConnect: %w", label, err)
+	}
+	if err := m.oracle.startExpecting(label); err != nil {
+		_ = client.close(ctx)
+		return nil, err
 	}
 	m.mu.Lock()
 	m.clients[label] = client
@@ -306,7 +307,7 @@ func (m *clientManager) disconnectAndReplace(ctx context.Context, index int) err
 	m.mu.Lock()
 	delete(m.clients, label)
 	m.mu.Unlock()
-	m.oracle.markDisconnecting(label)
+	m.oracle.stopExpecting(label)
 	if err := waitUntil(ctx, 50*time.Millisecond, func() (bool, error) {
 		err := m.oracle.convergence(label)
 		return err == nil, err
@@ -317,10 +318,7 @@ func (m *clientManager) disconnectAndReplace(ctx context.Context, index int) err
 		return fmt.Errorf("disconnect client %s: %w", label, err)
 	}
 	if err := waitUntil(ctx, 50*time.Millisecond, func() (bool, error) {
-		m.oracle.mu.Lock()
-		defer m.oracle.mu.Unlock()
-		ledger := m.oracle.ledgers[label]
-		return ledger != nil && !ledger.active, nil
+		return !m.oracle.connected(label), nil
 	}); err != nil {
 		return fmt.Errorf("wait for client %s OnDisconnect: %w", label, err)
 	}
@@ -368,7 +366,7 @@ func (m *clientManager) stall(ctx context.Context, gate *workGate, index int, du
 
 func (m *clientManager) quiesce(ctx context.Context) error {
 	for _, label := range m.labels() {
-		m.oracle.markDisconnecting(label)
+		m.oracle.stopExpecting(label)
 	}
 	return waitUntil(ctx, 50*time.Millisecond, func() (bool, error) {
 		err := m.oracle.convergence("")

@@ -155,7 +155,7 @@ func TestPanicFirewallThroughLoadedLibrary(t *testing.T) {
 	if result.err == nil {
 		t.Fatal("rk_test_panic returned no structured error")
 	}
-	nativeError := &Error{ptr: result.err}
+	nativeError := newError(result.err)
 	defer nativeError.Close()
 	payload, err := nativeError.Payload()
 	if err != nil {
@@ -199,7 +199,7 @@ func TestAllBindingsRejectNullRunner(t *testing.T) {
 			if test.err == nil {
 				t.Fatal("binding returned no structured error")
 			}
-			nativeError := &Error{ptr: test.err}
+			nativeError := newError(test.err)
 			defer nativeError.Close()
 			payload, err := nativeError.Payload()
 			if err != nil {

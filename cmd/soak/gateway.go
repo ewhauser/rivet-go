@@ -11,6 +11,8 @@ import (
 	"time"
 )
 
+const maxEngineJSONResponse = 2 << 20
+
 type engineAPI struct {
 	endpoint string
 	client   *http.Client
@@ -62,7 +64,7 @@ func (a *engineAPI) waitRunnerPingAfter(ctx context.Context, runnerName string, 
 		var payload struct {
 			Envoys []envoyRecord `json:"envoys"`
 		}
-		if err := json.NewDecoder(response.Body).Decode(&payload); err != nil {
+		if err := decodeBoundedJSON(response.Body, &payload); err != nil {
 			return false, err
 		}
 		for _, envoy := range payload.Envoys {
@@ -94,7 +96,7 @@ func (a *engineAPI) waitRunner(ctx context.Context, runnerName string, present b
 		var payload struct {
 			Envoys []envoyRecord `json:"envoys"`
 		}
-		if err := json.NewDecoder(response.Body).Decode(&payload); err != nil {
+		if err := decodeBoundedJSON(response.Body, &payload); err != nil {
 			return false, fmt.Errorf("decode envoys: %w", err)
 		}
 		for _, envoy := range payload.Envoys {
@@ -149,7 +151,7 @@ func (a *engineAPI) createActor(
 			ActorID string `json:"actor_id"`
 		} `json:"actor"`
 	}
-	if err := json.NewDecoder(response.Body).Decode(&result); err != nil {
+	if err := decodeBoundedJSON(response.Body, &result); err != nil {
 		return "", fmt.Errorf("decode actor create: %w", err)
 	}
 	if result.Actor.ActorID == "" {
@@ -219,11 +221,30 @@ func gatewayActionResponse(
 		return 0, nil, fmt.Errorf("call action %s: %w", action, err)
 	}
 	defer response.Body.Close()
-	body, err := io.ReadAll(io.LimitReader(response.Body, 2<<20))
+	body, err := readBounded(response.Body, maxEngineJSONResponse)
 	if err != nil {
 		return response.StatusCode, nil, fmt.Errorf("read action %s response: %w", action, err)
 	}
 	return response.StatusCode, body, nil
+}
+
+func decodeBoundedJSON(reader io.Reader, output any) error {
+	body, err := readBounded(reader, maxEngineJSONResponse)
+	if err != nil {
+		return err
+	}
+	return json.Unmarshal(body, output)
+}
+
+func readBounded(reader io.Reader, limit int64) ([]byte, error) {
+	body, err := io.ReadAll(io.LimitReader(reader, limit+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(body)) > limit {
+		return nil, fmt.Errorf("engine response exceeded %d bytes", limit)
+	}
+	return body, nil
 }
 
 func expectPanicAction(

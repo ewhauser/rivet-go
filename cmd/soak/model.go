@@ -36,7 +36,6 @@ type chatReceipt struct {
 }
 
 type alarmState struct {
-	Starts         uint64 `json:"starts"`
 	Armed          uint64 `json:"armed"`
 	Fired          uint64 `json:"fired"`
 	LastNonce      string `json:"lastNonce"`
@@ -121,9 +120,6 @@ func compareChat(got, want chatState) error {
 
 func compareAlarm(got, want alarmState) error {
 	var differences []string
-	if got.Starts != want.Starts {
-		differences = append(differences, fmt.Sprintf("starts=%d want=%d", got.Starts, want.Starts))
-	}
 	if got.Armed != want.Armed {
 		differences = append(differences, fmt.Sprintf("armed=%d want=%d", got.Armed, want.Armed))
 	}
@@ -143,71 +139,112 @@ func compareAlarm(got, want alarmState) error {
 }
 
 type receiptLedger struct {
-	active        bool
-	disconnecting bool
-	expected      []chatReceipt
-	received      []chatReceipt
-	seen          map[uint64]struct{}
+	expecting bool
+	connected bool
+	expected  []chatReceipt
+	received  []chatReceipt
+	seen      map[uint64]struct{}
 }
 
 type chatOracle struct {
-	mu      sync.Mutex
-	state   chatState
-	ledgers map[string]*receiptLedger
+	mu            sync.Mutex
+	state         chatState
+	observedToken string
+	ledgers       map[string]*receiptLedger
 }
 
 func newChatOracle() *chatOracle {
 	return &chatOracle{ledgers: make(map[string]*receiptLedger)}
 }
 
-func (o *chatOracle) connect(label string) {
+func (o *chatOracle) observeConnect(label string) {
 	o.mu.Lock()
 	ledger := o.ledgers[label]
 	if ledger == nil {
 		ledger = &receiptLedger{seen: make(map[uint64]struct{})}
 		o.ledgers[label] = ledger
 	}
-	ledger.active = true
-	ledger.disconnecting = false
+	ledger.connected = true
 	o.mu.Unlock()
 }
 
-func (o *chatOracle) markDisconnecting(label string) {
-	o.mu.Lock()
-	if ledger := o.ledgers[label]; ledger != nil {
-		ledger.disconnecting = true
-	}
-	o.mu.Unlock()
-}
-
-func (o *chatOracle) disconnect(label string) {
-	o.mu.Lock()
-	if ledger := o.ledgers[label]; ledger != nil {
-		ledger.active = false
-		ledger.disconnecting = false
-	}
-	o.mu.Unlock()
-}
-
-func (o *chatOracle) onMessage(state chatState, receipt chatReceipt) error {
+func (o *chatOracle) startExpecting(label string) error {
 	o.mu.Lock()
 	defer o.mu.Unlock()
-	expectedState := chatState{
+	ledger := o.ledgers[label]
+	if ledger == nil || !ledger.connected {
+		return fmt.Errorf("client %q was not observed connected", label)
+	}
+	ledger.expecting = true
+	return nil
+}
+
+func (o *chatOracle) stopExpecting(label string) {
+	o.mu.Lock()
+	if ledger := o.ledgers[label]; ledger != nil {
+		ledger.expecting = false
+	}
+	o.mu.Unlock()
+}
+
+func (o *chatOracle) observeDisconnect(label string) {
+	o.mu.Lock()
+	if ledger := o.ledgers[label]; ledger != nil {
+		ledger.connected = false
+	}
+	o.mu.Unlock()
+}
+
+func (o *chatOracle) connected(label string) bool {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	ledger := o.ledgers[label]
+	return ledger != nil && ledger.connected
+}
+
+// expectIntent advances the independent model before the workload generator
+// writes to the actor. The actor callback may only report what it observed; it
+// never derives or advances this expected state.
+func (o *chatOracle) expectIntent(token string, labels []string) (chatReceipt, error) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	next := chatState{
 		Sequence:  o.state.Sequence + 1,
 		Messages:  o.state.Messages + 1,
-		LastToken: receipt.Token,
-		Checksum:  o.state.Checksum*1_315_423_911 + tokenHash(receipt.Token) + receipt.Sequence,
+		LastToken: token,
+		Checksum:  o.state.Checksum*1_315_423_911 + tokenHash(token) + o.state.Sequence + 1,
 	}
-	if err := compareChat(state, expectedState); err != nil {
-		return fmt.Errorf("chat handler diverged from truth model: %w", err)
-	}
-	o.state = expectedState
-	for _, ledger := range o.ledgers {
-		if ledger.active && !ledger.disconnecting {
-			ledger.expected = append(ledger.expected, receipt)
+	receipt := chatReceipt{Sequence: next.Sequence, Token: token}
+	for _, label := range labels {
+		ledger := o.ledgers[label]
+		if ledger == nil || !ledger.expecting {
+			return chatReceipt{}, fmt.Errorf("client %q is not active in the workload ledger", label)
 		}
 	}
+	o.state = next
+	for _, label := range labels {
+		o.ledgers[label].expected = append(o.ledgers[label].expected, receipt)
+	}
+	return receipt, nil
+}
+
+func (o *chatOracle) observeMessage(state chatState, receipt chatReceipt) error {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if err := compareChat(state, o.state); err != nil {
+		return fmt.Errorf("chat handler diverged from workload intent model: %w", err)
+	}
+	if receipt.Sequence != o.state.Sequence || receipt.Token != o.state.LastToken {
+		return fmt.Errorf("chat handler receipt=%#v want sequence=%d token=%q", receipt, o.state.Sequence, o.state.LastToken)
+	}
+	o.observedToken = receipt.Token
 	return nil
+}
+
+func (o *chatOracle) observed(token string) bool {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return o.observedToken == token
 }
 
 func (o *chatOracle) record(label string, receipt chatReceipt) error {
@@ -292,42 +329,26 @@ func newAlarmOracle() *alarmOracle {
 	return &alarmOracle{fired: make(chan string, 16)}
 }
 
-func (o *alarmOracle) onStart(state alarmState) error {
+func (o *alarmOracle) expectArm(nonce string) alarmState {
 	o.mu.Lock()
 	defer o.mu.Unlock()
-	want := o.state
-	want.Starts++
-	if err := compareAlarm(state, want); err != nil {
-		return fmt.Errorf("alarm OnStart diverged: %w", err)
-	}
-	o.state = want
-	return nil
+	o.state.Armed++
+	o.state.LastNonce = nonce
+	return o.state
 }
 
-func (o *alarmOracle) onArm(state alarmState, nonce string) error {
+func (o *alarmOracle) expectFire(nonce string) (alarmState, error) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
-	want := o.state
-	want.Armed++
-	want.LastNonce = nonce
-	if err := compareAlarm(state, want); err != nil {
-		return fmt.Errorf("alarm arm diverged: %w", err)
+	if o.state.Fired >= o.state.Armed {
+		return alarmState{}, fmt.Errorf("alarm fired nonce=%q without a pending arm", nonce)
 	}
-	o.state = want
-	return nil
-}
-
-func (o *alarmOracle) onFire(state alarmState) error {
-	o.mu.Lock()
-	defer o.mu.Unlock()
-	want := o.state
-	want.Fired++
-	want.LastFiredNonce = want.LastNonce
-	if err := compareAlarm(state, want); err != nil {
-		return fmt.Errorf("alarm fire diverged: %w", err)
+	if nonce != o.state.LastNonce {
+		return alarmState{}, fmt.Errorf("alarm fired nonce=%q want=%q", nonce, o.state.LastNonce)
 	}
-	o.state = want
-	return nil
+	o.state.Fired++
+	o.state.LastFiredNonce = nonce
+	return o.state, nil
 }
 
 func (o *alarmOracle) truth() alarmState {
