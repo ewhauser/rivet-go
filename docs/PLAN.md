@@ -192,15 +192,15 @@ returns a clear error at `rivet.Serve`.
 
 ## Milestones
 
-| # | Deliverable | Exit criterion | Est. |
-|---|---|---|---|
-| M0 | Skeleton: FFI crate builds against pinned rivet tag; purego loader loads it; `runner_version()` round-trip; CI matrix green | `go test ./internal/ffi` passes on all 6 targets | 1 wk |
-| M1 | Pump + registration: `runner_new` dials local engine, `ToServerInit` sent, runner visible to engine; poll/submit loop with correlation | Conformance: engine lists the runner | 1 wk |
-| M2 | Actor lifecycle: start/stop events → Go handlers; explicit state load/save via core; actor survives restart with state intact | Conformance: counter actor persists across engine restart | 1–2 wk |
-| M3 | Actions + HTTP tunnel: `http.Handler` bridge, request/response streaming | Conformance: client curl → actor action round-trip | 1–2 wk |
-| M4 | WebSockets + events: connection objects, broadcast, message acks | Conformance: two WS clients see each other's broadcasts | 1–2 wk |
-| M5 | Scheduling + sleep: alarms, sleep/wake, hibernating WS (`canHibernate`) | Conformance: alarm fires after actor slept; WS survives hibernation | 2 wk |
-| M6 | Production hardening: graceful drain, panic firewall, soak/chaos, metrics hooks, docs + examples | 24 h soak clean; README quickstart works from scratch | 2–3 wk |
+| # | Deliverable | Exit criterion | Est. | Status / review |
+|---|---|---|---|---|
+| M0 | Skeleton: FFI crate builds against pinned rivet tag; purego loader loads it; `runner_version()` round-trip; CI matrix green | `go test ./internal/ffi` passes on all 6 targets | 1 wk | Complete — [review](reviews/M0-REVIEW.md) |
+| M1 | Pump + registration: `runner_new` dials local engine, `ToServerInit` sent, runner visible to engine; poll/submit loop with correlation | Conformance: engine lists the runner | 1 wk | Complete — [review](reviews/M1-REVIEW.md) |
+| M2 | Actor lifecycle: start/stop events → Go handlers; explicit state load/save via core; actor survives restart with state intact | Conformance: counter actor persists across engine restart | 1–2 wk | Complete — [review](reviews/M2-REVIEW.md) |
+| M3 | Actions + HTTP tunnel: `http.Handler` bridge, request/response streaming | Conformance: client curl → actor action round-trip | 1–2 wk | Complete — [review](reviews/M3-REVIEW.md) |
+| M4 | WebSockets + events: connection objects, broadcast, message acks | Conformance: two WS clients see each other's broadcasts | 1–2 wk | Complete — [review](reviews/M4-REVIEW.md) |
+| M5 | Scheduling + sleep: alarms, sleep/wake, hibernating WS (`canHibernate`) | Conformance: alarm fires after actor slept; WS survives hibernation | 2 wk | Complete — [review](reviews/M5-REVIEW.md) |
+| M6 | Production hardening: graceful drain, panic firewall, soak/chaos, metrics hooks, docs + examples | Configurable strict soak harness; bounded 15-minute run clean; 24-hour release soak documented; README quickstart works from scratch | 2–3 wk | Complete — [review](reviews/M6-REVIEW.md) |
 
 Roughly 9–13 weeks solo to a production-ready v0. M0–M3 (~4–6 wk) is the
 demo-quality milestone and the point of maximum learning — reassess the
@@ -500,3 +500,42 @@ waits through the pin's 22-second envoy liveness
 window, demand-rehydrates once to make the pin reconcile its persisted core
 schedule after abrupt engine replacement, and resleeps without rescheduling
 before the alarm wake.
+
+## M6 production-hardening notes — 2026-08-03
+
+M6 keeps ABI 5 and the v2.3.10 engine pin. The native change is lifecycle-only:
+when process-level drain begins, core actor proxies mark the runner as draining
+and close raw gateway WebSockets with code 1001 and reason `runner shutting
+down`. Ordinary actor sleep still hibernates eligible sockets. Go stops
+accepting new work, lets already-admitted actor-serial handlers and their
+accepted persistence or scheduling operations finish within the configured
+deadline, waits for `RunnerStopped`, and then closes the native handle.
+
+`rivet.Serve` owns `SIGINT` and `SIGTERM`; context cancellation follows the
+same path. `Config.ShutdownTimeout` defaults to 10 seconds. `Config.Hooks`
+provides dependency-free counters, gauges, and duration observations, while
+`Config.Logger` accepts `log/slog` and defaults to discard. The FFI wrappers
+also expose process-local native runner, error, and buffer handle counts for
+the strict soak drain oracle; those counters do not change the wire contract.
+
+The M6 chaos harness sends all actor work through the real gateway. It runs
+counter actions, chat broadcasts, and alarm-driven sleep/wake while replacing
+the engine against the same data directory, dropping clients, stalling a live
+WebSocket, and panicking sacrificial actors. Field-by-field Go truth models,
+per-client ordered receipt ledgers, monotonic sequence checks, nonzero workload
+and chaos guards, and final goroutine/native-handle baselines make a vacuous or
+partially observed run fail. The command defaults to a two-minute smoke;
+[OPERATIONS.md](OPERATIONS.md) owns the 24-hour release runbook.
+
+The public README quickstart, `cmd/rivet-go-dev`, `examples/counter`, and
+`examples/chat` all use the exact pinned engine acquisition path shared by
+conformance. Real-subprocess conformance sends `SIGTERM` while an action and a
+WebSocket are live, proving action completion, code-1001 socket closure,
+runner disappearance from the engine, and exit status zero.
+
+M6 introduces no SDK or FFI MessagePack shape and therefore no new ABI decode
+surface. Its test/tooling-only decoders are bounded: the soak management and
+action clients decode local-engine JSON with capped response bodies, and its
+WebSocket clients decode the existing pinned CBOR actor-connect event envelope
+under a 1 MiB read limit. No fuzz case, deliberately malformed-input test, or
+raw binary-payload test was added.

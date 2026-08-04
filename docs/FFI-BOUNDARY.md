@@ -556,3 +556,29 @@ the 22-second disconnect/liveness interval, rehydrates the actor once, proves
 the core schedule and pre-restart state survived with no alarm delivery,
 resleeps without rescheduling, and then requires the original 60-second alarm
 to wake it. This is the recovery behavior verified at the pin.
+
+## M6 production-hardening notes — 2026-08-03
+
+M6 does not change the C ABI, the MessagePack envelope, or either catalog; ABI
+5 remains current. Process-level drain adds one native lifecycle state outside
+the serialized boundary. `rk_runner_shutdown` marks each actor proxy as runner
+draining before asking core to stop. A draining proxy closes every raw gateway
+WebSocket with code 1001 and reason `runner shutting down`, whereas an ordinary
+sleep continues to hibernate an eligible socket. This distinction prevents a
+dead Go process from leaving connection state that it can never resume.
+
+The Go pump continues polling during drain so admitted action, HTTP,
+WebSocket, alarm, state, and lifecycle completions can cross normally. New
+public work is rejected; commands needed by admitted work remain available.
+`RunnerStopped` is the terminal event and is required before the pump frees the
+runner handle. A non-graceful drain report is returned as an error.
+
+Native runner, error, and buffer ownership now has process-local accounting in
+the Go FFI wrappers. The strict soak compares all three counts with their
+pre-run baseline after the pump and engine drain. This is observability over
+the existing ownership rules, not another handle or wire format.
+
+There are no new SDK/FFI decode surfaces in M6. The soak and real-subprocess
+conformance tooling decode bounded management/action JSON plus the existing
+v2.3.10 CBOR actor-connect event envelope; these decoders do not cross the FFI
+boundary or change its allocation limits.
