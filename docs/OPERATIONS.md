@@ -85,12 +85,15 @@ go run ./cmd/soak \
 
 Record the printed seed and complete final summary with the release evidence.
 
-Known intermittent (2026-08-03, unresolved): one `-duration=2m -intensity=4`
-run exited 1 while the same command passed three sibling runs and the default
-smoke profile passed consistently; the failing run's output was not captured.
-Until reproduced with output, treat short non-default profiles as advisory and
-gate releases on the default smoke profile plus the 24-hour procedure. If a
-soak fails, preserve the printed summary and the failure data directory.
+Known intermittent (2026-08-03/04, unresolved): rare exit-1 soak failures —
+one `-duration=2m -intensity=4` run (2026-08-03) and one default-profile run
+(2026-08-04, post-hibernation-fix) — each passing on immediate rerun; roughly
+one failure in ten short runs. Neither failure's output was captured (both
+were piped through truncating filters — always redirect soak output to a
+file). Until a failure is reproduced with output, treat single short-run
+failures as retry-once, gate releases on the default profile passing plus the
+24-hour procedure, and preserve the printed summary and failure data
+directory from any failing run.
 The harness fails if any required chaos knob did not activate, if its Go truth
 model differs field-by-field from engine-persisted actor state, if any live
 client sees a missing or duplicate broadcast, if sequence values regress, or
