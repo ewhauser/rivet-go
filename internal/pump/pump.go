@@ -1211,6 +1211,14 @@ func (p *Pump) pollLoop(ctx context.Context) {
 				return
 			}
 			if event.Kind == wire.EventRunnerStopped {
+				if event.DrainReport == nil {
+					p.setResult(errors.New("RunnerStopped did not include a drain report"))
+				} else if !event.DrainReport.Graceful {
+					p.setResult(fmt.Errorf(
+						"runner drain exceeded its deadline with %d actors remaining",
+						event.DrainReport.ActorsRemaining,
+					))
+				}
 				p.log(slog.LevelInfo, "runner drain completed",
 					slog.Uint64("event_seq", batch.Seq),
 				)

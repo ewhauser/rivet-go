@@ -14,16 +14,12 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
-	"os"
-	"os/exec"
-	"path/filepath"
-	"runtime"
-	"strconv"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/ewhauser/rivet-go/internal/devengine"
 	"github.com/ewhauser/rivet-go/internal/ffi"
 	"github.com/ewhauser/rivet-go/internal/wire"
 	"github.com/ewhauser/rivet-go/rivet"
@@ -31,11 +27,8 @@ import (
 )
 
 const (
-	engineTag        = "v2.3.10"
-	engineVersion    = "2.3.10"
-	engineCommit     = "957d4e482f404913ca1955d8ecc357533f6fd081"
-	engineRepository = "https://github.com/rivet-dev/rivet.git"
-	startupBound     = 13 * time.Second
+	engineTag    = devengine.Tag
+	startupBound = 13 * time.Second
 	// rivet-envoy-client v2.3.10 declares a 20-second ping-health threshold;
 	// the adapter samples that status every 250 milliseconds.
 	disconnectLivenessWindow = 22 * time.Second
@@ -43,13 +36,9 @@ const (
 )
 
 type runningEngine struct {
-	binary    string
-	endpoint  string
-	command   *exec.Cmd
-	logFile   *os.File
-	logPath   string
-	storage   string
-	guardPort int
+	process  *devengine.Engine
+	endpoint string
+	storage  string
 }
 
 type envoyListResponse struct {
@@ -1386,83 +1375,20 @@ func TestPanickingActorDoesNotKillRunner(t *testing.T) {
 }
 
 func acquireEngine(ctx context.Context) (string, error) {
-	if override := os.Getenv("RIVET_GO_ENGINE_BIN"); override != "" {
-		return verifyEngineBinary(ctx, override)
-	}
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return "", fmt.Errorf("locate home directory: %w", err)
-	}
-	cache := filepath.Join(home, ".cache", "rivet-go", "engine-"+engineTag)
-	binary := filepath.Join(cache, executableName("rivet-engine"))
-	if path, err := verifyEngineBinary(ctx, binary); err == nil {
-		return path, nil
-	}
-	if err := os.MkdirAll(cache, 0o755); err != nil {
-		return "", fmt.Errorf("create engine cache: %w", err)
-	}
-
-	return buildPinnedEngine(ctx, cache)
-}
-
-func buildPinnedEngine(ctx context.Context, cache string) (string, error) {
-	source := filepath.Join(cache, "source")
-	if _, err := os.Stat(filepath.Join(source, ".git")); errors.Is(err, os.ErrNotExist) {
-		command := exec.CommandContext(ctx, "git", "clone", "--depth", "1", "--branch", engineTag, engineRepository, source)
-		if output, err := command.CombinedOutput(); err != nil {
-			return "", fmt.Errorf("clone pinned engine source: %w: %s", err, tail(output, 20))
-		}
-	} else if err != nil {
-		return "", fmt.Errorf("inspect cached engine source: %w", err)
-	}
-	commit, err := exec.CommandContext(ctx, "git", "-C", source, "rev-parse", "HEAD").Output()
-	if err != nil {
-		return "", fmt.Errorf("verify cached engine source: %w", err)
-	}
-	if got := strings.TrimSpace(string(commit)); got != engineCommit {
-		return "", fmt.Errorf("cached source is %s, want pinned commit %s; remove %s and retry", got, engineCommit, source)
-	}
-
-	target := filepath.Join(cache, "target")
-	command := exec.CommandContext(ctx, "cargo", "build", "--manifest-path", filepath.Join(source, "Cargo.toml"), "-p", "rivet-engine", "--release", "--target-dir", target)
-	logPath := filepath.Join(cache, "build.log")
-	logFile, err := os.Create(logPath)
-	if err != nil {
-		return "", fmt.Errorf("create engine build log: %w", err)
-	}
-	command.Stdout = logFile
-	command.Stderr = logFile
-	runErr := command.Run()
-	closeErr := logFile.Close()
-	if runErr != nil {
-		logData, _ := os.ReadFile(logPath)
-		return "", fmt.Errorf("build pinned engine: %w\nlast build output:\n%s", runErr, tail(logData, 40))
-	}
-	if closeErr != nil {
-		return "", fmt.Errorf("close engine build log: %w", closeErr)
-	}
-
-	built := filepath.Join(target, "release", executableName("rivet-engine"))
-	data, err := os.ReadFile(built)
-	if err != nil {
-		return "", fmt.Errorf("read built engine: %w", err)
-	}
-	destination := filepath.Join(cache, executableName("rivet-engine"))
-	if err := os.WriteFile(destination, data, 0o755); err != nil {
-		return "", fmt.Errorf("cache built engine: %w", err)
-	}
-	return verifyEngineBinary(ctx, destination)
+	return devengine.Acquire(ctx)
 }
 
 func startEngine(t *testing.T, binary string) *runningEngine {
 	t.Helper()
-	engine := &runningEngine{
-		binary:    binary,
-		guardPort: reservePortRange(t),
-		storage:   t.TempDir(),
+	port, err := devengine.ReservePortRange()
+	if err != nil {
+		t.Fatalf("reserve engine ports: %v", err)
 	}
-	engine.endpoint = fmt.Sprintf("http://127.0.0.1:%d", engine.guardPort)
-	engine.logPath = filepath.Join(engine.storage, "engine.log")
+	process, err := devengine.New(binary, t.TempDir(), port)
+	if err != nil {
+		t.Fatalf("configure engine: %v", err)
+	}
+	engine := &runningEngine{process: process, endpoint: process.Endpoint, storage: process.StorageDir}
 	engine.start(t)
 	t.Cleanup(func() { engine.stop() })
 	return engine
@@ -1470,68 +1396,16 @@ func startEngine(t *testing.T, binary string) *runningEngine {
 
 func (e *runningEngine) start(t *testing.T) {
 	t.Helper()
-	if e.command != nil {
-		t.Fatal("engine process is already running")
+	if err := e.process.Start(context.Background()); err != nil {
+		t.Fatalf("start engine %s: %v", e.process.Binary, err)
 	}
-	logFile, err := os.OpenFile(e.logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
-	if err != nil {
-		t.Fatalf("open engine log: %v", err)
-	}
-	command := exec.Command(e.binary, "start")
-	command.Env = append(os.Environ(),
-		"RIVET__GUARD__HOST=127.0.0.1",
-		"RIVET__GUARD__PORT="+strconv.Itoa(e.guardPort),
-		"RIVET__API_PEER__HOST=127.0.0.1",
-		"RIVET__API_PEER__PORT="+strconv.Itoa(e.guardPort+1),
-		"RIVET__METRICS__HOST=127.0.0.1",
-		"RIVET__METRICS__PORT="+strconv.Itoa(e.guardPort+10),
-		"RIVET__FILE_SYSTEM__PATH="+filepath.Join(e.storage, "db"),
-	)
-	command.Stdout = logFile
-	command.Stderr = logFile
-	if err := command.Start(); err != nil {
-		_ = logFile.Close()
-		t.Fatalf("start engine %s: %v", e.binary, err)
-	}
-	e.command = command
-	e.logFile = logFile
-
-	eventually(t, 20*time.Second, func() (bool, error) {
-		response, err := http.Get(e.endpoint + "/health")
-		if err != nil {
-			return false, fmt.Errorf("engine health request: %w\nlast engine output:\n%s", err, readLogTail(e.logPath))
-		}
-		defer response.Body.Close()
-		if response.StatusCode != http.StatusOK {
-			return false, fmt.Errorf("engine health returned %s\nlast engine output:\n%s", response.Status, readLogTail(e.logPath))
-		}
-		return true, nil
-	})
 }
 
 func (e *runningEngine) kill(t *testing.T) {
 	t.Helper()
-	if e.command == nil {
-		return
+	if err := e.process.Kill(); err != nil {
+		t.Fatalf("kill engine: %v", err)
 	}
-	if e.command.Process != nil {
-		if err := e.command.Process.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
-			t.Fatalf("kill engine: %v", err)
-		}
-	}
-	if err := e.command.Wait(); err != nil {
-		var exitError *exec.ExitError
-		if !errors.As(err, &exitError) {
-			t.Fatalf("wait for killed engine: %v", err)
-		}
-	}
-	if e.logFile != nil {
-		if err := e.logFile.Close(); err != nil {
-			t.Fatalf("close engine log: %v", err)
-		}
-	}
-	e.command = nil
-	e.logFile = nil
 }
 
 func (e *runningEngine) restart(t *testing.T) {
@@ -1541,18 +1415,7 @@ func (e *runningEngine) restart(t *testing.T) {
 }
 
 func (e *runningEngine) stop() {
-	if e.command == nil {
-		return
-	}
-	if e.command.Process != nil {
-		_ = e.command.Process.Kill()
-	}
-	_ = e.command.Wait()
-	if e.logFile != nil {
-		_ = e.logFile.Close()
-	}
-	e.command = nil
-	e.logFile = nil
+	_ = e.process.Kill()
 }
 
 func listEnvoys(endpoint, runnerName string) ([]envoyRecord, error) {
@@ -1942,77 +1805,6 @@ func eventually(t *testing.T, timeout time.Duration, check func() (bool, error))
 	t.Fatalf("condition did not become true within %s", timeout)
 }
 
-func reservePortRange(t *testing.T) int {
-	t.Helper()
-	for attempt := 0; attempt < 100; attempt++ {
-		listener, err := net.Listen("tcp", "127.0.0.1:0")
-		if err != nil {
-			t.Fatalf("reserve engine port: %v", err)
-		}
-		port := listener.Addr().(*net.TCPAddr).Port
-		_ = listener.Close()
-		if port > 1024 && port < 65525 && portsAvailable(port, port+1, port+10) {
-			return port
-		}
-	}
-	t.Fatal("could not find three available engine ports")
-	return 0
-}
-
-func portsAvailable(ports ...int) bool {
-	listeners := make([]net.Listener, 0, len(ports))
-	defer func() {
-		for _, listener := range listeners {
-			_ = listener.Close()
-		}
-	}()
-	for _, port := range ports {
-		listener, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", port))
-		if err != nil {
-			return false
-		}
-		listeners = append(listeners, listener)
-	}
-	return true
-}
-
-func verifyExecutable(path string) (string, error) {
-	info, err := os.Stat(path)
-	if err != nil {
-		return "", err
-	}
-	if !info.Mode().IsRegular() {
-		return "", fmt.Errorf("%s is not a regular file", path)
-	}
-	if runtime.GOOS != "windows" && info.Mode().Perm()&0o111 == 0 {
-		return "", fmt.Errorf("%s is not executable", path)
-	}
-	return path, nil
-}
-
-func executableName(name string) string {
-	if runtime.GOOS == "windows" {
-		return name + ".exe"
-	}
-	return name
-}
-
-func readLogTail(path string) string {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return err.Error()
-	}
-	return tail(data, 60)
-}
-
-func tail(data []byte, lines int) string {
-	parts := strings.Split(string(data), "\n")
-	if len(parts) > lines {
-		parts = parts[len(parts)-lines:]
-	}
-	return strings.Join(parts, "\n")
-}
-
 func engineRemediation() string {
 	return "Set RIVET_GO_ENGINE_BIN to a v2.3.10 rivet-engine binary, or install git + Rust and retry. " +
 		"The automatic fallback clones tag v2.3.10 and runs `cargo build -p rivet-engine --release`; see conformance/README.md."
@@ -2223,25 +2015,4 @@ func nativeErrorCode(err error) string {
 		return payload.Code
 	}
 	return ""
-}
-
-// verifyEngineBinary checks that path is executable and reports exactly the
-// pinned engine version and commit.
-func verifyEngineBinary(ctx context.Context, path string) (string, error) {
-	path, err := verifyExecutable(path)
-	if err != nil {
-		return "", err
-	}
-	output, err := exec.CommandContext(ctx, path, "--version").CombinedOutput()
-	if err != nil {
-		return "", fmt.Errorf("%s --version: %w: %s", path, err, tail(output, 5))
-	}
-	text := string(output)
-	if !strings.Contains(text, engineVersion) {
-		return "", fmt.Errorf("%s reports %q, want version %s", path, strings.TrimSpace(text), engineVersion)
-	}
-	if !strings.Contains(text, engineCommit) {
-		return "", fmt.Errorf("%s reports %q, want commit %s", path, strings.TrimSpace(text), engineCommit)
-	}
-	return path, nil
 }

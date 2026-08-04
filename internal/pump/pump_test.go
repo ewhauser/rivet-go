@@ -248,6 +248,30 @@ func TestDispatchesRunnerStoppedBeforeClosingSubscription(t *testing.T) {
 	}
 }
 
+func TestNonGracefulDrainReturnsAnError(t *testing.T) {
+	defer goleak.VerifyNone(t)
+	runner := newFakeRunner()
+	p := New(runner)
+	result := make(chan error, 1)
+	go func() { result <- p.Run(context.Background()) }()
+	waitPumpStarted(t, p)
+	runner.emit(wire.Event{
+		Kind: wire.EventRunnerStopped,
+		DrainReport: &wire.DrainReport{
+			Graceful:        false,
+			ActorsRemaining: 2,
+		},
+	})
+	select {
+	case err := <-result:
+		if err == nil || !strings.Contains(err.Error(), "2 actors remaining") {
+			t.Fatalf("non-graceful drain error = %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("pump did not return after non-graceful RunnerStopped")
+	}
+}
+
 func TestRunRejectsSecondStart(t *testing.T) {
 	runner := newFakeRunner()
 	p := New(runner)
