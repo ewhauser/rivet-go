@@ -1,2 +1,7 @@
 /target/
 /.rivet-go/
+/bench/.bin/
+/bench/results/
+/bench/runner-rust/target/
+/bench/runner-ts/dist/
+/bench/runner-ts/node_modules/
