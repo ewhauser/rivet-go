@@ -562,10 +562,12 @@ to wake it. This is the recovery behavior verified at the pin.
 M6 does not change the C ABI, the MessagePack envelope, or either catalog; ABI
 5 remains current. Process-level drain adds one native lifecycle state outside
 the serialized boundary. `rk_runner_shutdown` marks each actor proxy as runner
-draining before asking core to stop. A draining proxy closes every raw gateway
-WebSocket with code 1001 and reason `runner shutting down`, whereas an ordinary
-sleep continues to hibernate an eligible socket. This distinction prevents a
-dead Go process from leaving connection state that it can never resume.
+draining and closes every raw gateway WebSocket with code 1001 and reason
+`runner shutting down` before asking core to stop. Closing while core's
+transport remains live also makes the code-1001 policy hold on the forced
+deadline path. An ordinary sleep continues to hibernate an eligible socket.
+This distinction prevents a dead Go process from leaving connection state that
+it can never resume.
 
 The Go pump continues polling during drain so admitted action, HTTP,
 WebSocket, alarm, state, and lifecycle completions can cross normally. New

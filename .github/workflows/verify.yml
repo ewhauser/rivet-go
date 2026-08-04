@@ -129,3 +129,29 @@ jobs:
 
       - name: Run real-engine conformance
         run: go test -race -count=1 -v ./...
+
+  soak-smoke:
+    name: linux-amd64-soak-smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install 1.97.0 --profile minimal
+          rustup default 1.97.0
+
+      - name: Cache pinned engine
+        uses: actions/cache@v5
+        with:
+          path: ~/.cache/rivet-go/engine-v2.3.10
+          key: rivet-engine-v2.3.10-${{ runner.os }}-${{ runner.arch }}-957d4e482f404913ca1955d8ecc357533f6fd081
+
+      - name: Run strict chaos smoke
+        run: go run ./cmd/soak

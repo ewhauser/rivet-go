@@ -10,17 +10,22 @@ to `Registry.Serve` follows the same path. The default graceful deadline is 10
 seconds and can be changed with `Config.ShutdownTimeout`.
 
 Once drain begins, new public submissions are rejected while commands needed
-by already-admitted handlers remain available. Actions, alarms, HTTP handlers,
-and WebSocket handlers finish in actor-serial order. Accepted state and alarm
-operations are fenced before `ActorStopResult`. Raw gateway WebSockets close
-with code 1001 and reason `runner shutting down`; ordinary actor sleep still
-hibernates eligible sockets. The native runner then emits `RunnerStopped`, the
-pump closes its handle, and a clean drain returns nil so `main` exits with code
-zero.
+by already-admitted handlers remain available. Actions, alarms, and HTTP
+handlers that already started finish in actor-serial order when they fit inside
+the deadline; their accepted state and alarm operations are fenced before
+`ActorStopResult`. Raw gateway WebSockets close immediately with code 1001 and
+reason `runner shutting down` while core's transport is still able to deliver
+the close frame. An already-admitted WebSocket handler may finish internally,
+but the terminating process does not keep the client transport open for a late
+reply. Ordinary actor sleep still hibernates eligible sockets. The native
+runner then emits `RunnerStopped`, the pump closes its handle, and a clean drain
+returns nil so `main` exits with code zero.
 
 If the deadline expires, core aborts the remaining runtime work and reports a
-non-graceful drain. Treat that as a production incident even when the process
-must continue exiting.
+non-graceful drain. In-flight action and HTTP clients must not observe success,
+raw WebSockets have already received 1001, `Registry.Serve` returns an error,
+and the runnable examples exit with code 1. Treat that forced path as a
+production incident even when the process must continue exiting.
 
 ## Metrics and logging
 
@@ -46,12 +51,14 @@ Stable metric names are exported as `rivet.Metric*` constants:
 | Counter | `actor_panics_total` | recovered user-hook panics |
 | Gauge | `live_actors` | actor workers currently owned by the pump |
 | Gauge | `live_connections` | raw WebSockets currently owned by the pump |
-| Duration | `poll_latency` | wall time of each blocking native poll |
+| Duration | `poll_latency` | wall time of event-bearing native polls; intentional empty timeout polls are excluded |
 
-Hooks run synchronously, must return quickly, and must be safe for concurrent
-use. A hook panic is recovered and logged; it does not stop the runner. The
-counter example's `-metrics-address` option is a complete `expvar`
-implementation.
+Hooks are serialized on a dedicated dispatcher outside pump state locks and
+the poll, submit, and actor goroutines. A hook may call back into the SDK, and a
+briefly blocking hook does not stall event or command progress. Hooks should
+still return quickly because the dispatcher queue is drained during shutdown.
+A hook panic is recovered and logged; it does not stop the runner. The counter
+example's `-metrics-address` option is a complete `expvar` implementation.
 
 Set `Config.Logger` to a configured `*slog.Logger` for Go-side lifecycle,
 disconnect, drain, actor, panic, and leak-backstop records. Nil discards these
@@ -86,6 +93,13 @@ directory, mid-stream client disconnect, sleep/wake churn, a stalled WebSocket
 client, and a sacrificial action panic. A successful duration alone is not a
 pass.
 
+The seed is printed before engine startup and selects deterministic counter
+value streams and per-producer intent sequences. Reusing the seed and flags
+replays those streams and the fixed chaos cadence. A default temporary data
+directory is printed and preserved on failure, with the engine log path, but
+removed after a successful run. An explicit `-data-dir` is always left under
+the operator's ownership.
+
 For a failed run:
 
 1. Preserve the seed, command line, summary, and engine log path.
@@ -101,8 +115,11 @@ Engine upgrades are deliberate and never happen through a floating Cargo or
 download dependency.
 
 1. Choose one stable Rivet tag and record its full commit in
-   `docs/PINNED-VERSION.md`, `internal/devengine`, the FFI Cargo dependency,
-   conformance documentation, and user-facing limitations.
+   `docs/PINNED-VERSION.md`, `Cargo.toml` and `Cargo.lock`,
+   `internal/devengine/devengine.go`, `README.md`, conformance documentation,
+   and user-facing limitations. Update both pinned-engine cache paths and keys
+   in `.github/workflows/verify.yml`. A repository-wide search for the old tag
+   and full commit must return only intentionally retained historical reviews.
 2. Read upstream core, envoy, gateway, storage, alarm, and WebSocket changes.
    Update `docs/FFI-BOUNDARY.md` before changing the boundary. Bump the ABI for
    any event, command, or configuration shape change.
@@ -142,6 +159,9 @@ download dependency.
 
 ## Known v2.3.10 limitations
 
+The following 12 bullets are the grouped, complete deviation summary for the
+M1-M6 pin-specific notes in `docs/FFI-BOUNDARY.md`:
+
 - Core calls runner registration an envoy and exposes it through `/envoys`.
   The public SDK deliberately retains runner vocabulary.
 - `TotalSlots` is validated and retained at the stable boundary, but this core
@@ -153,9 +173,12 @@ download dependency.
   needs an atomic-write SQLite build and is not shipped.
 - Gateway JSON action arguments are normalized to CBOR by core. `RawAction`
   therefore exposes the exact CBOR argument array, not original JSON bytes.
+  Actions use the pin's 60-second cooperative deadline; Go cannot preempt a
+  handler that ignores its context.
 - HTTP requests and responses are buffered by core. There is no `Flusher`, a
   peer socket abort is not visible to the handler, headers have one value per
-  name, and multiple response `Set-Cookie` values cannot cross the boundary.
+  name, at most 256 names and 1 MiB per name/value cross the boundary, and
+  multiple response `Set-Cookie` values cannot be represented.
 - Raw WebSocket frames and individual boundary blobs are capped at 1 MiB. The
   SDK's 64-command per-connection admission queue can isolate a stalled peer,
   but core's later envoy queue exposes no buffered-byte gauge.
@@ -164,11 +187,20 @@ download dependency.
 - One durable Go alarm exists per actor. Alarm mutation completion includes a
   four-second pinned transport settlement; the engine workflow worker polls on
   a 16-second tick, so alarm delivery is not a low-latency timer guarantee.
+- A hibernatable WebSocket message holds the native callback until Go returns
+  its FIFO acknowledgement, with a 60-second bound. Frames accepted in the
+  sleep-intent gap finish on the old generation; later frames wake the new
+  generation. Hibernation itself suppresses `OnDisconnect`.
 - After abrupt engine replacement, an already-sleeping actor may need one
   demand rehydration to reconcile its persisted alarm. A client that vanished
   while fully asleep may be pruned before Go observes `OnDisconnect`.
 - Process-level runner drain intentionally closes raw WebSockets instead of
   hibernating them: no Go process remains to resume their connection state.
+
+One additional architecture constraint is not pin-specific: every runner has a
+single blocking poller pinned to one OS thread. Submission and user hooks do
+not run on that thread, but event decoding and dispatch remain single-poller by
+design.
 
 ## Tracked follow-ups
 

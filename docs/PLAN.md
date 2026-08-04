@@ -218,6 +218,20 @@ approach there.
 | Rivet pivots the runner model (e.g. ships official polyglot FFI or WASI component) | Medium | That's a win, not a loss — L2–L3 survive a backend swap; keep the pure-Go wire fallback documented |
 | tokio inside dlopen'd lib + Go runtime coexistence (signals, TLS) | Medium | tokio confined to its own threads; no signal handlers in FFI crate; validated in M0 on all platforms |
 
+### Remaining production limitations
+
+- Hibernatable messages have a 60-second acknowledgement bound, frames in the
+  sleep-intent gap finish on the old generation, and the pin may hide a client
+  close that occurs while the actor is fully asleep.
+- HTTP headers are limited to 256 names and 1 MiB per name/value; the pinned
+  core carries one value per name and buffers complete requests and responses.
+- Alarm mutation completion includes the pin-specific four-second transport
+  fence, and the engine's 16-second workflow tick prevents low-latency timing
+  guarantees.
+- Each runner uses one blocking, OS-thread-pinned poller. Submissions and
+  operability hooks run elsewhere, but event decoding and dispatch are
+  intentionally single-poller.
+
 ## Upstream engagement (start immediately)
 
 1. Open a discussion in rivet-dev/rivet: intent to build a Go runner via an
@@ -521,10 +535,13 @@ the strict soak drain oracle; those counters do not change the wire contract.
 The M6 chaos harness sends all actor work through the real gateway. It runs
 counter actions, chat broadcasts, and alarm-driven sleep/wake while replacing
 the engine against the same data directory, dropping clients, stalling a live
-WebSocket, and panicking sacrificial actors. Field-by-field Go truth models,
-per-client ordered receipt ledgers, monotonic sequence checks, nonzero workload
+WebSocket, and panicking sacrificial actors. Field-by-field Go truth models
+advance from the workload generator's intents rather than actor callbacks.
+Per-client ordered receipt ledgers, monotonic sequence checks, nonzero workload
 and chaos guards, and final goroutine/native-handle baselines make a vacuous or
-partially observed run fail. The command defaults to a two-minute smoke;
+partially observed run fail. Seeds and temporary data/log paths are printed
+before work; failed runs preserve data while successful default runs remove it.
+The command defaults to a two-minute CI smoke;
 [OPERATIONS.md](OPERATIONS.md) owns the 24-hour release runbook.
 
 The public README quickstart, `cmd/rivet-go-dev`, `examples/counter`, and

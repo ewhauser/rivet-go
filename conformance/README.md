@@ -100,10 +100,14 @@ rescheduling before requiring the engine wake.
 `TestRunnableExamplesAndSIGTERMDrain` compiles `examples/counter` and
 `examples/chat` as real subprocesses. The counter is called through the
 gateway before receiving `SIGTERM`. The chat subprocess receives `SIGTERM`
-with a raw WebSocket open and a 1.5-second action already running. The test
-requires the action to finish, the socket to close with code 1001 and reason
-`runner shutting down`, the engine management API to stop listing the runner,
-and both example processes to exit with status zero.
+with a raw WebSocket open plus a 1.5-second action and a 1.5-second HTTP request
+already running on separate actors. The test requires both requests to finish,
+the socket to close with code 1001 and reason `runner shutting down`, the
+engine management API to stop listing the runner, and both example processes
+to exit with status zero. A second chat subprocess uses a 200-millisecond
+deadline and proves the forced path: action and HTTP do not report success,
+the socket still receives 1001, the runner disappears, and the process exits
+with code 1.
 
 The soak is intentionally separate from `go test`: `cmd/soak` owns its engine,
 runner, gateway clients, chaos schedule, strict truth models, and final leak
