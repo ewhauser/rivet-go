@@ -7,6 +7,7 @@ import (
 	"net/http"
 	_ "net/http/pprof"
 	"os"
+	"sync"
 	"time"
 
 	"github.com/ewhauser/rivet-go/rivet"
@@ -18,6 +19,52 @@ type counterState struct {
 }
 
 type echoState struct{}
+
+type pumpStats struct {
+	mu       sync.Mutex
+	counters map[string]int64
+}
+
+func newPumpStats() *pumpStats {
+	return &pumpStats{counters: make(map[string]int64)}
+}
+
+func (s *pumpStats) Counter(name string, delta int64) {
+	s.mu.Lock()
+	s.counters[name] += delta
+	s.mu.Unlock()
+}
+
+func (*pumpStats) Gauge(string, int64) {}
+
+func (*pumpStats) ObserveDuration(string, time.Duration) {}
+
+func (s *pumpStats) report() {
+	s.mu.Lock()
+	commands := s.counters[rivet.MetricCommandsSubmitted]
+	batches := s.counters[rivet.MetricSubmitBatches]
+	events := s.counters[rivet.MetricEventsPolled]
+	eventBatches := s.counters[rivet.MetricEventBatches]
+	s.mu.Unlock()
+	commandAverage := 0.0
+	if batches != 0 {
+		commandAverage = float64(commands) / float64(batches)
+	}
+	eventAverage := 0.0
+	if eventBatches != 0 {
+		eventAverage = float64(events) / float64(eventBatches)
+	}
+	fmt.Fprintf(
+		os.Stderr,
+		"pump stats: events=%d event_batches=%d events_per_batch=%.3f commands=%d submit_batches=%d commands_per_batch=%.3f\n",
+		events,
+		eventBatches,
+		eventAverage,
+		commands,
+		batches,
+		commandAverage,
+	)
+}
 
 func main() {
 	if err := run(); err != nil {
@@ -80,6 +127,14 @@ func run() error {
 		return err
 	}
 
+	var hooks rivet.Hooks
+	var stats *pumpStats
+	if os.Getenv("BENCH_PUMP_STATS") != "" {
+		stats = newPumpStats()
+		hooks = stats
+		defer stats.report()
+	}
+
 	return registry.Serve(context.Background(), rivet.Config{
 		Endpoint:        endpoint,
 		Namespace:       "default",
@@ -89,6 +144,7 @@ func run() error {
 		LogLevel:        "error",
 		Logger:          slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError})),
 		ShutdownTimeout: 10 * time.Second,
+		Hooks:           hooks,
 	})
 }
 

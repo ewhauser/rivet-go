@@ -340,7 +340,11 @@ fn runner_thread(
     correlations: CorrelationTable,
 ) {
     let runtime = match Builder::new_multi_thread()
-        .worker_threads(2)
+        // Hibernatable WebSocket callbacks use block_in_place while they wait
+        // for the exact Go acknowledgement. Tokio supplies a replacement
+        // worker for that interval; a second permanent worker only adds
+        // scheduler contention on the command/ack path.
+        .worker_threads(1)
         .enable_all()
         .thread_name("rivet-go-tokio")
         .build()

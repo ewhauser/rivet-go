@@ -15,7 +15,9 @@ type Hooks interface {
 // Stable metric names emitted through Hooks.
 const (
 	MetricEventsPolled      = "events_polled_total"
+	MetricEventBatches      = "event_batches_polled_total"
 	MetricCommandsSubmitted = "commands_submitted_total"
+	MetricSubmitBatches     = "submit_batches_total"
 	MetricBackpressureHits  = "backpressure_hits_total"
 	MetricActorStarts       = "actor_starts_total"
 	MetricActorStops        = "actor_stops_total"

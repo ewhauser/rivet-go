@@ -39,7 +39,9 @@ var (
 
 const (
 	metricEventsPolled      = "events_polled_total"
+	metricEventBatches      = "event_batches_polled_total"
 	metricCommandsSubmitted = "commands_submitted_total"
+	metricSubmitBatches     = "submit_batches_total"
 	metricBackpressureHits  = "backpressure_hits_total"
 	metricActorStarts       = "actor_starts_total"
 	metricActorStops        = "actor_stops_total"
@@ -1195,6 +1197,7 @@ func (p *Pump) pollLoop(ctx context.Context) {
 		if len(batch.Events) != 0 {
 			// Empty batches are the intentional poll timeout, not event latency.
 			p.observeDuration(metricPollLatency, time.Since(pollStarted))
+			p.counter(metricEventBatches, 1)
 		}
 		if p.seenSeq && batch.Seq <= p.lastSeq {
 			p.setResult(fmt.Errorf(
@@ -1258,6 +1261,7 @@ func (p *Pump) submitLoop() {
 				err = p.runner.Submit(encoded)
 			}
 			if err == nil {
+				p.counter(metricSubmitBatches, 1)
 				p.counter(metricCommandsSubmitted, int64(len(commands)))
 			} else if errorCode(err) == "backpressure" {
 				p.counter(metricBackpressureHits, 1)
