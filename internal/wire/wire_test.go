@@ -62,6 +62,7 @@ func TestRustEventBatchGoldens(t *testing.T) {
 		{"event_actor_start.msgpack", EventActorStart, 4},
 		{"event_actor_stop.msgpack", EventActorStop, 5},
 		{"event_actor_alarm.msgpack", EventActorAlarm, 17},
+		{"event_actor_intent_result.msgpack", EventActorIntentResult, 18},
 		{"event_kv_result.msgpack", EventKVResult, 6},
 		{"event_state_persisted.msgpack", EventStatePersisted, 7},
 		{"event_action_call.msgpack", EventActionCall, 10},
@@ -117,11 +118,18 @@ func TestRustM5CommandBatchGolden(t *testing.T) {
 	if batch.Commands[0].Generation != 8 {
 		t.Fatalf("alarm handled generation = %d, want 8", batch.Commands[0].Generation)
 	}
+	if batch.Commands[1].OperationID != 41 || batch.Commands[1].Generation != 8 {
+		t.Fatalf("set alarm identity = %#v", batch.Commands[1])
+	}
 	if batch.Commands[1].AlarmTS == nil || *batch.Commands[1].AlarmTS != 1_788_500_000_000 {
 		t.Fatalf("set alarm command = %#v", batch.Commands[1])
 	}
 	if batch.Commands[2].AlarmTS != nil {
 		t.Fatalf("clear alarm command = %#v", batch.Commands[2])
+	}
+	if batch.Commands[2].OperationID != 42 || batch.Commands[3].OperationID != 43 ||
+		batch.Commands[3].Generation != 8 {
+		t.Fatalf("M5 intent identities = %#v", batch.Commands)
 	}
 	encoded, err := EncodeCommandBatch(batch)
 	if err != nil {

@@ -398,10 +398,13 @@ func TestActorStopWaitsForCleanupAndPreservesActorOrder(t *testing.T) {
 
 func TestActorAlarmIsOrderedAndAcknowledged(t *testing.T) {
 	runner := newFakeRunner()
-	seen := make(chan string, 2)
+	actionStarted := make(chan struct{})
+	actionRelease := make(chan struct{})
+	seen := make(chan string, 1)
 	handler := dispatchHandler{
 		action: func(context.Context, *ActorSession, wire.Event, any) ([]byte, error) {
-			seen <- "action"
+			close(actionStarted)
+			<-actionRelease
 			return []byte("done"), nil
 		},
 		alarm: func(_ context.Context, _ *ActorSession, event wire.Event, _ any) error {
@@ -431,14 +434,22 @@ func TestActorAlarmIsOrderedAndAcknowledged(t *testing.T) {
 			AlarmTS: 1_788_500_000_000,
 		},
 	)
-	if got := <-seen; got != "action" {
-		t.Fatalf("first callback = %q, want action", got)
+	select {
+	case <-actionStarted:
+	case <-time.After(time.Second):
+		t.Fatal("long action did not start")
 	}
-	if got := <-seen; got != "alarm:1788500000000" {
-		t.Fatalf("second callback = %q, want alarm", got)
+	select {
+	case got := <-seen:
+		t.Fatalf("alarm ran while action was active: %q", got)
+	default:
 	}
+	close(actionRelease)
 	if command := nextCommand(t, runner); command.Kind != wire.CommandActionResult {
 		t.Fatalf("action command = %#v", command)
+	}
+	if got := <-seen; got != "alarm:1788500000000" {
+		t.Fatalf("serialized callback = %q, want alarm", got)
 	}
 	if command := nextCommand(t, runner); command.Kind != wire.CommandAlarmHandled ||
 		command.AID != "scheduled-aid" || command.Generation != 2 || command.Error != nil {
@@ -448,6 +459,186 @@ func TestActorAlarmIsOrderedAndAcknowledged(t *testing.T) {
 	cancel()
 	if err := <-result; err != nil {
 		t.Fatalf("Run: %v", err)
+	}
+}
+
+func TestActorWithoutOnAlarmReturnsStructuredError(t *testing.T) {
+	runner := newFakeRunner()
+	p := NewWithHandlers(runner, map[string]ActorHandler{"no-alarm": lifecycleHandler{}})
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() { result <- p.Run(ctx) }()
+	waitPumpStarted(t, p)
+
+	runner.emit(wire.Event{
+		Kind: wire.EventActorStart, AID: "no-alarm-aid", Generation: 3, Name: "no-alarm",
+	})
+	if command := nextCommand(t, runner); command.Kind != wire.CommandActorStartResult {
+		t.Fatalf("start command = %#v", command)
+	}
+	runner.emit(wire.Event{
+		Kind: wire.EventActorAlarm, AID: "no-alarm-aid", Generation: 3, AlarmTS: 1_788_500_000_000,
+	})
+	command := nextCommand(t, runner)
+	if command.Kind != wire.CommandAlarmHandled || command.Error == nil ||
+		command.Error.Code != "callback_not_found" {
+		t.Fatalf("alarm command = %#v, want structured callback_not_found", command)
+	}
+
+	cancel()
+	if err := <-result; err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+}
+
+func TestActorIntentsAreGenerationFencedAndWaitForCompletion(t *testing.T) {
+	runner := newFakeRunner()
+	sessions := make(chan *ActorSession, 1)
+	handler := lifecycleHandler{start: func(
+		_ context.Context,
+		session *ActorSession,
+		_ wire.Event,
+	) (any, error) {
+		sessions <- session
+		return nil, nil
+	}}
+	p := NewWithHandlers(runner, map[string]ActorHandler{"intent": handler})
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() { result <- p.Run(ctx) }()
+	waitPumpStarted(t, p)
+
+	runner.emit(wire.Event{
+		Kind: wire.EventActorStart, AID: "intent-aid", Generation: 9, Name: "intent",
+	})
+	if command := nextCommand(t, runner); command.Kind != wire.CommandActorStartResult {
+		t.Fatalf("start command = %#v", command)
+	}
+	session := <-sessions
+	alarmTS := int64(1_788_500_000_000)
+	alarmResult := make(chan error, 1)
+	go func() { alarmResult <- session.SetAlarm(&alarmTS) }()
+	alarmCommand := nextCommand(t, runner)
+	if alarmCommand.Kind != wire.CommandSetAlarm || alarmCommand.AID != "intent-aid" ||
+		alarmCommand.Generation != 9 || alarmCommand.OperationID == 0 {
+		t.Fatalf("set alarm command = %#v", alarmCommand)
+	}
+	select {
+	case err := <-alarmResult:
+		t.Fatalf("SetAlarm returned before native completion: %v", err)
+	default:
+	}
+	runner.emit(wire.Event{
+		Kind: wire.EventActorIntentResult, OperationID: alarmCommand.OperationID,
+	})
+	if err := <-alarmResult; err != nil {
+		t.Fatalf("SetAlarm: %v", err)
+	}
+
+	sleepResult := make(chan error, 1)
+	go func() { sleepResult <- session.Sleep() }()
+	sleepCommand := nextCommand(t, runner)
+	if sleepCommand.Kind != wire.CommandSleepIntent || sleepCommand.AID != "intent-aid" ||
+		sleepCommand.Generation != 9 || sleepCommand.OperationID == 0 {
+		t.Fatalf("sleep command = %#v", sleepCommand)
+	}
+	runner.emit(wire.Event{
+		Kind: wire.EventActorIntentResult, OperationID: sleepCommand.OperationID,
+		Error: &wire.WireError{Code: "sleep_intent_failed", Message: "core rejected sleep"},
+	})
+	intentErr := <-sleepResult
+	var structured HandlerError
+	if !errors.As(intentErr, &structured) || structured.Code != "sleep_intent_failed" ||
+		structured.Message != "core rejected sleep" {
+		t.Fatalf("Sleep error = %#v, want native structured sleep_intent_failed", intentErr)
+	}
+
+	cancel()
+	if err := <-result; err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+}
+
+func TestLateActorIntentCompletionCannotResolveAReusedID(t *testing.T) {
+	p := New(newFakeRunner())
+	p.nextIntentID.Store(^uint64(0))
+	abandoned := make(chan wire.Event, 1)
+	abandonedID := p.addActorIntentWaiter(abandoned)
+	if abandonedID != 1 {
+		t.Fatalf("wrapped operation ID = %d, want 1", abandonedID)
+	}
+	p.abandonActorIntentWaiter(abandonedID)
+
+	p.nextIntentID.Store(^uint64(0))
+	live := make(chan wire.Event, 1)
+	liveID := p.addActorIntentWaiter(live)
+	if liveID != 2 {
+		t.Fatalf("operation ID after tombstone = %d, want 2", liveID)
+	}
+	if err := p.handleInternalEvent(wire.Event{
+		Kind: wire.EventActorIntentResult, OperationID: abandonedID,
+	}); err != nil {
+		t.Fatalf("handle late completion: %v", err)
+	}
+	select {
+	case event := <-live:
+		t.Fatalf("late completion resolved live waiter: %#v", event)
+	default:
+	}
+	if err := p.handleInternalEvent(wire.Event{
+		Kind: wire.EventActorIntentResult, OperationID: liveID,
+	}); err != nil {
+		t.Fatalf("handle live completion: %v", err)
+	}
+	select {
+	case event := <-live:
+		if event.OperationID != liveID {
+			t.Fatalf("live completion = %#v", event)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("live waiter did not receive its completion")
+	}
+}
+
+func TestRunnerShutdownRacingSleepIntentIsDeterministic(t *testing.T) {
+	runner := newFakeRunner()
+	sessions := make(chan *ActorSession, 1)
+	handler := lifecycleHandler{start: func(
+		_ context.Context,
+		session *ActorSession,
+		_ wire.Event,
+	) (any, error) {
+		sessions <- session
+		return nil, nil
+	}}
+	p := NewWithHandlers(runner, map[string]ActorHandler{"sleep-race": handler})
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() { result <- p.Run(ctx) }()
+	waitPumpStarted(t, p)
+	runner.emit(wire.Event{
+		Kind: wire.EventActorStart, AID: "sleep-race-aid", Generation: 6, Name: "sleep-race",
+	})
+	if command := nextCommand(t, runner); command.Kind != wire.CommandActorStartResult {
+		t.Fatalf("start command = %#v", command)
+	}
+	session := <-sessions
+	sleepResult := make(chan error, 1)
+	go func() { sleepResult <- session.Sleep() }()
+	sleepCommand := nextCommand(t, runner)
+	if sleepCommand.Kind != wire.CommandSleepIntent || sleepCommand.Generation != 6 {
+		t.Fatalf("sleep command = %#v", sleepCommand)
+	}
+
+	cancel()
+	if err := <-sleepResult; !errors.Is(err, ErrShuttingDown) {
+		t.Fatalf("Sleep result = %v, want ErrShuttingDown", err)
+	}
+	if err := <-result; err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if !runner.stoppedPoll.Load() || runner.closeEarly.Load() {
+		t.Fatalf("shutdown order: stopped=%v close_early=%v", runner.stoppedPoll.Load(), runner.closeEarly.Load())
 	}
 }
 

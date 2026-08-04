@@ -20,6 +20,7 @@ const (
 	defaultPollTimeout     = 100 * time.Millisecond
 	defaultShutdownTimeout = 10 * time.Second
 	defaultSaveTimeout     = 35 * time.Second
+	defaultIntentTimeout   = 35 * time.Second
 	defaultHTTPSubmitLimit = 30 * time.Second
 	defaultWSSubmitLimit   = 30 * time.Second
 	defaultSubmitQueue     = 1_024
@@ -86,6 +87,10 @@ func (e HandlerError) Error() string {
 }
 
 func (e HandlerError) Unwrap() error { return e.Cause }
+
+// ActionCode preserves actor-local structured errors when they pass through a
+// public action handler before the pump serializes them onto the wire.
+func (e HandlerError) ActionCode() string { return e.Code }
 
 type actorIdentity struct {
 	aid        string
@@ -327,9 +332,8 @@ func (s *ActorSession) SetAlarm(alarmTS *int64) error {
 		value := *alarmTS
 		timestamp = &value
 	}
-	return s.pump.submitInternal(context.Background(), wire.Command{
+	return s.submitActorIntent(wire.Command{
 		Kind:    wire.CommandSetAlarm,
-		AID:     s.AID(),
 		AlarmTS: timestamp,
 	})
 }
@@ -344,10 +348,46 @@ func (s *ActorSession) Sleep() error {
 	if !s.isAccepting() {
 		return ErrShuttingDown
 	}
-	return s.pump.submitInternal(context.Background(), wire.Command{
+	return s.submitActorIntent(wire.Command{
 		Kind: wire.CommandSleepIntent,
-		AID:  s.AID(),
 	})
+}
+
+func (s *ActorSession) submitActorIntent(command wire.Command) error {
+	result := make(chan wire.Event, 1)
+	operationID := s.pump.addActorIntentWaiter(result)
+	command.OperationID = operationID
+	command.AID = s.identity.aid
+	command.Generation = s.identity.generation
+	if err := s.pump.submitInternal(context.Background(), command); err != nil {
+		s.pump.removeActorIntentWaiter(operationID)
+		return err
+	}
+	timer := time.NewTimer(s.pump.intentTimeout)
+	defer timer.Stop()
+	select {
+	case event := <-result:
+		if event.Error != nil {
+			return HandlerError{
+				Code:    event.Error.Code,
+				Message: event.Error.Message,
+				Cause:   *event.Error,
+			}
+		}
+		return nil
+	case <-timer.C:
+		s.pump.abandonActorIntentWaiter(operationID)
+		return HandlerError{
+			Code:    "actor_intent_timeout",
+			Message: fmt.Sprintf("actor intent was not acknowledged within %s", s.pump.intentTimeout),
+		}
+	case <-s.done:
+		s.pump.abandonActorIntentWaiter(operationID)
+		return ErrShuttingDown
+	case <-s.pump.done:
+		s.pump.abandonActorIntentWaiter(operationID)
+		return ErrShuttingDown
+	}
 }
 
 func (s *ActorSession) submitWebSocket(ctx context.Context, command wire.Command) error {
@@ -893,6 +933,7 @@ type Pump struct {
 	pollTimeout     time.Duration
 	shutdownTimeout time.Duration
 	saveTimeout     time.Duration
+	intentTimeout   time.Duration
 	httpSubmitLimit time.Duration
 	wsSubmitLimit   time.Duration
 	handlers        map[string]ActorHandler
@@ -910,14 +951,17 @@ type Pump struct {
 	actors   map[actorIdentity]*actorWorker
 	actorWG  sync.WaitGroup
 
-	nextKVID    atomic.Uint64
-	kvMu        sync.Mutex
-	kvPending   map[uint64]chan wire.Event
-	lateSaves   map[actorIdentity]struct{}
-	httpMu      sync.Mutex
-	httpPending map[uint64]*httpRequestState
-	wsMu        sync.Mutex
-	websockets  map[string]websocketOwner
+	nextKVID      atomic.Uint64
+	kvMu          sync.Mutex
+	kvPending     map[uint64]chan wire.Event
+	nextIntentID  atomic.Uint64
+	intentMu      sync.Mutex
+	intentPending map[uint64]chan wire.Event
+	lateSaves     map[actorIdentity]struct{}
+	httpMu        sync.Mutex
+	httpPending   map[uint64]*httpRequestState
+	wsMu          sync.Mutex
+	websockets    map[string]websocketOwner
 
 	subsMu    sync.Mutex
 	subs      map[uint64]*subscriber
@@ -942,6 +986,7 @@ func NewWithHandlers(runner Runner, handlers map[string]ActorHandler) *Pump {
 		pollTimeout:     defaultPollTimeout,
 		shutdownTimeout: defaultShutdownTimeout,
 		saveTimeout:     defaultSaveTimeout,
+		intentTimeout:   defaultIntentTimeout,
 		httpSubmitLimit: defaultHTTPSubmitLimit,
 		wsSubmitLimit:   defaultWSSubmitLimit,
 		handlers:        ownedHandlers,
@@ -951,6 +996,7 @@ func NewWithHandlers(runner Runner, handlers map[string]ActorHandler) *Pump {
 		workerErrors:    make(chan error, 1),
 		actors:          make(map[actorIdentity]*actorWorker),
 		kvPending:       make(map[uint64]chan wire.Event),
+		intentPending:   make(map[uint64]chan wire.Event),
 		lateSaves:       make(map[actorIdentity]struct{}),
 		httpPending:     make(map[uint64]*httpRequestState),
 		websockets:      make(map[string]websocketOwner),
@@ -1061,6 +1107,7 @@ func (p *Pump) pollLoop(ctx context.Context) {
 		p.stopSubmissions()
 		p.submitWG.Wait()
 		p.failKVWaiters()
+		p.failActorIntentWaiters()
 		p.runner.Close()
 		p.closeSubscribers()
 		close(p.done)
@@ -1214,6 +1261,14 @@ func (p *Pump) handleInternalEvent(event wire.Event) error {
 			return fmt.Errorf("ActorAlarm for unknown actor %s generation %d", event.AID, event.Generation)
 		}
 		worker.events <- event
+	case wire.EventActorIntentResult:
+		p.intentMu.Lock()
+		result := p.intentPending[event.OperationID]
+		delete(p.intentPending, event.OperationID)
+		p.intentMu.Unlock()
+		if result != nil {
+			result <- event
+		}
 	case wire.EventActionCall:
 		worker := p.actor(event.AID, event.Generation)
 		if worker == nil {
@@ -1875,6 +1930,46 @@ func (p *Pump) failKVWaiters() {
 		delete(p.kvPending, kvID)
 	}
 	p.kvMu.Unlock()
+}
+
+func (p *Pump) removeActorIntentWaiter(operationID uint64) {
+	p.intentMu.Lock()
+	delete(p.intentPending, operationID)
+	p.intentMu.Unlock()
+}
+
+func (p *Pump) abandonActorIntentWaiter(operationID uint64) {
+	p.intentMu.Lock()
+	if _, pending := p.intentPending[operationID]; pending {
+		// Retain a tombstone until a late native completion consumes it. This
+		// keeps a wrapped operation ID from being assigned to a different wait.
+		p.intentPending[operationID] = nil
+	}
+	p.intentMu.Unlock()
+}
+
+func (p *Pump) addActorIntentWaiter(result chan wire.Event) uint64 {
+	p.intentMu.Lock()
+	defer p.intentMu.Unlock()
+	for {
+		operationID := p.nextIntentID.Add(1)
+		if operationID == 0 {
+			continue
+		}
+		if _, pending := p.intentPending[operationID]; pending {
+			continue
+		}
+		p.intentPending[operationID] = result
+		return operationID
+	}
+}
+
+func (p *Pump) failActorIntentWaiters() {
+	p.intentMu.Lock()
+	for operationID := range p.intentPending {
+		delete(p.intentPending, operationID)
+	}
+	p.intentMu.Unlock()
 }
 
 func (p *Pump) stopSubmissions() {

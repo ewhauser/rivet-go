@@ -101,6 +101,7 @@ instance ID, `gen` = generation; both assigned by core.
 | `ActorStart` | aid, gen, name, key, create_ts, input, persisted_state (optional; absent differs from present-empty) | `ActorStartResult { aid, gen, ok / error }` |
 | `ActorStop` | aid, gen, reason (stop cmd / sleep intent / drain) | `ActorStopResult { aid, gen }` after handler cleanup |
 | `ActorAlarm` | aid, gen, alarm_ts | `AlarmHandled { aid, gen }` |
+| `ActorIntentResult` | op_id, error? | completes the matching `SetAlarm` or `SleepIntent` admission |
 | `ActionCall` | aid, gen, call_id, action name, timeout_ms, args (raw bytes: JSON/CBOR per client encoding), conn_id | `ActionResult { call_id, output / error }` |
 | `HttpRequest` | aid, req_id, method, path, headers, body?, stream flag | `HttpResponseStart` (+ chunks) |
 | `HttpRequestChunk` | req_id, body, finish | — (feeds request body reader) |
@@ -123,8 +124,9 @@ instance ID, `gen` = generation; both assigned by core.
 | `Broadcast` | aid, event name, payload, exclude_conn? | — |
 | `SaveState` | aid, gen, state bytes | `StatePersisted` |
 | `KvGet` / `KvList` / `KvPut` / `KvDelete` | kv_id, aid, op payload | `KvResult` |
-| `SetAlarm` | aid, alarm_ts? (null clears) | — |
-| `SleepIntent` / `StopIntent` | aid | eventual `ActorStop` |
+| `SetAlarm` | op_id, aid, gen, alarm_ts? (null clears) | `ActorIntentResult` after the core schedule operation succeeds or fails |
+| `SleepIntent` | op_id, aid, gen | `ActorIntentResult` after exact-generation admission; eventual `ActorStop` reports eviction |
+| `StopIntent` | aid | eventual `ActorStop` |
 
 The catalogs deliberately mirror runner-protocol concepts
 (`engine/sdks/schemas/runner-protocol/v7.bare`) at one level higher — actions
@@ -429,9 +431,10 @@ behavior with durable replay before enabling hibernation.
 
 ## M5 pin-specific notes — 2026-08-03
 
-M5 adds `ActorAlarm`, `AlarmHandled`, `SetAlarm`, and `SleepIntent`, adds the
-`WsOpen.resumed` marker, and bumps the boundary ABI to 5. The shape scanner
-limits remain unchanged: alarm timestamps and generations are fixed-width
+M5 adds `ActorAlarm`, `AlarmHandled`, `ActorIntentResult`, `SetAlarm`, and
+`SleepIntent`, adds the `WsOpen.resumed` marker, and bumps the boundary ABI to
+5. The shape scanner limits remain unchanged: alarm timestamps and generations
+are fixed-width
 integers, actor IDs use the existing string cap, and no new blob, map, or
 container surface is introduced. Rust produces the M5 command and alarm-event
 goldens; Go decodes and re-encodes them byte-for-byte.
@@ -441,14 +444,29 @@ with the pinned core's persisted one-shot schedule table using the reserved
 action name `__rivet_go_alarm`, rather than with an embedder-owned timer.
 Replacement and clear operations are revisioned and serialized; the latest
 accepted command cancels any prior reserved schedule before optionally adding
-the new timestamp. Other core schedule rows are untouched. The reserved action
+the new timestamp. Each operation is fenced to the caller's actor generation
+and reports completion through its operation ID; `Context.Schedule` and
+`Context.ClearSchedule` do not report success before the native list, cancel,
+and optional set operation has succeeded. At this pin alarm updates and sleep
+are separate workflow signals. The engine can otherwise observe the later
+sleep checkpoint first, advance its checkpoint, and discard the earlier alarm
+update as stale. The FFI therefore holds each serialized alarm completion for
+4 seconds: two complete 1.5-second `DatabaseKv` signal polls plus a 1-second
+scheduling margin. That settlement also orders rapid replacement and clear
+before the caller can submit the next mutation. Other core schedule rows are
+untouched. The reserved action
 cannot be registered by an actor author. When core fires it, the FFI converts
 the scheduled action to `ActorAlarm`, waits for `AlarmHandled`, and replies to
 core only after the Go hook and its implicit state save complete. Core owns the
 SQLite schedule durability, engine alarm transport, restart resynchronization,
 and wake allocation.
 
-`SleepIntent` calls `ActorContext::sleep`. The per-actor Go worker serializes
+`SleepIntent` is fenced to the caller's generation. Its result acknowledges
+that the exact generation accepted the intent, not that eviction has already
+finished; waiting for eviction inside the initiating handler would deadlock
+the drain policy. Rust calls `ActorContext::sleep` after work already admitted
+through the proxy becomes idle, and core performs the authoritative work
+drain before it emits `ActorStop`. The per-actor Go worker serializes
 actions, alarms, HTTP handlers, WebSocket callbacks, and lifecycle hooks. A
 handler that requests sleep therefore finishes normally before `OnStop`; a
 successful action's implicit save and result, an HTTP response, or a WebSocket
@@ -460,6 +478,11 @@ Existing action deadlines, engine HTTP aborts, and runner-shutdown cancellation
 remain the only abort paths; sleep does not add a second cancellation policy.
 `ActorStop.reason` is `sleep` for engine sleep, `stop` for the actor-local
 `StopIntent` panic path, and `destroy` for an engine destroy.
+
+An alarm uses the same 60-second core action deadline and FFI correlation
+deadline as an ordinary action. If an actor has no `OnAlarm`, Go returns the
+structured `callback_not_found` error in `AlarmHandled`; the pump remains
+alive and core receives the failure instead of a panic or silent success.
 
 The hibernatable raw-message callback has a 60-second boundary acknowledgement
 limit. If Go has not returned and acknowledged by then, the FFI closes that
@@ -488,6 +511,12 @@ Open question 3 is resolved at v2.3.10 as follows:
   `WsMessageAck` arrives after the serialized Go handler. Core suppresses
   already-persisted replay before the callback; the FFI still validates FIFO
   acknowledgements for every message it does receive;
+- a sleep intent submitted inside a WebSocket handler is admitted immediately
+  but applied only after that handler's acknowledgement. Frames accepted by
+  the same gateway socket in that boundary window can consequently run, in
+  FIFO order, on the old generation before eviction. Frames sent after
+  engine-visible sleep rehydrate the actor and run on the new generation.
+  Neither set is lost or delivered twice;
 - on sleep, `WsCloseCmd { hibernate: true }` detaches the outgoing queue and
   callbacks belonging to the old generation without calling
   `WebSocket::close`. Core and the engine own the hibernating transport and
@@ -506,11 +535,19 @@ This is the pinned behavior, not a promise that a future core will hide every
 sleep-time close.
 
 Real-engine alarm checks use engine-driven timestamps and the existing
-`eventually` polling discipline. Repeated race-enabled v2.3.10 runs made
-5-second and 10-second deadlines unreliable when they sat close to actor
-shutdown settlement. The exit tests therefore use 20-second and 25-second wake
-deadlines and prove that at least 10 seconds remain after engine-visible sleep;
-the wait bound is 90 seconds and is not a sub-second latency assertion.
+`eventually` polling discipline. The pinned engine's workflow worker polls on
+a 16-second tick. Negative clear, replacement, and one-shot checks therefore
+observe one complete tick plus a 5-second delivery margin. Positive cases use
+20-second sleep alarms, 12-second canceled/superseded alarms, a 35-second
+hibernation alarm, a 45-second replacement alarm, and a 60-second restart
+alarm; they prove that at least 10 seconds remain after engine-visible sleep
+where that transition is the assertion. The separate 4-second transport
+settlement is derived from the 1.5-second signal poll as described above.
+The 90-second alarm bound covers the requested deadline, one poll tick, the
+delivery margin, and runner scheduling under `-race`; it is not a latency
+claim. The 20-second WebSocket message-wake bound does not depend on the alarm
+poller and covers gateway delivery plus actor allocation. No fixed sleep is
+used as a success gate.
 
 After an abrupt engine process replacement, the pinned engine does not
 reliably resume an already-sleeping workflow timer until the actor is

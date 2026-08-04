@@ -19,6 +19,7 @@ const (
 	EventActorStart         EventKind = "actor_start"
 	EventActorStop          EventKind = "actor_stop"
 	EventActorAlarm         EventKind = "actor_alarm"
+	EventActorIntentResult  EventKind = "actor_intent_result"
 	EventActionCall         EventKind = "action_call"
 	EventHTTPRequest        EventKind = "http_request"
 	EventHTTPRequestChunk   EventKind = "http_request_chunk"
@@ -112,6 +113,7 @@ type Event struct {
 	MessageIndex    uint16            `msgpack:"msg_index,omitempty"`
 	CloseCode       *uint16           `msgpack:"code,omitempty"`
 	AlarmTS         int64             `msgpack:"alarm_ts,omitempty"`
+	OperationID     uint64            `msgpack:"op_id,omitempty"`
 }
 
 type DrainReport struct {
@@ -178,6 +180,7 @@ type Command struct {
 	Payload      []byte            `msgpack:"payload"`
 	ExcludeConn  *string           `msgpack:"exclude_conn"`
 	AlarmTS      *int64            `msgpack:"alarm_ts"`
+	OperationID  uint64            `msgpack:"op_id"`
 }
 
 func EncodeRunnerConfig(config RunnerConfig) ([]byte, error) {
@@ -237,9 +240,16 @@ func validateEvent(event Event) error {
 		if event.AID == "" || event.Reason == "" {
 			return fmt.Errorf("%s event requires aid and reason", event.Kind)
 		}
+		if event.Reason != "sleep" && event.Reason != "stop" && event.Reason != "destroy" {
+			return fmt.Errorf("%s event has unsupported reason %q", event.Kind, event.Reason)
+		}
 	case EventActorAlarm:
 		if event.AID == "" {
 			return fmt.Errorf("%s event has empty aid", event.Kind)
+		}
+	case EventActorIntentResult:
+		if event.OperationID == 0 {
+			return fmt.Errorf("%s event has invalid op_id", event.Kind)
 		}
 	case EventActionCall:
 		if event.AID == "" || event.CallID == 0 || event.Action == "" || event.ActionTimeoutMS == 0 {
@@ -266,6 +276,9 @@ func validateEvent(event Event) error {
 		}
 		if len(event.Headers) > 256 {
 			return fmt.Errorf("%s event exceeds the 256-header schema limit", event.Kind)
+		}
+		if event.Resumed && !event.CanHibernate {
+			return fmt.Errorf("%s resumed event is not hibernatable", event.Kind)
 		}
 	case EventWSMessage:
 		if event.WSID == "" {

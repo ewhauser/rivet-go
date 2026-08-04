@@ -22,6 +22,12 @@ use crate::wire::{Command, Event, KvEntry, WireError};
 const LIFECYCLE_RESULT_TIMEOUT: Duration = Duration::from_secs(30);
 const SAVE_STATE_TIMEOUT: Duration = Duration::from_secs(30);
 const ACTION_RESULT_TIMEOUT: Duration = Duration::from_secs(60);
+const ALARM_RESULT_TIMEOUT: Duration = ACTION_RESULT_TIMEOUT;
+// DatabaseKv polls workflow signals every 1.5 seconds at the pinned engine.
+// Alarm and sleep are separate workflow signals, so hold the serialized alarm
+// operation for two complete polls plus a one-second scheduling margin before
+// allowing the Go handler to submit a later alarm or sleep checkpoint.
+const ALARM_TRANSPORT_SETTLEMENT: Duration = Duration::from_millis(2 * 1_500 + 1_000);
 const HTTP_RESULT_TIMEOUT: Duration = Duration::from_secs(30);
 const WS_OPEN_RESULT_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_BODY_CHUNK: usize = 1 << 20;
@@ -507,15 +513,17 @@ impl ActorProxy {
                     let _ = actor.ctx.stop_with_error("Go WebSocket handler panicked");
                 }
             }
-            Command::SetAlarm { aid, alarm_ts } => self.dispatch_set_alarm(aid, alarm_ts),
-            Command::SleepIntent { aid } => {
-                if let Some(actor) = self.actor_current(&aid) {
-                    tokio::spawn(async move {
-                        actor.operations.wait_idle().await;
-                        let _ = actor.ctx.sleep();
-                    });
-                }
-            }
+            Command::SetAlarm {
+                op_id,
+                aid,
+                r#gen: generation,
+                alarm_ts,
+            } => self.dispatch_set_alarm(op_id, aid, generation, alarm_ts),
+            Command::SleepIntent {
+                op_id,
+                aid,
+                r#gen: generation,
+            } => self.dispatch_sleep_intent(op_id, aid, generation),
             Command::SaveState {
                 aid,
                 r#gen: generation,
@@ -875,7 +883,7 @@ impl ActorProxy {
             actor: identity.clone(),
             kind: LifecycleKind::Alarm,
         };
-        let (id, receiver) = self.correlations.insert(LIFECYCLE_RESULT_TIMEOUT);
+        let (id, receiver) = self.correlations.insert(ALARM_RESULT_TIMEOUT);
         self.pending
             .insert(key.clone(), id)
             .map_err(|error| WireError::new("alarm_correlation_failed", error.to_string()))?;
@@ -961,24 +969,50 @@ impl ActorProxy {
         }
     }
 
-    fn dispatch_set_alarm(&self, aid: String, alarm_ts: Option<i64>) {
-        let Some(actor) = self.actor_current(&aid) else {
+    fn dispatch_set_alarm(&self, op_id: u64, aid: String, generation: u64, alarm_ts: Option<i64>) {
+        let identity = ActorIdentity::new(aid.clone(), generation);
+        let Some(actor) = self.actor_exact(&identity) else {
+            self.emit_actor_intent_result(
+                op_id,
+                Err(WireError::new(
+                    "actor_generation_stale",
+                    format!("actor {aid} generation {generation} is not active"),
+                )),
+            );
             return;
         };
         let Some(operation) = actor.operations.begin() else {
+            self.emit_actor_intent_result(
+                op_id,
+                Err(WireError::new(
+                    "actor_stopping",
+                    format!("actor {aid} generation {generation} is stopping"),
+                )),
+            );
             return;
         };
         let revision = actor.alarm_updates.revision.fetch_add(1, Ordering::AcqRel) + 1;
+        let proxy = self.clone();
         tokio::spawn(async move {
             let _operation = operation;
             let _apply = actor.alarm_updates.apply.lock().await;
             if actor.alarm_updates.revision.load(Ordering::Acquire) != revision {
+                proxy.emit_actor_intent_result(
+                    op_id,
+                    Err(WireError::new(
+                        "alarm_superseded",
+                        "alarm update was superseded by a newer request",
+                    )),
+                );
                 return;
             }
             let scheduled = match actor.ctx.list_scheduled_events().await {
                 Ok(scheduled) => scheduled,
                 Err(error) => {
-                    tracing::error!(?error, actor_id = aid, "failed to list Go actor alarms");
+                    proxy.emit_actor_intent_result(
+                        op_id,
+                        Err(WireError::new("alarm_list_failed", error.to_string())),
+                    );
                     return;
                 }
             };
@@ -987,11 +1021,21 @@ impl ActorProxy {
                     continue;
                 }
                 if let Err(error) = actor.ctx.cancel_schedule(&event.id).await {
-                    tracing::error!(?error, actor_id = aid, "failed to clear Go actor alarm");
+                    proxy.emit_actor_intent_result(
+                        op_id,
+                        Err(WireError::new("alarm_clear_failed", error.to_string())),
+                    );
                     return;
                 }
             }
             if actor.alarm_updates.revision.load(Ordering::Acquire) != revision {
+                proxy.emit_actor_intent_result(
+                    op_id,
+                    Err(WireError::new(
+                        "alarm_superseded",
+                        "alarm update was superseded by a newer request",
+                    )),
+                );
                 return;
             }
             if let Some(alarm_ts) = alarm_ts
@@ -1000,13 +1044,57 @@ impl ActorProxy {
                     .at(alarm_ts, INTERNAL_ALARM_ACTION, &cbor_empty_args())
                     .await
             {
-                tracing::error!(
-                    ?error,
-                    actor_id = aid,
-                    alarm_ts,
-                    "failed to schedule Go actor alarm"
+                proxy.emit_actor_intent_result(
+                    op_id,
+                    Err(WireError::new("alarm_set_failed", error.to_string())),
                 );
+                return;
             }
+            tokio::time::sleep(ALARM_TRANSPORT_SETTLEMENT).await;
+            if actor.alarm_updates.revision.load(Ordering::Acquire) != revision {
+                proxy.emit_actor_intent_result(
+                    op_id,
+                    Err(WireError::new(
+                        "alarm_superseded",
+                        "alarm update was superseded by a newer request",
+                    )),
+                );
+                return;
+            }
+            proxy.emit_actor_intent_result(op_id, Ok(()));
+        });
+    }
+
+    fn dispatch_sleep_intent(&self, op_id: u64, aid: String, generation: u64) {
+        let identity = ActorIdentity::new(aid.clone(), generation);
+        let Some(actor) = self.actor_exact(&identity) else {
+            self.emit_actor_intent_result(
+                op_id,
+                Err(WireError::new(
+                    "actor_generation_stale",
+                    format!("actor {aid} generation {generation} is not active"),
+                )),
+            );
+            return;
+        };
+        // Sleep is accepted now but applied only after work already admitted
+        // through this actor proxy is idle. Hibernatable raw WebSocket work
+        // stays admitted until Go has returned its matching FIFO ack; core then
+        // persists and acknowledges that exact message index.
+        self.emit_actor_intent_result(op_id, Ok(()));
+        tokio::spawn(async move {
+            actor.operations.wait_idle().await;
+            // The result above acknowledges admission of the intent. Once the
+            // exact generation and its already-admitted work are fenced, core
+            // owns the sleep transition and reports it through ActorStop.
+            let _ = actor.ctx.sleep();
+        });
+    }
+
+    fn emit_actor_intent_result(&self, op_id: u64, result: Result<(), WireError>) {
+        let _ = self.events.send(Event::ActorIntentResult {
+            op_id,
+            error: result.err(),
         });
     }
 
@@ -1328,13 +1416,20 @@ impl ActorProxy {
             );
             return Ok(());
         }
-        let (acknowledgements, can_hibernate) = {
+        let (acknowledgements, can_hibernate, actor_identity) = {
             let websockets = self.websockets.lock().expect("WebSocket table poisoned");
             let Some(active) = websockets.get(ws_id) else {
                 return Ok(());
             };
-            (active.acknowledgements.clone(), active.can_hibernate)
+            (
+                active.acknowledgements.clone(),
+                active.can_hibernate,
+                active.actor.clone(),
+            )
         };
+        let _actor_operation = self
+            .actor_exact(&actor_identity)
+            .and_then(|actor| actor.operations.begin());
         let (completion, completed) = if can_hibernate {
             let (tx, rx) = bounded(1);
             (Some(tx), Some(rx))
@@ -2352,6 +2447,91 @@ mod tests {
         );
     }
 
+    #[tokio::test(flavor = "multi_thread")]
+    async fn hibernating_message_index_wraps_across_generations() {
+        let (events, event_rx) = bounded(4);
+        let proxy = ActorProxy::new(events, CorrelationTable::default());
+        let (outbound, _receiver) = tokio::sync::mpsc::channel(1);
+        proxy.websockets.lock().expect("WebSocket table").insert(
+            "restored".to_owned(),
+            ActiveWebSocket {
+                actor: ActorIdentity::new("actor", 1),
+                can_hibernate: true,
+                ws: WebSocket::new(),
+                outbound,
+                acknowledgements: Arc::new(Mutex::new(WsAcknowledgements {
+                    last_received: Some(u16::MAX - 1),
+                    pending: VecDeque::new(),
+                })),
+            },
+        );
+
+        let first_proxy = proxy.clone();
+        let first = tokio::spawn(async move {
+            first_proxy.websocket_message(
+                "restored",
+                WsMessage::Text("before hibernation".to_owned()),
+                u16::MAX,
+            )
+        });
+        assert!(matches!(
+            event_rx.recv_timeout(Duration::from_secs(1)),
+            Ok(Event::WsMessage {
+                msg_index: u16::MAX,
+                ..
+            })
+        ));
+        proxy.ack_ws_message("restored", u16::MAX);
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), first)
+                .await
+                .expect("pre-hibernation callback completed")
+                .expect("pre-hibernation callback task")
+                .is_ok()
+        );
+
+        proxy.hibernate_ws("restored");
+        assert!(
+            !proxy
+                .websockets
+                .lock()
+                .expect("WebSocket table")
+                .contains_key("restored")
+        );
+
+        let (outbound, _receiver) = tokio::sync::mpsc::channel(1);
+        proxy.websockets.lock().expect("WebSocket table").insert(
+            "restored".to_owned(),
+            ActiveWebSocket {
+                actor: ActorIdentity::new("actor", 2),
+                can_hibernate: true,
+                ws: WebSocket::new(),
+                outbound,
+                acknowledgements: Arc::new(Mutex::new(WsAcknowledgements::default())),
+            },
+        );
+        let restored_proxy = proxy.clone();
+        let restored = tokio::spawn(async move {
+            restored_proxy.websocket_message(
+                "restored",
+                WsMessage::Text("after hibernation".to_owned()),
+                0,
+            )
+        });
+        assert!(matches!(
+            event_rx.recv_timeout(Duration::from_secs(1)),
+            Ok(Event::WsMessage { msg_index: 0, .. })
+        ));
+        proxy.ack_ws_message("restored", 0);
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), restored)
+                .await
+                .expect("restored callback completed")
+                .expect("restored callback task")
+                .is_ok()
+        );
+    }
+
     #[test]
     fn websocket_acknowledgements_are_ordered_and_wrap_monotonically() {
         let (events, event_rx) = bounded(8);
@@ -2411,5 +2591,15 @@ mod tests {
             .expect("WebSocket acknowledgement table");
         assert_eq!(acknowledgement_state.last_received, Some(0));
         assert!(acknowledgement_state.pending.is_empty());
+    }
+
+    #[test]
+    fn alarm_handler_timeout_matches_the_core_action_deadline() {
+        assert_eq!(ALARM_RESULT_TIMEOUT, ACTION_RESULT_TIMEOUT);
+    }
+
+    #[test]
+    fn alarm_transport_settlement_covers_two_pinned_signal_polls() {
+        assert!(ALARM_TRANSPORT_SETTLEMENT >= Duration::from_millis(2 * 1_500));
     }
 }

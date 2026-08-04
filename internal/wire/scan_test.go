@@ -67,6 +67,7 @@ func TestValidateShapeAcceptsGoldens(t *testing.T) {
 		"event_actor_start_empty_state.msgpack",
 		"event_actor_stop.msgpack",
 		"event_actor_alarm.msgpack",
+		"event_actor_intent_result.msgpack",
 		"event_action_call.msgpack",
 		"event_http_request.msgpack",
 		"event_http_request_chunk.msgpack",

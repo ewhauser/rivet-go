@@ -210,6 +210,10 @@ func actionHandlerError(err error) error {
 	if errors.Is(err, context.Canceled) {
 		return pump.HandlerError{Code: "action_canceled", Message: err.Error()}
 	}
+	var handlerError pump.HandlerError
+	if errors.As(err, &handlerError) {
+		return handlerError
+	}
 	var structured interface {
 		ActionCode() string
 	}

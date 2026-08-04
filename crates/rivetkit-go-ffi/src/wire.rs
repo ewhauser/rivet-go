@@ -107,6 +107,11 @@ pub(crate) enum Event {
         r#gen: u64,
         alarm_ts: i64,
     },
+    ActorIntentResult {
+        op_id: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<WireError>,
+    },
     ActionCall {
         aid: String,
         r#gen: u64,
@@ -301,11 +306,17 @@ pub(crate) enum Command {
         aid: String,
     },
     SetAlarm {
+        op_id: u64,
         aid: String,
+        #[serde(default)]
+        r#gen: u64,
         alarm_ts: Option<i64>,
     },
     SleepIntent {
+        op_id: u64,
         aid: String,
+        #[serde(default)]
+        r#gen: u64,
     },
     SaveState {
         aid: String,
@@ -540,9 +551,13 @@ impl CommandBatch {
                         return Err("broadcast exclude_conn must not be empty".to_owned());
                     }
                 }
-                Command::StopIntent { aid }
-                | Command::SetAlarm { aid, .. }
-                | Command::SleepIntent { aid } => require_aid(aid)?,
+                Command::StopIntent { aid } => require_aid(aid)?,
+                Command::SetAlarm { op_id, aid, .. } | Command::SleepIntent { op_id, aid, .. } => {
+                    require_aid(aid)?;
+                    if *op_id == 0 {
+                        return Err("actor intent op_id must not be zero".to_owned());
+                    }
+                }
                 Command::KvGet { kv_id, aid, .. }
                 | Command::KvPut { kv_id, aid, .. }
                 | Command::KvDelete { kv_id, aid, .. } => {
@@ -671,6 +686,7 @@ mod tests {
         payload: Option<Vec<u8>>,
         exclude_conn: Option<&'static str>,
         alarm_ts: Option<i64>,
+        op_id: u64,
     }
 
     #[derive(Serialize)]
@@ -712,6 +728,7 @@ mod tests {
             payload: None,
             exclude_conn: None,
             alarm_ts: None,
+            op_id: 0,
         }
     }
 
@@ -865,6 +882,20 @@ mod tests {
         write_golden(
             "event_actor_alarm.msgpack",
             &actor_alarm.encode().expect("encode actor alarm event"),
+        );
+
+        let actor_intent_result = EventBatch {
+            seq: 18,
+            events: vec![Event::ActorIntentResult {
+                op_id: 41,
+                error: None,
+            }],
+        };
+        write_golden(
+            "event_actor_intent_result.msgpack",
+            &actor_intent_result
+                .encode()
+                .expect("encode actor intent result event"),
         );
 
         let action_call = EventBatch {
@@ -1102,10 +1133,16 @@ mod tests {
         let mut alarm_handled = golden_command("alarm_handled");
         alarm_handled.r#gen = 8;
         let mut set_alarm = golden_command("set_alarm");
+        set_alarm.op_id = 41;
+        set_alarm.r#gen = 8;
         set_alarm.alarm_ts = Some(1_788_500_000_000);
         let mut clear_alarm = golden_command("set_alarm");
+        clear_alarm.op_id = 42;
+        clear_alarm.r#gen = 8;
         clear_alarm.alarm_ts = None;
-        let sleep_intent = golden_command("sleep_intent");
+        let mut sleep_intent = golden_command("sleep_intent");
+        sleep_intent.op_id = 43;
+        sleep_intent.r#gen = 8;
         let command_m5 = rmp_serde::to_vec_named(&GoldenCommandBatch {
             commands: vec![alarm_handled, set_alarm, clear_alarm, sleep_intent],
         })

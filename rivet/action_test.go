@@ -82,6 +82,26 @@ func TestActionErrorsStayStructured(t *testing.T) {
 	}
 }
 
+func TestInternalHandlerErrorsStayStructuredThroughActions(t *testing.T) {
+	type state struct{}
+	arguments, err := cbor.Marshal([]any{1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := Action(func(*Context[state], int) (int, error) {
+		return 0, pump.HandlerError{
+			Code:    "alarm_set_failed",
+			Message: "core rejected alarm",
+		}
+	})
+	_, err = handler.invoke(context.Background(), &Context[state]{}, arguments)
+	var structured pump.HandlerError
+	if !errors.As(err, &structured) || structured.Code != "alarm_set_failed" ||
+		structured.Message != "core rejected alarm" {
+		t.Fatalf("action error = %#v, want preserved alarm_set_failed", err)
+	}
+}
+
 func TestTypedActionDecodeAndEncodeFailuresStayStructured(t *testing.T) {
 	type state struct{}
 	handler := Action(func(*Context[state], int) (chan int, error) {
