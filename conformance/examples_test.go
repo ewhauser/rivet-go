@@ -76,6 +76,10 @@ func TestRunnableExamplesAndSIGTERMDrain(t *testing.T) {
 	waitTextFrame(t, client, "connected")
 	client.write(t, websocket.TextMessage, []byte("hello from conformance"))
 	waitChatBroadcast(t, client, 1, "hello from conformance")
+	httpActor := createActor(t, engine.endpoint, "chat", chatRunner, "destroy", nil, nil)
+	waitForActor(t, engine.endpoint, httpActor.ActorID, false, func(actor actorRecord) bool {
+		return actor.ConnectableTS != nil && actor.DestroyTS == nil
+	})
 
 	actionResult := make(chan gatewayResponse, 1)
 	go func() {
@@ -88,12 +92,26 @@ func TestRunnableExamplesAndSIGTERMDrain(t *testing.T) {
 			8*time.Second,
 		)
 	}()
+	httpResult := make(chan gatewayHTTPResponse, 1)
+	go func() {
+		response, body, requestErr := gatewayHTTPRequest(
+			engine.endpoint,
+			httpActor.ActorID,
+			"/request/hold?milliseconds=1500",
+			http.MethodGet,
+			nil,
+			nil,
+			8*time.Second,
+		)
+		httpResult <- gatewayHTTPResponse{response: response, body: body, err: requestErr}
+	}()
 	eventually(t, 5*time.Second, func() (bool, error) {
 		data, readErr := os.ReadFile(chat.logPath)
 		if readErr != nil {
 			return false, readErr
 		}
-		return bytes.Contains(data, []byte("drain probe action started")), nil
+		return bytes.Contains(data, []byte("drain probe action started")) &&
+			bytes.Contains(data, []byte("drain probe HTTP started")), nil
 	})
 	chat.signal(t, syscall.SIGTERM)
 	select {
@@ -102,11 +120,102 @@ func TestRunnableExamplesAndSIGTERMDrain(t *testing.T) {
 	case <-time.After(8 * time.Second):
 		t.Fatal("in-flight example action did not complete during SIGTERM drain")
 	}
+	select {
+	case result := <-httpResult:
+		if result.err != nil || result.response.StatusCode != http.StatusOK || string(result.body) != "1\n" {
+			t.Fatalf("in-flight example HTTP drain: status=%s body=%q err=%v", responseStatus(result.response), result.body, result.err)
+		}
+	case <-time.After(8 * time.Second):
+		t.Fatal("in-flight example HTTP request did not complete during SIGTERM drain")
+	}
 	assertGatewayWebSocketClose(t, client, 1001, "runner shutting down")
 	if err := chat.wait(15 * time.Second); err != nil {
 		t.Fatalf("chat example SIGTERM exit: %v\n%s", err, chat.logTail())
 	}
 	waitForRunner(t, engine.endpoint, chatRunner, false)
+
+	forcedRunner := fmt.Sprintf("chat-forced-example-%d", time.Now().UnixNano())
+	forced := startExample(t, chatBinary,
+		"-endpoint", engine.endpoint,
+		"-runner-name", forcedRunner,
+		"-shutdown-timeout", "200ms",
+	)
+	waitForRunner(t, engine.endpoint, forcedRunner, true)
+	forcedActionActor := createActor(t, engine.endpoint, "chat", forcedRunner, "destroy", nil, nil)
+	forcedHTTPActor := createActor(t, engine.endpoint, "chat", forcedRunner, "destroy", nil, nil)
+	waitForActor(t, engine.endpoint, forcedActionActor.ActorID, false, func(actor actorRecord) bool {
+		return actor.ConnectableTS != nil && actor.DestroyTS == nil
+	})
+	waitForActor(t, engine.endpoint, forcedHTTPActor.ActorID, false, func(actor actorRecord) bool {
+		return actor.ConnectableTS != nil && actor.DestroyTS == nil
+	})
+	forcedClient := openGatewayWebSocket(t, engine.endpoint, forcedActionActor.ActorID, "forced-example-client", true)
+	waitTextFrame(t, forcedClient, "connected")
+	forcedActionResult := make(chan gatewayResponse, 1)
+	go func() {
+		forcedActionResult <- gatewayAction(
+			t,
+			engine.endpoint,
+			forcedActionActor.ActorID,
+			"hold",
+			[]any{map[string]int{"milliseconds": 1_500}},
+			8*time.Second,
+		)
+	}()
+	forcedHTTPResult := make(chan gatewayHTTPResponse, 1)
+	go func() {
+		response, body, requestErr := gatewayHTTPRequest(
+			engine.endpoint,
+			forcedHTTPActor.ActorID,
+			"/request/hold?milliseconds=1500",
+			http.MethodGet,
+			nil,
+			nil,
+			8*time.Second,
+		)
+		forcedHTTPResult <- gatewayHTTPResponse{response: response, body: body, err: requestErr}
+	}()
+	eventually(t, 5*time.Second, func() (bool, error) {
+		data, readErr := os.ReadFile(forced.logPath)
+		if readErr != nil {
+			return false, readErr
+		}
+		return bytes.Contains(data, []byte("drain probe action started")) &&
+			bytes.Contains(data, []byte("drain probe HTTP started")), nil
+	})
+	forced.signal(t, syscall.SIGTERM)
+	assertGatewayWebSocketClose(t, forcedClient, 1001, "runner shutting down")
+	if err := forced.wait(15 * time.Second); err == nil {
+		t.Fatal("forced-deadline example exited successfully")
+	} else {
+		var exitError *exec.ExitError
+		if !errors.As(err, &exitError) || exitError.ExitCode() != 1 {
+			t.Fatalf("forced-deadline example exit=%v, want code 1\n%s", err, forced.logTail())
+		}
+	}
+	select {
+	case result := <-forcedActionResult:
+		if result.err == nil && result.response != nil && result.response.StatusCode == http.StatusOK {
+			t.Fatalf("forced-deadline action completed successfully: %#v", result)
+		}
+	case <-time.After(8 * time.Second):
+		t.Fatal("forced-deadline action client did not resolve")
+	}
+	select {
+	case result := <-forcedHTTPResult:
+		if result.err == nil && result.response != nil && result.response.StatusCode == http.StatusOK {
+			t.Fatalf("forced-deadline HTTP completed successfully: status=%s body=%q", result.response.Status, result.body)
+		}
+	case <-time.After(8 * time.Second):
+		t.Fatal("forced-deadline HTTP client did not resolve")
+	}
+	waitForRunner(t, engine.endpoint, forcedRunner, false)
+}
+
+type gatewayHTTPResponse struct {
+	response *http.Response
+	body     []byte
+	err      error
 }
 
 func buildExample(t *testing.T, name string) string {

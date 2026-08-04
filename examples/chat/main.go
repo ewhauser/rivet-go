@@ -6,7 +6,9 @@ import (
 	"flag"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"os"
+	"strconv"
 	"time"
 
 	"github.com/ewhauser/rivet-go/rivet"
@@ -15,6 +17,7 @@ import (
 type chatState struct {
 	Sequence         uint64 `json:"sequence"`
 	CompletedActions uint64 `json:"completedActions"`
+	CompletedHTTP    uint64 `json:"completedHTTP"`
 }
 
 type chatMessage struct {
@@ -35,8 +38,10 @@ func main() {
 
 func run() error {
 	var endpoint, runnerName string
+	var shutdownTimeout time.Duration
 	flag.StringVar(&endpoint, "endpoint", "http://127.0.0.1:6420", "Rivet Engine endpoint")
 	flag.StringVar(&runnerName, "runner-name", "chat-example", "engine-visible runner name")
+	flag.DurationVar(&shutdownTimeout, "shutdown-timeout", 10*time.Second, "graceful runner shutdown deadline")
 	flag.Parse()
 	logger := slog.New(slog.NewJSONHandler(os.Stderr, nil))
 
@@ -83,6 +88,29 @@ func run() error {
 				logger.Error("broadcast chat message", slog.Any("error", err))
 			}
 		},
+		OnFetch: func(ctx *rivet.Context[chatState], writer http.ResponseWriter, request *http.Request) {
+			milliseconds, err := strconv.Atoi(request.URL.Query().Get("milliseconds"))
+			if err != nil || milliseconds < 1 || milliseconds > 5_000 {
+				http.Error(writer, "milliseconds must be between 1 and 5000", http.StatusBadRequest)
+				return
+			}
+			logger.Info("drain probe HTTP started", slog.String("actor_id", ctx.ActorID()))
+			timer := time.NewTimer(time.Duration(milliseconds) * time.Millisecond)
+			defer timer.Stop()
+			select {
+			case <-timer.C:
+			case <-request.Context().Done():
+				http.Error(writer, request.Context().Err().Error(), http.StatusServiceUnavailable)
+				return
+			}
+			ctx.State().CompletedHTTP++
+			if err := ctx.Save(request.Context()); err != nil {
+				http.Error(writer, err.Error(), http.StatusInternalServerError)
+				return
+			}
+			writer.WriteHeader(http.StatusOK)
+			_, _ = fmt.Fprintln(writer, ctx.State().CompletedHTTP)
+		},
 		OnDisconnect: func(ctx *rivet.Context[chatState], connection *rivet.Connection) {
 			code, reason := connection.CloseInfo()
 			logger.Info("chat client disconnected",
@@ -100,6 +128,6 @@ func run() error {
 		TotalSlots:      16,
 		LogLevel:        "info",
 		Logger:          logger,
-		ShutdownTimeout: 10 * time.Second,
+		ShutdownTimeout: shutdownTimeout,
 	})
 }

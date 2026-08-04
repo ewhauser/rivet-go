@@ -569,7 +569,6 @@ impl ActorProxy {
         self.begin_shutdown();
         self.pending.clear();
         self.pending_ws_open.clear();
-        self.close_all_websockets(Some(1001), Some("runner shutting down".to_owned()));
         self.active_http
             .lock()
             .expect("active HTTP table poisoned")
@@ -581,7 +580,12 @@ impl ActorProxy {
     }
 
     pub(crate) fn begin_shutdown(&self) {
-        self.runner_draining.store(true, Ordering::Release);
+        if !self.runner_draining.swap(true, Ordering::AcqRel) {
+            // Close while core's transport is still alive. Waiting until the
+            // forced-abort fallback would leave no sender capable of carrying
+            // the close frame to the gateway.
+            self.close_all_websockets(Some(1001), Some("runner shutting down".to_owned()));
+        }
     }
 
     async fn run_actor(&self, start: ActorStart) -> Result<()> {
