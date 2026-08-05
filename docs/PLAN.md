@@ -201,7 +201,7 @@ returns a clear error at `rivet.Serve`.
 | M4 | WebSockets + events: connection objects, broadcast, message acks | Conformance: two WS clients see each other's broadcasts | 1–2 wk | Complete — [review](reviews/M4-REVIEW.md) |
 | M5 | Scheduling + sleep: alarms, sleep/wake, hibernating WS (`canHibernate`) | Conformance: alarm fires after actor slept; WS survives hibernation | 2 wk | Complete — [review](reviews/M5-REVIEW.md) |
 | M6 | Production hardening: graceful drain, panic firewall, soak/chaos, metrics hooks, docs + examples | Configurable strict soak harness; bounded 15-minute run clean; 24-hour release soak documented; README quickstart works from scratch | 2–3 wk | Complete — [review](reviews/M6-REVIEW.md) |
-| M7 | Per-actor SQLite through FFI-pump and actor-runtime-socket candidates behind one `Context.DB` API; conformance and S5 comparison | Both transports pass the same durability/isolation/transaction suite; two-repetition S5 archive includes Go-ffi, Go-socket, and TypeScript `c.db` raw SQL | 2–3 wk | Complete — candidate review pending; no default selected |
+| M7 | Per-actor SQLite through FFI-pump and actor-runtime-socket candidates behind one `Context.DB` API; conformance and S5 comparison | Both transports pass the same durability/isolation/transaction suite; two-repetition S5 archive includes Go-ffi, Go-socket, and TypeScript `c.db` raw SQL | 2–3 wk | Complete — FFI default; actor capability remains opt-in |
 
 Roughly 9–13 weeks solo to a production-ready v0. M0–M3 (~4–6 wk) is the
 demo-quality milestone and the point of maximum learning — reassess the
@@ -229,11 +229,13 @@ approach there.
 - Alarm mutation completion includes the pin-specific four-second transport
   fence, and the engine's 16-second workflow tick prevents low-latency timing
   guarantees.
-- Per-actor SQL has no default transport while M7 is under review. Applications
-  must select `ffi` or `socket`; the socket candidate is Unix-only. Results are
-  fully buffered, bounded to 32 MiB overall, 1 MiB per SQL/text/blob value,
-  1,024 parameters and columns, and an active transaction exclusively gates
-  other operations for up to its 60-second default lease.
+- Per-actor SQL is opt-in with `Actor.Database`; FFI is the default transport,
+  socket is Unix-only, and `disabled` overrides every actor declaration. A
+  database actor left live across standalone engine replacement does not
+  rehydrate at this pin. Results are fully buffered, bounded to 32 MiB overall,
+  1 MiB per SQL/text/blob value, 1,024 parameters and columns, and an active
+  transaction exclusively gates other operations for up to its 60-second
+  default lease.
 - Each runner uses one blocking, OS-thread-pinned poller. Submissions and
   operability hooks run elsewhere, but event decoding and dispatch are
   intentionally single-poller.
@@ -607,21 +609,22 @@ envoy to engine Depot and FoundationDB/filesystem storage. A successful commit
 is durable at the engine commit boundary. `RemoteEnvoy`, used by the M2 state
 mapping, instead executes SQL on the engine/envoy side.
 
-The embedding compiles both core features. With no SQLite transport selected,
-the existing state and actor-KV path remains `RemoteEnvoy` and `Context.DB()`
-returns `sqlite_transport_not_configured`. Selecting either `ffi` or `socket`
-sets `ActorConfig.remote_sqlite = false`, enables the actor database, and uses
-the same `LocalNative` database. This makes S5 a transport comparison against
-one backend mode. Core's FFI-visible `SqliteDb` API can operate against either
+The embedding compiles both core features. `Actor.Database` defaults false;
+those actors retain `RemoteEnvoy` for state/KV and `Context.DB()` returns
+`sqlite_transport_not_configured`. Declaring actors use the same `LocalNative`
+database through either `ffi` or `socket`. The runner-level transport is only
+a selection: empty defaults to FFI, while `disabled` force-disables databases
+for every actor. Core's FFI-visible `SqliteDb` API can operate against either
 backend, but the Actor Runtime Socket rejects every database other than an
 enabled `LocalNative` one, so comparing FFI/remote with socket/local would
 confound transport and execution placement.
 
-`Config.SQLiteTransport` accepts only `rivet.SQLiteTransportFFI` (`"ffi"`) or
-`rivet.SQLiteTransportSocket` (`"socket"`).
+`Config.SQLiteTransport` accepts `rivet.SQLiteTransportFFI` (`"ffi"`),
+`rivet.SQLiteTransportSocket` (`"socket"`), or
+`rivet.SQLiteTransportDisabled` (`"disabled"`). An empty value resolves to
+FFI.
 `RIVET_GO_SQLITE_TRANSPORT` overrides it for a complete runner invocation.
-There is intentionally no fallback or recommendation while the M7 result is
-reviewed. The socket candidate also enables
+The socket candidate also enables
 `ActorConfig.enable_actor_runtime_socket`, provisions the Unix endpoint before
 `ActorStart`, and passes its generation-scoped path to Go. The endpoint is
 closed and recreated on sleep/wake; an open socket transaction is rolled back
@@ -667,6 +670,12 @@ late completion is consumed safely; neither core operation is forcibly
 preempted after submission. Already-canceled contexts are rejected before
 submission.
 
+ABI 8 adds `RunnerConfig.actor_databases`, a bounded map from registered actor
+name to the public `Actor.Database` boolean. Rust combines the manifest value
+with the transport selection when setting `has_database`; database-less and
+force-disabled actors keep `remote_sqlite = true`. No command or event shape
+changes in ABI 8.
+
 The socket client is pure Go. It vendors
 `engine/sdks/rust/actor-runtime-socket-protocol/schemas/v1.bare` at commit
 `957d4e482f404913ca1955d8ecc357533f6fd081`, implements the two-byte vbare
@@ -699,6 +708,11 @@ the durable SQL fixture therefore sleeps the actor, stops the runner, replaces
 the engine against the same data directory, starts a new runner, and
 demand-wakes the actor. This proves persisted storage recovery, not seamless
 rescheduling of a live generation across a crash.
+
+The separate live-generation regression pins that limitation directly. After
+runner reconnection and the 22-second envoy liveness window, the engine still
+reports the old database generation as connectable, gateway work returns
+`503 Actor not found`, and Go receives no later `ActorStart`.
 
 SQL and actor state use separate engine commit operations, not a cross-store
 transaction. A successful SQL `Exec` or `Tx.Commit` is durable before it

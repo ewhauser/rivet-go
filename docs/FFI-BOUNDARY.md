@@ -630,14 +630,22 @@ and unknown actor keys are rejected before the registry starts. It adds no
 event/command variant, binary blob, nested container, or new native allocation
 ownership rule. No fuzz or deliberately malformed-input test was added.
 
-## M7 SQLite transports and ABI 7 — 2026-08-05
+## M7 SQLite transports and ABI 7/8 — 2026-08-05
 
-ABI 7 is single-sourced by Rust and generated into the cbindgen header and Go
-loader for all six artifacts. `RunnerConfig.sqlite_transport` accepts empty,
-`ffi`, or `socket`. Empty retains the M2 `RemoteEnvoy` state/KV database and
-does not expose public SQL. Both explicit candidates enable the actor database
-with `ActorConfig.remote_sqlite = false`, selecting `SqliteBackend::LocalNative`;
-only `socket` also sets `enable_actor_runtime_socket`.
+ABI 7 added the SQLite transport and command/event shapes described below. ABI
+8 is now single-sourced by Rust and generated into the cbindgen header and Go
+loader for all six artifacts. It adds `RunnerConfig.actor_databases`, a bounded
+map from registered actor name to `Actor.Database`. Rust validates every key
+against `actor_names` and enables `ActorConfig.has_database` only when both the
+manifest value and a nonempty wire transport are present. Database-less and
+force-disabled actors retain `ActorConfig.remote_sqlite = true`; declaring
+actors select `SqliteBackend::LocalNative`, and only declaring socket actors
+set `enable_actor_runtime_socket`.
+
+`RunnerConfig.sqlite_transport` still accepts empty, `ffi`, or `socket` at the
+wire boundary. Public `Config.SQLiteTransport` resolves empty to FFI before
+encoding and maps `disabled` to the empty wire value, so the runner field is a
+transport selection rather than an implicit all-actor database switch.
 
 At this pin, LocalNative means the native SQLite worker and transaction
 coordinator execute in the embedded runner. Its Depot VFS still obtains pages
@@ -754,10 +762,24 @@ pointer. The workspace Cargo patch vendors the exact v2.3.10 seven-file Depot
 client and changes only that branch to return an empty blob. This is a local
 pin correction, not a dependency or Rivet version change.
 
+### Engine replacement recovery
+
+At this pin, a LocalNative database actor left live across abrupt standalone
+engine replacement stays assigned to its old envoy generation. After the
+runner reconnects and the 22-second envoy liveness window passes, engine
+metadata still reports that generation as connectable, gateway work returns
+`503 Actor not found`, and Go receives no new `ActorStart`. The conformance
+test asserts that exact negative outcome. The durable recovery fixture sleeps
+the database actor first, replaces the engine against the same data directory,
+then demand-wakes a higher generation and verifies its SQL rows and actor state.
+
 New decode surfaces: ABI 7 adds the bounded `sqlite_transport` string, optional
 ActorStart socket-path string, five SQLite command variants, the chunked
 `SqliteResult` event, and the `SqliteValue` union to the existing MessagePack
 scanner. The pure-Go socket client additionally decodes the u32 frame length,
 vbare hello, `ServerFrame`/`ResponsePayload` variants, structured socket error
 metadata, column strings, row/value lists, and optional last-insert ID from the
-vendored BARE schema. No fuzz or deliberately malformed-input test was added.
+vendored BARE schema. ABI 8 adds only the bounded string-to-boolean
+`actor_databases` manifest map; it adds no command, event, blob, nested
+container, or native allocation ownership surface. No fuzz or deliberately
+malformed-input test was added.

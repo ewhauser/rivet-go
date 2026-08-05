@@ -146,6 +146,14 @@ starts a new runner, and demand-wakes the actor. The recovered SQL rows and Go
 state prove storage durability across process replacement; the fixture does
 not claim live-generation failover.
 
+`TestDatabaseActorLiveGenerationDoesNotRehydrateAcrossEngineCrash` pins that
+negative interaction. A `Database: true` actor is left live across standalone
+engine replacement. After runner reconnection and the 22-second envoy
+liveness window, engine metadata still assigns the old generation, a gateway
+request returns `503 Actor not found`, and no new Go `ActorStart` occurs. The
+sleep-first durability case above is the supported recovery fixture at this
+pin.
+
 The suite is intentionally part of normal `go test ./conformance` and the full
 `go test -race -count=1 ./...` gate. It is not skipped as a long test. No fuzz
 or deliberately malformed socket-input cases live here; the supervisor owns

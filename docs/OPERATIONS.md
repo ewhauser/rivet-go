@@ -28,30 +28,38 @@ raw WebSockets have already received 1001, `Registry.Serve` returns an error,
 and the runnable examples exit with code 1. Treat that forced path as a
 production incident even when the process must continue exiting.
 
-## Per-actor SQLite transport
+## Per-actor SQLite
 
-M7 deliberately has no default SQL transport. Select one for the complete
-runner invocation:
+SQLite is an actor capability. Declare it only on actor types that use
+`Context.DB`:
 
 ```go
-config.SQLiteTransport = rivet.SQLiteTransportFFI
-// or: rivet.SQLiteTransportSocket
+rivet.Actor[State]{
+    Database: true,
+    // ...
+}
 ```
 
-`RIVET_GO_SQLITE_TRANSPORT=ffi|socket` overrides the config and is primarily
-used by the candidate benchmark. An empty setting preserves the existing
-remote state/KV backend, but `ctx.DB()` operations return the structured
-`sqlite_transport_not_configured` error. Do not silently choose a candidate in
-application configuration until the review pass selects a default.
+`Config.SQLiteTransport` selects one transport for all declaring actors. Its
+empty value defaults to `rivet.SQLiteTransportFFI`. Set
+`rivet.SQLiteTransportSocket` to use the experimental Unix socket path, or
+`rivet.SQLiteTransportDisabled` to force-disable databases for every actor.
+`RIVET_GO_SQLITE_TRANSPORT=ffi|socket|disabled` overrides the config for a
+complete runner invocation.
 
-| Build target | FFI SQLite | Socket SQLite |
+An actor without `Database: true`, or any actor under the disabled transport,
+keeps the RemoteEnvoy state/KV backend. Its `ctx.DB()` handle returns the
+structured `sqlite_transport_not_configured` error and points to the actor
+declaration in its message.
+
+| Build target | FFI SQLite (default) | Socket SQLite |
 |---|---|---|
 | macOS arm64 | Supported | Supported |
 | Linux amd64/arm64, glibc or musl | Supported | Supported |
 | Windows amd64 | Supported | Rejected during runner configuration because the endpoint is Unix-only |
 | Other targets, including macOS amd64 | Unsupported-platform runner stub | Unsupported-platform runner stub |
 
-Both explicit choices run core's LocalNative SQLite worker against the same
+Both active choices run core's LocalNative SQLite worker against the same
 engine-backed per-actor Depot storage. `ffi` sends correlated commands through
 the existing MessagePack pump and reconstructs chunked results. `socket` uses
 core's experimental generation-scoped Unix endpoint and is unavailable on
@@ -144,15 +152,13 @@ go run ./cmd/soak \
 
 Record the printed seed and complete final summary with the release evidence.
 
-Known intermittent (2026-08-03/04, unresolved): rare exit-1 soak failures —
-one `-duration=2m -intensity=4` run (2026-08-03) and one default-profile run
-(2026-08-04, post-hibernation-fix) — each passing on immediate rerun; roughly
-one failure in ten short runs. Neither failure's output was captured (both
-were piped through truncating filters — always redirect soak output to a
-file). Until a failure is reproduced with output, treat single short-run
-failures as retry-once, gate releases on the default profile passing plus the
-24-hour procedure, and preserve the printed summary and failure data
-directory from any failing run.
+A captured default-profile failure on 2026-08-05 showed that the pinned engine
+can still return plain `503 Actor not found` for the alarm actor just after the
+nominal 22-second restart settlement. The harness now retries only that exact
+response and the existing structured `actor/stopping` transition within its
+30-second rehydration budget. Earlier uncaptured 2026-08-03/04 failures cannot
+be attributed retroactively. Preserve the printed summary and failure data
+directory from any future failure.
 The harness fails if any required chaos knob did not activate, if its Go truth
 model differs field-by-field from engine-persisted actor state, if any live
 client sees a missing or duplicate broadcast, if sequence values regress, or
@@ -160,7 +166,9 @@ if the final goroutine and native-handle counts do not return to baseline.
 
 The mandatory activations are engine replacement using the same data
 directory, mid-stream client disconnect, sleep/wake churn, a stalled WebSocket
-client, and a sacrificial action panic. A successful duration alone is not a
+client, a sacrificial action panic, and database inserts reconciled against an
+independent row-count oracle. Other soak actors remain database-less, so the
+same run covers both capability classes. A successful duration alone is not a
 pass.
 
 The soak gives its final runner drain 60 seconds so actors accumulated across
@@ -235,7 +243,7 @@ download dependency.
 
 ## Known v2.3.10 limitations
 
-The following 15 bullets are the grouped, complete deviation summary for the
+The following bullets are the grouped, complete deviation summary for the
 pin-specific notes in `docs/FFI-BOUNDARY.md`:
 
 - Core calls runner registration an envoy and exposes it through `/envoys`.
@@ -245,18 +253,24 @@ pin-specific notes in `docs/FFI-BOUNDARY.md`:
 - Actor creation time is unavailable to the adapter and crosses as zero.
   Core reduces stop causes to sleep or destroy, with the Go panic-stop path
   adding stop.
-- With no M7 SQL transport selected, state and actor KV use core's remote
-  SQLite backend. Either explicit SQL candidate switches that actor to the
-  LocalNative worker while retaining engine-backed Depot durability. The build
-  supplies SQLite batch-atomic-write support required by that mode.
-- Per-actor SQL has no default recommendation. FFI and socket share one public
-  API and one LocalNative backend for comparison; the experimental socket is
-  Unix-only and generation-scoped, while FFI is supported on all six targets.
+- Database-less actors use core's RemoteEnvoy state/KV backend. Setting
+  `Database: true` switches that actor to the LocalNative worker while retaining
+  engine-backed Depot durability; `SQLiteTransportDisabled` overrides every
+  declaration. The build supplies SQLite batch-atomic-write support required
+  by LocalNative.
+- FFI is the default database transport and is supported on all six targets.
+  Socket shares the public API and LocalNative backend but is experimental,
+  Unix-only, and generation-scoped.
 - SQL results are fully buffered and bounded: 1 MiB SQL/text/blob values,
   1,024 arguments/columns, and 32 MiB results. FFI chunks within that total;
   a socket response must fit one frame including protocol overhead. The exact
   pin's Depot decoder is locally corrected so an empty BLOB remains distinct
   from NULL.
+- A database actor left live across abrupt standalone engine replacement stays
+  assigned to its old generation at this pin. After runner reconnection and
+  the envoy liveness window, gateway work returns `503 Actor not found` and no
+  new Go `ActorStart` occurs. Sleep database actors before planned standalone
+  replacement; sleep/wake durability is covered separately.
 - Gateway JSON action arguments are normalized to CBOR by core. `RawAction`
   therefore exposes the exact CBOR argument array, not original JSON bytes.
   Actions use the pin's 60-second cooperative deadline; Go cannot preempt a
