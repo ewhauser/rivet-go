@@ -20,8 +20,6 @@ import (
 	"sync/atomic"
 	"time"
 	"unsafe"
-
-	"github.com/ebitengine/purego"
 )
 
 type cRunner struct{}
@@ -172,10 +170,13 @@ func (a *nativeAPI) load() error {
 }
 
 func (a *nativeAPI) bindAndValidate(handle uintptr) error {
-	if err := a.register(handle); err != nil {
+	if err := registerLibraryFunc(handle, "rk_abi_version", &a.abiVersion); err != nil {
 		return err
 	}
-	return requireABIVersion(a.abiVersion())
+	if err := requireABIVersion(a.abiVersion()); err != nil {
+		return err
+	}
+	return a.register(handle)
 }
 
 func requireABIVersion(got uint32) error {
@@ -186,39 +187,6 @@ func requireABIVersion(got uint32) error {
 			ExpectedABIVersion,
 		)
 	}
-	return nil
-}
-
-func (a *nativeAPI) register(handle uintptr) error {
-	for _, binding := range []struct {
-		name string
-		dst  any
-	}{
-		{"rk_abi_version", &a.abiVersion},
-		{"rk_bytes_free", &a.bytesFree},
-		{"rk_string_free", &a.stringFree},
-		{"rk_error_json", &a.errorJSON},
-		{"rk_error_free", &a.errorFree},
-		{"rk_runner_new", &a.runnerNew},
-		{"rk_runner_free", &a.runnerFree},
-		{"rk_runner_poll", &a.runnerPoll},
-		{"rk_runner_submit", &a.runnerSubmit},
-		{"rk_runner_shutdown", &a.runnerShutdown},
-	} {
-		if err := registerLibraryFunc(handle, binding.name, binding.dst); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func registerLibraryFunc(handle uintptr, name string, dst any) (err error) {
-	defer func() {
-		if recovered := recover(); recovered != nil {
-			err = fmt.Errorf("register native function %s: %v", name, recovered)
-		}
-	}()
-	purego.RegisterLibFunc(dst, handle, name)
 	return nil
 }
 

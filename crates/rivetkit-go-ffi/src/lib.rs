@@ -370,6 +370,100 @@ pub unsafe extern "C" fn rk_runner_shutdown(
     })
 }
 
+// purego intentionally does not marshal structs on Windows. These private,
+// additive exports preserve the public ABI while giving the Go loader a
+// pointer-only representation of the same calls on that platform.
+#[cfg(windows)]
+#[doc(hidden)]
+#[unsafe(no_mangle)]
+pub extern "C" fn rk_windows_bytes_free(ptr: *mut u8, len: usize, cap: usize) {
+    rk_bytes_free(RkBytes { ptr, len, cap });
+}
+
+#[cfg(windows)]
+#[doc(hidden)]
+#[unsafe(no_mangle)]
+pub extern "C" fn rk_windows_string_free(ptr: *mut u8, len: usize, cap: usize) {
+    rk_string_free(RkBytes { ptr, len, cap });
+}
+
+#[cfg(windows)]
+#[doc(hidden)]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rk_windows_error_json(error: *const RkError, out: *mut RkBytes) {
+    if out.is_null() {
+        return;
+    }
+    // SAFETY: Forwarding the caller's live error handle; out is non-null and
+    // points to writable storage supplied for this call.
+    unsafe { out.write(rk_error_json(error)) };
+}
+
+#[cfg(windows)]
+#[doc(hidden)]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rk_windows_runner_new(
+    config: *const u8,
+    config_len: usize,
+    out: *mut RkRunnerResult,
+) {
+    if out.is_null() {
+        return;
+    }
+    // SAFETY: Forwarding the caller's borrowed-buffer promise; out is non-null
+    // and points to writable storage supplied for this call.
+    unsafe { out.write(rk_runner_new(config, config_len)) };
+}
+
+#[cfg(windows)]
+#[doc(hidden)]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rk_windows_runner_poll(
+    runner: *mut RkRunner,
+    timeout_ms: u32,
+    out: *mut RkPollResult,
+) {
+    if out.is_null() {
+        return;
+    }
+    // SAFETY: Forwarding the caller's live runner handle; out is non-null and
+    // points to writable storage supplied for this call.
+    unsafe { out.write(rk_runner_poll(runner, timeout_ms)) };
+}
+
+#[cfg(windows)]
+#[doc(hidden)]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rk_windows_runner_submit(
+    runner: *mut RkRunner,
+    batch: *const u8,
+    len: usize,
+    out: *mut RkSubmitResult,
+) {
+    if out.is_null() {
+        return;
+    }
+    // SAFETY: Forwarding the caller's live runner and borrowed-buffer
+    // promises; out is non-null and writable for this call.
+    unsafe { out.write(rk_runner_submit(runner, batch, len)) };
+}
+
+#[cfg(windows)]
+#[doc(hidden)]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rk_windows_runner_shutdown(
+    runner: *mut RkRunner,
+    deadline_ms: u32,
+    out: *mut RkSubmitResult,
+) {
+    if out.is_null() {
+        return;
+    }
+    // SAFETY: Forwarding the caller's live runner handle; out is non-null and
+    // writable for this call.
+    unsafe { out.write(rk_runner_shutdown(runner, deadline_ms)) };
+}
+
 // This probe is deliberately excluded from the generated public header. The
 // build script enables it only so Go tests can prove that a panic originating
 // inside the loaded cdylib is caught before returning across extern "C".
@@ -377,6 +471,18 @@ pub unsafe extern "C" fn rk_runner_shutdown(
 #[unsafe(no_mangle)]
 pub extern "C" fn rk_test_panic() -> RkSubmitResult {
     firewall_submit(|| panic!("panic firewall probe"))
+}
+
+#[cfg(all(windows, any(test, feature = "ffi-test")))]
+#[doc(hidden)]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rk_windows_test_panic(out: *mut RkSubmitResult) {
+    if out.is_null() {
+        return;
+    }
+    // SAFETY: out is non-null and points to writable storage supplied for
+    // this call.
+    unsafe { out.write(rk_test_panic()) };
 }
 
 #[cfg(test)]

@@ -155,8 +155,8 @@ func TestPanicFirewallThroughLoadedLibrary(t *testing.T) {
 		t.Fatalf("Load: %v", err)
 	}
 
-	var panicProbe func() cSubmitResult
-	if err := registerLibraryFunc(api.handle, "rk_test_panic", &panicProbe); err != nil {
+	panicProbe, err := registerPanicProbe(api.handle)
+	if err != nil {
 		t.Fatalf("register rk_test_panic: %v", err)
 	}
 	result := panicProbe()

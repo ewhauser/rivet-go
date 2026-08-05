@@ -9,7 +9,17 @@ documentation = true
 parse_deps = false
 
 [export]
-exclude = ["rk_test_panic"]
+exclude = [
+  "rk_test_panic",
+  "rk_windows_bytes_free",
+  "rk_windows_string_free",
+  "rk_windows_error_json",
+  "rk_windows_runner_new",
+  "rk_windows_runner_poll",
+  "rk_windows_runner_submit",
+  "rk_windows_runner_shutdown",
+  "rk_windows_test_panic",
+]
 include = [
   "RK_ABI_VERSION",
   "RkBytes",

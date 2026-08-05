@@ -3,7 +3,7 @@ name: verify
 on:
   pull_request: {}
   push:
-    branches: [main]
+    branches: [main, ci-green]
 
 permissions:
   contents: read
@@ -12,6 +12,7 @@ jobs:
   native:
     name: ${{ matrix.name }}
     runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
@@ -83,7 +84,7 @@ jobs:
         run: |
           set -euo pipefail
           docker run --rm --volume "$PWD:/src" --workdir /src golang:1.26-alpine \
-            go test -short -count=1 -v ./...
+            sh -ceu 'apk add --no-cache rust >/dev/null && go test -short -count=1 -v ./...'
 
       - name: Build native FFI library
         shell: bash
@@ -103,11 +104,58 @@ jobs:
         run: |
           set -euo pipefail
           docker run --rm --volume "$PWD:/src" --workdir /src golang:1.26-alpine \
-            go test -short -count=1 -v ./...
+            sh -ceu 'apk add --no-cache rust >/dev/null && go test -short -count=1 -v ./...'
+
+  engine:
+    name: linux-amd64-engine
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Restore pinned engine
+        id: engine-cache
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cache/rivet-go/engine-v2.3.10/rivet-engine
+            ~/.cache/rivet-go/engine-v2.3.10/build.log
+          key: rivet-engine-v2.3.10-${{ runner.os }}-${{ runner.arch }}-957d4e482f404913ca1955d8ecc357533f6fd081-source-cwd-v1
+
+      - name: Install Rust toolchain
+        if: steps.engine-cache.outputs.cache-hit != 'true'
+        run: |
+          rustup toolchain install 1.97.0 --profile minimal
+          rustup default 1.97.0
+
+      - name: Build or verify pinned engine
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p .ci-logs
+          go run ./.github/scripts/build-engine 2>&1 | tee .ci-logs/engine-acquisition.log
+
+      - name: Upload engine build failure logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-amd64-engine-logs
+          path: |
+            .ci-logs/engine-acquisition.log
+            ~/.cache/rivet-go/engine-v2.3.10/build.log
+          if-no-files-found: ignore
+          retention-days: 14
 
   conformance:
     name: linux-amd64-conformance
     runs-on: ubuntu-latest
+    needs: engine
+    timeout-minutes: 35
     steps:
       - uses: actions/checkout@v7
 
@@ -116,24 +164,38 @@ jobs:
           go-version-file: go.mod
           cache: true
 
-      - name: Install Rust toolchain
-        run: |
-          rustup toolchain install 1.97.0 --profile minimal
-          rustup default 1.97.0
-
-      - name: Cache pinned engine
+      - name: Restore pinned engine
         uses: actions/cache@v5
         with:
-          path: ~/.cache/rivet-go/engine-v2.3.10
-          key: rivet-engine-v2.3.10-${{ runner.os }}-${{ runner.arch }}-957d4e482f404913ca1955d8ecc357533f6fd081
+          path: |
+            ~/.cache/rivet-go/engine-v2.3.10/rivet-engine
+            ~/.cache/rivet-go/engine-v2.3.10/build.log
+          key: rivet-engine-v2.3.10-${{ runner.os }}-${{ runner.arch }}-957d4e482f404913ca1955d8ecc357533f6fd081-source-cwd-v1
+          fail-on-cache-miss: true
 
       - name: Run real-engine conformance
-        run: go test -race -count=1 -v ./...
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p .ci-logs
+          go test -race -count=1 -timeout=25m -v ./... 2>&1 | tee .ci-logs/conformance.log
+
+      - name: Upload conformance failure logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-amd64-conformance-logs
+          path: |
+            .ci-logs/conformance.log
+            ~/.cache/rivet-go/engine-v2.3.10/build.log
+          if-no-files-found: ignore
+          retention-days: 14
 
   soak-smoke:
     name: linux-amd64-soak-smoke
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    needs: engine
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7
 
@@ -142,16 +204,29 @@ jobs:
           go-version-file: go.mod
           cache: true
 
-      - name: Install Rust toolchain
-        run: |
-          rustup toolchain install 1.97.0 --profile minimal
-          rustup default 1.97.0
-
-      - name: Cache pinned engine
+      - name: Restore pinned engine
         uses: actions/cache@v5
         with:
-          path: ~/.cache/rivet-go/engine-v2.3.10
-          key: rivet-engine-v2.3.10-${{ runner.os }}-${{ runner.arch }}-957d4e482f404913ca1955d8ecc357533f6fd081
+          path: |
+            ~/.cache/rivet-go/engine-v2.3.10/rivet-engine
+            ~/.cache/rivet-go/engine-v2.3.10/build.log
+          key: rivet-engine-v2.3.10-${{ runner.os }}-${{ runner.arch }}-957d4e482f404913ca1955d8ecc357533f6fd081-source-cwd-v1
+          fail-on-cache-miss: true
 
       - name: Run strict chaos smoke
-        run: go run ./cmd/soak
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p .ci-logs
+          go run ./cmd/soak 2>&1 | tee .ci-logs/soak-smoke.log
+
+      - name: Upload soak failure logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-amd64-soak-smoke-logs
+          path: |
+            .ci-logs/soak-smoke.log
+            ~/.cache/rivet-go/engine-v2.3.10/build.log
+          if-no-files-found: ignore
+          retention-days: 14

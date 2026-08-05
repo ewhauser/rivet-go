@@ -68,14 +68,7 @@ func buildPinned(ctx context.Context, cache string) (string, error) {
 	}
 
 	target := filepath.Join(cache, "target")
-	command := exec.CommandContext(
-		ctx,
-		"cargo", "build",
-		"--manifest-path", filepath.Join(source, "Cargo.toml"),
-		"-p", "rivet-engine",
-		"--release",
-		"--target-dir", target,
-	)
+	command := pinnedBuildCommand(ctx, source, target)
 	logPath := filepath.Join(cache, "build.log")
 	logFile, err := os.Create(logPath)
 	if err != nil {
@@ -103,6 +96,22 @@ func buildPinned(ctx context.Context, cache string) (string, error) {
 		return "", fmt.Errorf("cache built engine: %w", err)
 	}
 	return verifyBinary(ctx, destination)
+}
+
+func pinnedBuildCommand(ctx context.Context, source, target string) *exec.Cmd {
+	command := exec.CommandContext(
+		ctx,
+		"cargo", "build",
+		"--manifest-path", filepath.Join(source, "Cargo.toml"),
+		"-p", "rivet-engine",
+		"--release",
+		"--target-dir", target,
+	)
+	// Cargo discovers .cargo/config.toml from its working directory, not from
+	// --manifest-path. Rivet's checkout enables tokio_unstable there for the
+	// runtime metrics APIs used by the pinned engine.
+	command.Dir = source
+	return command
 }
 
 // Engine is one restartable local engine process. Restarts retain StorageDir.
