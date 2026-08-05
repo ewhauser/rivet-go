@@ -1448,18 +1448,27 @@ type servedRegistry struct {
 }
 
 func startRegistry(t *testing.T, engine *runningEngine, runnerName string, registry *rivet.Registry) *servedRegistry {
+	return startRegistryWithConfig(t, engine, runnerName, registry, rivet.Config{})
+}
+
+func startRegistryWithConfig(
+	t *testing.T,
+	engine *runningEngine,
+	runnerName string,
+	registry *rivet.Registry,
+	config rivet.Config,
+) *servedRegistry {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	served := &servedRegistry{cancel: cancel, result: make(chan error, 1)}
+	config.Endpoint = engine.endpoint
+	config.Namespace = "default"
+	config.RunnerName = runnerName
+	config.Version = 1
+	config.TotalSlots = 16
+	config.LogLevel = "error"
 	go func() {
-		served.result <- registry.Serve(ctx, rivet.Config{
-			Endpoint:   engine.endpoint,
-			Namespace:  "default",
-			RunnerName: runnerName,
-			Version:    1,
-			TotalSlots: 16,
-			LogLevel:   "error",
-		})
+		served.result <- registry.Serve(ctx, config)
 	}()
 	t.Cleanup(func() { served.stop(t) })
 
