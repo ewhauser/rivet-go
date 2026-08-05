@@ -123,16 +123,19 @@ release procedure is documented in `docs/OPERATIONS.md`.
 `TestPerActorSQLiteConformance` is one real-engine test parameterized over
 `ffi` and `socket`. Each candidate runs CRUD, parameter binding for NULL,
 integer, real, text, blob, and distinct empty-blob values, commit and rollback,
-lease expiry, syntax and constraint errors, concurrent access, per-actor
-isolation, SQL plus public state/KV, ordinary sleep/wake, and engine process
-replacement against the same data directory. SQL errors must retain structured
-codes and the actor must remain healthy.
+integer boundaries, REAL non-finite behavior, embedded-NUL text, a blob at the
+value cap, lease expiry and rollback read-after, cancellation, rejected second
+Begin, outer-DB transaction gating, syntax, constraint, and multi-statement
+errors, concurrent access, per-actor isolation, SQL plus explicit public state
+save, result-limit recovery, ordinary sleep/wake, dirty-lease sleep, and engine
+process replacement against the same data directory. SQL errors must retain
+structured codes and the actor must remain healthy.
 
 FFI additionally queries a result larger than one boundary batch and requires
-ordered reconstruction. Socket additionally sleeps the actor while a
-transaction lease is open; Go closes the old generation's endpoint before the
-sleep intent, the lease rolls back, and the stale `Tx` cannot affect the
-rehydrated actor.
+ordered reconstruction, including an empty result. Both candidates sleep the
+actor while a transaction lease is open; the shared Go lifecycle fence rejects
+new work, rolls back the lease, waits for admitted calls, closes the transport,
+and then submits sleep. The stale `Tx` cannot affect the rehydrated actor.
 
 Pinned engine behavior constrains the restart fixture. A generation left live
 across abrupt standalone engine replacement remains associated with its old

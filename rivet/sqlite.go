@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"sync"
 	"sync/atomic"
 	"time"
 	"unicode/utf8"
@@ -16,6 +17,7 @@ import (
 
 const (
 	defaultSQLiteLeaseTimeout = 60 * time.Second
+	defaultSQLiteCloseTimeout = 10 * time.Second
 	maxSQLiteSQLBytes         = 1 << 20
 	maxSQLiteArguments        = 1_024
 	maxSQLiteValueBytes       = 1 << 20
@@ -36,7 +38,8 @@ type Result struct {
 }
 
 // Rows is a fully buffered SQLite query result. Every value is nil, int64,
-// float64, string, or []byte.
+// float64, string, or []byte. SQLite stores a bound NaN as NULL; infinities
+// remain REAL values. Text returned by the pinned engine is valid UTF-8.
 type Rows struct {
 	Columns []string
 	Values  [][]any
@@ -73,7 +76,8 @@ func (e *SQLiteError) Error() string {
 // Tx is an explicit actor SQLite transaction. The lease defaults to 60
 // seconds. If Begin's context has an earlier deadline, that remaining duration
 // becomes the lease timeout. Expiry rolls the transaction back; transactions
-// also die with their actor generation or socket connection.
+// also die with their actor generation or socket connection. One Tx may be
+// open per DB; another Begin returns transaction_already_open.
 type Tx interface {
 	Exec(context.Context, string, ...any) (Result, error)
 	Query(context.Context, string, ...any) (Rows, error)
@@ -93,17 +97,39 @@ type sqliteBackend interface {
 // DB is one actor generation's SQLite database handle. Core serializes the
 // native SQLite worker; the SDK permits concurrent non-transaction calls and
 // core queues them. An active transaction exclusively gates other operations.
+// Sleep and stop reject new calls, roll back that transaction, wait for
+// admitted calls, and close this generation's transport.
 type DB struct {
 	backend sqliteBackend
+
+	lifecycleMu  sync.Mutex
+	lifecycle    *sync.Cond
+	closing      bool
+	active       int
+	beginning    bool
+	transactions map[*sqliteTx]struct{}
+	closeOnce    sync.Once
+	closeDone    chan struct{}
+	closeErr     error
+}
+
+func makeDB(backend sqliteBackend) *DB {
+	database := &DB{
+		backend:      backend,
+		transactions: make(map[*sqliteTx]struct{}),
+		closeDone:    make(chan struct{}),
+	}
+	database.lifecycle = sync.NewCond(&database.lifecycleMu)
+	return database
 }
 
 func newDB(session *pump.ActorSession) (*DB, error) {
 	if session == nil {
-		return &DB{backend: disabledSQLiteBackend{}}, nil
+		return makeDB(disabledSQLiteBackend{}), nil
 	}
 	switch SQLiteTransport(session.SQLiteTransport()) {
 	case SQLiteTransportFFI:
-		return &DB{backend: ffiSQLiteBackend{session: session}}, nil
+		return makeDB(ffiSQLiteBackend{session: session}), nil
 	case SQLiteTransportSocket:
 		if session.SQLiteSocketPath() == "" {
 			return nil, &SQLiteError{Code: "sqlite_socket_unavailable", Message: "ActorStart did not include a socket endpoint"}
@@ -114,9 +140,9 @@ func newDB(session *pump.ActorSession) (*DB, error) {
 		if err != nil {
 			return nil, &SQLiteError{Code: "sqlite_socket_connect_failed", Message: err.Error()}
 		}
-		return &DB{backend: &socketSQLiteBackend{client: client}}, nil
+		return makeDB(&socketSQLiteBackend{client: client}), nil
 	default:
-		return &DB{backend: disabledSQLiteBackend{}}, nil
+		return makeDB(disabledSQLiteBackend{}), nil
 	}
 }
 
@@ -124,6 +150,9 @@ func (d *DB) Exec(ctx context.Context, sql string, args ...any) (Result, error) 
 	if d == nil || d.backend == nil {
 		return Result{}, sqliteUnavailableError()
 	}
+	if err := validateSQLiteContext(ctx); err != nil {
+		return Result{}, err
+	}
 	if err := validateSQLiteSQL(sql); err != nil {
 		return Result{}, err
 	}
@@ -131,6 +160,10 @@ func (d *DB) Exec(ctx context.Context, sql string, args ...any) (Result, error) 
 	if err != nil {
 		return Result{}, err
 	}
+	if err := d.beginOperation(); err != nil {
+		return Result{}, err
+	}
+	defer d.finishOperation()
 	return d.backend.exec(ctx, sql, values, nil)
 }
 
@@ -138,6 +171,9 @@ func (d *DB) Query(ctx context.Context, sql string, args ...any) (Rows, error) {
 	if d == nil || d.backend == nil {
 		return Rows{}, sqliteUnavailableError()
 	}
+	if err := validateSQLiteContext(ctx); err != nil {
+		return Rows{}, err
+	}
 	if err := validateSQLiteSQL(sql); err != nil {
 		return Rows{}, err
 	}
@@ -145,6 +181,10 @@ func (d *DB) Query(ctx context.Context, sql string, args ...any) (Rows, error) {
 	if err != nil {
 		return Rows{}, err
 	}
+	if err := d.beginOperation(); err != nil {
+		return Rows{}, err
+	}
+	defer d.finishOperation()
 	return d.backend.query(ctx, sql, values, nil)
 }
 
@@ -152,8 +192,8 @@ func (d *DB) Begin(ctx context.Context) (Tx, error) {
 	if d == nil || d.backend == nil {
 		return nil, sqliteUnavailableError()
 	}
-	if ctx == nil {
-		return nil, errors.New("SQLite begin context is nil")
+	if err := validateSQLiteContext(ctx); err != nil {
+		return nil, err
 	}
 	timeout := defaultSQLiteLeaseTimeout
 	if deadline, ok := ctx.Deadline(); ok {
@@ -162,36 +202,152 @@ func (d *DB) Begin(ctx context.Context) (Tx, error) {
 	if timeout <= 0 {
 		return nil, context.DeadlineExceeded
 	}
+	if err := d.beginOperation(); err != nil {
+		return nil, err
+	}
+	defer d.finishOperation()
+	d.lifecycleMu.Lock()
+	if d.beginning || len(d.transactions) != 0 {
+		d.lifecycleMu.Unlock()
+		return nil, &SQLiteError{Code: "transaction_already_open", Message: "actor SQLite database already has an open transaction"}
+	}
+	d.beginning = true
+	d.lifecycleMu.Unlock()
+	defer func() {
+		d.lifecycleMu.Lock()
+		d.beginning = false
+		d.lifecycleMu.Unlock()
+	}()
 	leaseKey := fmt.Sprintf("go-%016x", sqliteLeaseSequence.Add(1))
 	if err := d.backend.begin(ctx, leaseKey, timeout); err != nil {
 		return nil, err
 	}
-	return &sqliteTx{backend: d.backend, leaseKey: leaseKey}, nil
+	transaction := &sqliteTx{owner: d, backend: d.backend, leaseKey: leaseKey}
+	d.lifecycleMu.Lock()
+	if d.closing {
+		d.lifecycleMu.Unlock()
+		rollbackCtx, cancel := context.WithTimeout(context.Background(), defaultSQLiteCloseTimeout)
+		defer cancel()
+		_ = d.backend.rollback(rollbackCtx, leaseKey)
+		transaction.terminal.Store(true)
+		return nil, sqliteClosedError()
+	}
+	d.transactions[transaction] = struct{}{}
+	d.lifecycleMu.Unlock()
+	return transaction, nil
 }
 
 func (d *DB) close() error {
 	if d == nil || d.backend == nil {
 		return nil
 	}
-	return d.backend.close()
+	return d.closeTransport()
 }
 
 func (d *DB) closeForSleep() error {
 	if d == nil || d.backend == nil {
 		return nil
 	}
-	return d.backend.close()
+	return d.closeTransport()
+}
+
+func (d *DB) beginOperation() error {
+	if d == nil || d.backend == nil {
+		return sqliteUnavailableError()
+	}
+	d.lifecycleMu.Lock()
+	defer d.lifecycleMu.Unlock()
+	if d.closing {
+		return sqliteClosedError()
+	}
+	d.active++
+	return nil
+}
+
+func (d *DB) finishOperation() {
+	d.lifecycleMu.Lock()
+	d.active--
+	if d.active == 0 {
+		d.lifecycle.Broadcast()
+	}
+	d.lifecycleMu.Unlock()
+}
+
+func (d *DB) unregisterTransaction(transaction *sqliteTx) {
+	if d == nil || transaction == nil {
+		return
+	}
+	d.lifecycleMu.Lock()
+	delete(d.transactions, transaction)
+	d.lifecycleMu.Unlock()
+}
+
+func (d *DB) closeTransport() error {
+	d.closeOnce.Do(func() {
+		d.lifecycleMu.Lock()
+		d.closing = true
+		transactions := make([]*sqliteTx, 0, len(d.transactions))
+		for transaction := range d.transactions {
+			transactions = append(transactions, transaction)
+		}
+		d.lifecycleMu.Unlock()
+
+		var closeErrors []error
+		for _, transaction := range transactions {
+			if !transaction.terminal.CompareAndSwap(false, true) {
+				continue
+			}
+			rollbackCtx, cancel := context.WithTimeout(context.Background(), defaultSQLiteCloseTimeout)
+			err := d.backend.rollback(rollbackCtx, transaction.leaseKey)
+			cancel()
+			if !expectedCloseRollbackError(err) {
+				closeErrors = append(closeErrors, err)
+			}
+			d.unregisterTransaction(transaction)
+		}
+
+		d.lifecycleMu.Lock()
+		for d.active != 0 {
+			d.lifecycle.Wait()
+		}
+		d.lifecycleMu.Unlock()
+
+		if err := d.backend.close(); err != nil {
+			closeErrors = append(closeErrors, err)
+		}
+		d.closeErr = errors.Join(closeErrors...)
+		close(d.closeDone)
+	})
+	<-d.closeDone
+	return d.closeErr
+}
+
+func expectedCloseRollbackError(err error) bool {
+	if err == nil {
+		return true
+	}
+	var structured *SQLiteError
+	return errors.As(err, &structured) &&
+		(structured.Code == "transaction_expired" || structured.Code == "invalid_lease_key")
+}
+
+func sqliteClosedError() error {
+	return &SQLiteError{Code: "sqlite_endpoint_closed", Message: "actor SQLite handle is closed for this generation"}
 }
 
 type sqliteTx struct {
+	owner    *DB
 	backend  sqliteBackend
 	leaseKey string
 	terminal atomic.Bool
 }
 
 func (t *sqliteTx) Exec(ctx context.Context, sql string, args ...any) (Result, error) {
-	if t == nil || t.backend == nil || t.terminal.Load() {
+	if t == nil || t.backend == nil {
 		return Result{}, &SQLiteError{Code: "invalid_lease_key", Message: "SQLite transaction is terminal"}
+	}
+	if err := validateSQLiteContext(ctx); err != nil {
+		return Result{}, err
 	}
 	if err := validateSQLiteSQL(sql); err != nil {
 		return Result{}, err
@@ -199,13 +355,23 @@ func (t *sqliteTx) Exec(ctx context.Context, sql string, args ...any) (Result, e
 	values, err := encodeSQLiteArgs(args)
 	if err != nil {
 		return Result{}, err
+	}
+	if err := t.owner.beginOperation(); err != nil {
+		return Result{}, err
+	}
+	defer t.owner.finishOperation()
+	if t.terminal.Load() {
+		return Result{}, &SQLiteError{Code: "invalid_lease_key", Message: "SQLite transaction is terminal"}
 	}
 	return t.backend.exec(ctx, sql, values, &t.leaseKey)
 }
 
 func (t *sqliteTx) Query(ctx context.Context, sql string, args ...any) (Rows, error) {
-	if t == nil || t.backend == nil || t.terminal.Load() {
+	if t == nil || t.backend == nil {
 		return Rows{}, &SQLiteError{Code: "invalid_lease_key", Message: "SQLite transaction is terminal"}
+	}
+	if err := validateSQLiteContext(ctx); err != nil {
+		return Rows{}, err
 	}
 	if err := validateSQLiteSQL(sql); err != nil {
 		return Rows{}, err
@@ -214,20 +380,49 @@ func (t *sqliteTx) Query(ctx context.Context, sql string, args ...any) (Rows, er
 	if err != nil {
 		return Rows{}, err
 	}
+	if err := t.owner.beginOperation(); err != nil {
+		return Rows{}, err
+	}
+	defer t.owner.finishOperation()
+	if t.terminal.Load() {
+		return Rows{}, &SQLiteError{Code: "invalid_lease_key", Message: "SQLite transaction is terminal"}
+	}
 	return t.backend.query(ctx, sql, values, &t.leaseKey)
 }
 
 func (t *sqliteTx) Commit(ctx context.Context) error {
-	if t == nil || t.backend == nil || !t.terminal.CompareAndSwap(false, true) {
+	if t == nil || t.backend == nil {
 		return &SQLiteError{Code: "invalid_lease_key", Message: "SQLite transaction is terminal"}
 	}
+	if err := validateSQLiteContext(ctx); err != nil {
+		return err
+	}
+	if err := t.owner.beginOperation(); err != nil {
+		return err
+	}
+	defer t.owner.finishOperation()
+	if !t.terminal.CompareAndSwap(false, true) {
+		return &SQLiteError{Code: "invalid_lease_key", Message: "SQLite transaction is terminal"}
+	}
+	defer t.owner.unregisterTransaction(t)
 	return t.backend.commit(ctx, t.leaseKey)
 }
 
 func (t *sqliteTx) Rollback(ctx context.Context) error {
-	if t == nil || t.backend == nil || !t.terminal.CompareAndSwap(false, true) {
+	if t == nil || t.backend == nil {
 		return &SQLiteError{Code: "invalid_lease_key", Message: "SQLite transaction is terminal"}
 	}
+	if err := validateSQLiteContext(ctx); err != nil {
+		return err
+	}
+	if err := t.owner.beginOperation(); err != nil {
+		return err
+	}
+	defer t.owner.finishOperation()
+	if !t.terminal.CompareAndSwap(false, true) {
+		return &SQLiteError{Code: "invalid_lease_key", Message: "SQLite transaction is terminal"}
+	}
+	defer t.owner.unregisterTransaction(t)
 	return t.backend.rollback(ctx, t.leaseKey)
 }
 
@@ -353,6 +548,13 @@ func validateSQLiteSQL(sql string) error {
 	return nil
 }
 
+func validateSQLiteContext(ctx context.Context) error {
+	if ctx == nil {
+		return errors.New("SQLite context is nil")
+	}
+	return ctx.Err()
+}
+
 func encodeSQLiteArgs(args []any) ([]wire.SQLiteValue, error) {
 	if len(args) > maxSQLiteArguments {
 		return nil, &SQLiteError{Code: "sqlite_too_many_arguments", Message: "SQLite arguments exceed the 1024-value limit"}
@@ -449,6 +651,12 @@ func decodeSQLiteValue(value wire.SQLiteValue) (any, error) {
 func publicSQLiteError(err error) error {
 	if err == nil {
 		return nil
+	}
+	if errors.Is(err, context.Canceled) {
+		return context.Canceled
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return context.DeadlineExceeded
 	}
 	var sqliteError *SQLiteError
 	if errors.As(err, &sqliteError) {

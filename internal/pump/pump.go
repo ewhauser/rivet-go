@@ -30,6 +30,7 @@ const (
 	actorEventQueue        = 64
 	maxHTTPChunk           = 1 << 20
 	maxWSMessage           = 1 << 20
+	maxSQLiteResponseBytes = 32 * 1024 * 1024
 )
 
 var (
@@ -193,6 +194,12 @@ type SQLiteResponse struct {
 	Values       []wire.SQLiteValue
 	RowsAffected int64
 	LastInsertID *int64
+}
+
+type sqliteResponseAssembler struct {
+	response   SQLiteResponse
+	nextChunk  uint32
+	totalBytes int
 }
 
 type httpRequestState struct {
@@ -832,36 +839,16 @@ func (s *ActorSession) sqlite(ctx context.Context, command wire.Command) (SQLite
 		return SQLiteResponse{}, err
 	}
 
-	var response SQLiteResponse
-	var nextChunk uint32
+	var assembler sqliteResponseAssembler
 	for {
 		select {
 		case event := <-result:
-			if event.ChunkIndex != nextChunk {
-				return SQLiteResponse{}, fmt.Errorf(
-					"SQLite result chunk index %d follows %d",
-					event.ChunkIndex,
-					nextChunk,
-				)
+			done, err := assembler.add(event)
+			if err != nil {
+				return SQLiteResponse{}, err
 			}
-			nextChunk++
-			if event.Error != nil {
-				return SQLiteResponse{}, *event.Error
-			}
-			if event.ChunkIndex == 0 {
-				response.Columns = append([]string(nil), event.Columns...)
-			}
-			response.Values = append(response.Values, event.SQLiteValues...)
-			response.RowsAffected = event.RowsAffected
-			response.LastInsertID = cloneInt64Pointer(event.LastInsertID)
-			if event.Done {
-				if len(response.Columns) == 0 && len(response.Values) != 0 {
-					return SQLiteResponse{}, errors.New("SQLite result has values without columns")
-				}
-				if len(response.Columns) != 0 && len(response.Values)%len(response.Columns) != 0 {
-					return SQLiteResponse{}, errors.New("SQLite result is not rectangular")
-				}
-				return response, nil
+			if done {
+				return assembler.response, nil
 			}
 		case <-ctx.Done():
 			s.pump.abandonSQLiteWaiter(requestID)
@@ -874,6 +861,69 @@ func (s *ActorSession) sqlite(ctx context.Context, command wire.Command) (SQLite
 			return SQLiteResponse{}, ErrShuttingDown
 		}
 	}
+}
+
+func (a *sqliteResponseAssembler) add(event wire.Event) (bool, error) {
+	if event.ChunkIndex != a.nextChunk {
+		return false, fmt.Errorf(
+			"SQLite result chunk index %d follows %d",
+			event.ChunkIndex,
+			a.nextChunk,
+		)
+	}
+	a.nextChunk++
+	if event.Error != nil {
+		return false, *event.Error
+	}
+	if event.ChunkIndex == 0 {
+		a.response.Columns = append([]string(nil), event.Columns...)
+		a.response.RowsAffected = event.RowsAffected
+		a.response.LastInsertID = cloneInt64Pointer(event.LastInsertID)
+		for _, column := range event.Columns {
+			a.totalBytes += len(column)
+		}
+		if a.totalBytes > maxSQLiteResponseBytes {
+			return false, wire.WireError{Code: "sqlite_result_too_large", Message: "SQLite result exceeds the 32 MiB result limit"}
+		}
+	} else if len(event.Columns) != 0 || event.RowsAffected != 0 || event.LastInsertID != nil {
+		return false, errors.New("SQLite result repeated first-chunk metadata")
+	}
+	for _, value := range event.SQLiteValues {
+		a.totalBytes += sqliteValueContentBytes(value)
+		if a.totalBytes > maxSQLiteResponseBytes {
+			return false, wire.WireError{Code: "sqlite_result_too_large", Message: "SQLite result exceeds the 32 MiB result limit"}
+		}
+	}
+	a.response.Values = append(a.response.Values, event.SQLiteValues...)
+	if !event.Done {
+		return false, nil
+	}
+	if len(a.response.Columns) == 0 && len(a.response.Values) != 0 {
+		return false, errors.New("SQLite result has values without columns")
+	}
+	if len(a.response.Columns) != 0 && len(a.response.Values)%len(a.response.Columns) != 0 {
+		return false, errors.New("SQLite result is not rectangular")
+	}
+	return true, nil
+}
+
+func sqliteValueContentBytes(value wire.SQLiteValue) int {
+	const fixedValueBytes = 16
+	switch value.Kind {
+	case "null":
+		return 1
+	case "integer", "real":
+		return fixedValueBytes
+	case "text":
+		if value.Text != nil {
+			return len(*value.Text) + fixedValueBytes
+		}
+	case "blob":
+		if value.Blob != nil {
+			return len(*value.Blob) + fixedValueBytes
+		}
+	}
+	return fixedValueBytes
 }
 
 func sqliteDeadlineMillis(ctx context.Context) (uint32, error) {

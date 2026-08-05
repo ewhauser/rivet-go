@@ -1,12 +1,44 @@
 package rivet
 
 import (
+	"context"
 	"errors"
 	"math"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/ewhauser/rivet-go/internal/wire"
 )
+
+type lifecycleSQLiteBackend struct {
+	execStarted    chan struct{}
+	execRelease    chan struct{}
+	rollbackCalled chan string
+	closed         chan struct{}
+	closeOnce      sync.Once
+}
+
+func (b *lifecycleSQLiteBackend) exec(context.Context, string, []wire.SQLiteValue, *string) (Result, error) {
+	close(b.execStarted)
+	<-b.execRelease
+	return Result{}, nil
+}
+
+func (*lifecycleSQLiteBackend) query(context.Context, string, []wire.SQLiteValue, *string) (Rows, error) {
+	return Rows{}, nil
+}
+
+func (*lifecycleSQLiteBackend) begin(context.Context, string, time.Duration) error { return nil }
+func (*lifecycleSQLiteBackend) commit(context.Context, string) error               { return nil }
+func (b *lifecycleSQLiteBackend) rollback(_ context.Context, leaseKey string) error {
+	b.rollbackCalled <- leaseKey
+	return nil
+}
+func (b *lifecycleSQLiteBackend) close() error {
+	b.closeOnce.Do(func() { close(b.closed) })
+	return nil
+}
 
 func TestSQLiteValueMappingPreservesAllPublicTypes(t *testing.T) {
 	values, err := encodeSQLiteArgs([]any{nil, int64(-7), float64(1.25), "text", []byte{0, 1}, []byte{}})
@@ -56,5 +88,88 @@ func TestSQLiteWireErrorKeepsStatementMetadata(t *testing.T) {
 	var structured *SQLiteError
 	if !errors.As(err, &structured) || structured.Code != "sqlite_error" || structured.SQLiteCode != code || structured.StatementIndex != statement {
 		t.Fatalf("error = %#v", err)
+	}
+}
+
+func TestSQLiteCloseRollsBackLeaseAndWaitsForInflightOperation(t *testing.T) {
+	backend := &lifecycleSQLiteBackend{
+		execStarted:    make(chan struct{}),
+		execRelease:    make(chan struct{}),
+		rollbackCalled: make(chan string, 1),
+		closed:         make(chan struct{}),
+	}
+	database := makeDB(backend)
+	tx, err := database.Begin(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	execDone := make(chan error, 1)
+	go func() {
+		_, execErr := tx.Exec(context.Background(), "SELECT 1")
+		execDone <- execErr
+	}()
+	select {
+	case <-backend.execStarted:
+	case <-time.After(time.Second):
+		t.Fatal("transaction operation did not start")
+	}
+
+	closeDone := make(chan error, 1)
+	go func() { closeDone <- database.closeForSleep() }()
+	select {
+	case <-backend.rollbackCalled:
+	case <-time.After(time.Second):
+		t.Fatal("sleep close did not roll back the open lease")
+	}
+	select {
+	case err := <-closeDone:
+		t.Fatalf("sleep close returned before the accepted operation finished: %v", err)
+	default:
+	}
+	select {
+	case <-backend.closed:
+		t.Fatal("transport closed before the accepted operation finished")
+	default:
+	}
+
+	close(backend.execRelease)
+	if err := <-execDone; err != nil {
+		t.Fatalf("accepted operation failed: %v", err)
+	}
+	if err := <-closeDone; err != nil {
+		t.Fatalf("sleep close failed: %v", err)
+	}
+	select {
+	case <-backend.closed:
+	default:
+		t.Fatal("transport was not closed")
+	}
+
+	_, err = tx.Exec(context.Background(), "SELECT 1")
+	var structured *SQLiteError
+	if !errors.As(err, &structured) || structured.Code != "sqlite_endpoint_closed" {
+		t.Fatalf("old transaction error = %T %v, want sqlite_endpoint_closed", err, err)
+	}
+	_, err = database.Query(context.Background(), "SELECT 1")
+	if !errors.As(err, &structured) || structured.Code != "sqlite_endpoint_closed" {
+		t.Fatalf("closed database error = %T %v, want sqlite_endpoint_closed", err, err)
+	}
+}
+
+func TestSQLiteBeginRejectsASecondOpenTransaction(t *testing.T) {
+	backend := &lifecycleSQLiteBackend{rollbackCalled: make(chan string, 1)}
+	database := makeDB(backend)
+	first, err := database.Begin(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = database.Begin(context.Background())
+	var structured *SQLiteError
+	if !errors.As(err, &structured) || structured.Code != "transaction_already_open" {
+		t.Fatalf("second Begin error = %T %v, want transaction_already_open", err, err)
+	}
+	if err := first.Rollback(context.Background()); err != nil {
+		t.Fatal(err)
 	}
 }

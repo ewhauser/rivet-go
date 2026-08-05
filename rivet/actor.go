@@ -120,9 +120,9 @@ func (c *Context[T]) Sleep() error {
 	if c == nil || c.session == nil {
 		return errors.New("actor context is unavailable")
 	}
-	// The runtime socket owns transaction leases per connection. Close it
-	// before requesting eviction so an open lease is rolled back immediately
-	// instead of gating core's sleep bookkeeping until its timeout.
+	// Fence both SQLite transports before requesting eviction so admitted work
+	// finishes and an open lease is rolled back instead of gating sleep until
+	// its timeout.
 	if c.db != nil {
 		if err := c.db.closeForSleep(); err != nil {
 			return fmt.Errorf("close actor SQLite transport for sleep: %w", err)

@@ -1,10 +1,12 @@
 package conformance
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"net/http"
 	"strings"
 	"sync"
@@ -32,13 +34,21 @@ type sqliteHTTPResult struct {
 	CommitVisible      bool     `json:"commit_visible,omitempty"`
 	RollbackInvisible  bool     `json:"rollback_invisible,omitempty"`
 	LeaseErrorCode     string   `json:"lease_error_code,omitempty"`
+	LeaseCommitCode    string   `json:"lease_commit_code,omitempty"`
+	LeaseRollbackCode  string   `json:"lease_rollback_code,omitempty"`
+	CancelledTxUsable  bool     `json:"cancelled_tx_usable,omitempty"`
+	InterleavingCode   string   `json:"interleaving_code,omitempty"`
+	SecondBeginCode    string   `json:"second_begin_code,omitempty"`
 	SyntaxErrorCode    string   `json:"syntax_error_code,omitempty"`
 	ConstraintCode     string   `json:"constraint_code,omitempty"`
+	MultiExecCode      string   `json:"multi_exec_code,omitempty"`
 	SyntaxSQLiteCode   int32    `json:"syntax_sqlite_code,omitempty"`
 	ConstraintSQLCode  int32    `json:"constraint_sqlite_code,omitempty"`
 	ConcurrentFailures []string `json:"concurrent_failures,omitempty"`
 	StateSaves         int      `json:"state_saves,omitempty"`
 	LargeRows          int      `json:"large_rows,omitempty"`
+	ResultLimitCode    string   `json:"result_limit_code,omitempty"`
+	ConnectionUsable   bool     `json:"connection_usable,omitempty"`
 }
 
 func TestPerActorSQLiteConformance(t *testing.T) {
@@ -74,14 +84,21 @@ func TestPerActorSQLiteConformance(t *testing.T) {
 			if !crud.ValuesOK || crud.RowsAffected != 1 || crud.LastInsertID <= 0 {
 				t.Fatalf("CRUD/value round trip = %#v", crud)
 			}
+			fidelity := sqliteGateway(t, engine.endpoint, first.ActorID, "/value-fidelity", 45*time.Second)
+			if !fidelity.ValuesOK {
+				t.Fatalf("value-fidelity round trip = %#v", fidelity)
+			}
 
 			transactions := sqliteGateway(t, engine.endpoint, first.ActorID, "/transactions", 30*time.Second)
-			if !transactions.CommitVisible || !transactions.RollbackInvisible || transactions.LeaseErrorCode != "transaction_expired" {
+			if !transactions.CommitVisible || !transactions.RollbackInvisible || !transactions.CancelledTxUsable ||
+				transactions.LeaseErrorCode != "transaction_expired" || transactions.LeaseCommitCode != "transaction_expired" ||
+				transactions.LeaseRollbackCode != "transaction_expired" || transactions.InterleavingCode != "context deadline exceeded" ||
+				transactions.SecondBeginCode != "transaction_already_open" {
 				t.Fatalf("transaction conformance = %#v", transactions)
 			}
 
 			errorsResult := sqliteGateway(t, engine.endpoint, first.ActorID, "/errors", 30*time.Second)
-			if errorsResult.SyntaxErrorCode != "sqlite_error" || errorsResult.ConstraintCode != "sqlite_error" || errorsResult.SyntaxSQLiteCode == 0 || errorsResult.ConstraintSQLCode == 0 {
+			if errorsResult.SyntaxErrorCode != "sqlite_error" || errorsResult.ConstraintCode != "sqlite_error" || errorsResult.MultiExecCode != "sqlite_error" || errorsResult.SyntaxSQLiteCode == 0 || errorsResult.ConstraintSQLCode == 0 {
 				t.Fatalf("structured SQLite errors = %#v", errorsResult)
 			}
 
@@ -112,6 +129,10 @@ func TestPerActorSQLiteConformance(t *testing.T) {
 					t.Fatalf("chunked FFI result rows = %d, want 2200", large.LargeRows)
 				}
 			}
+			limit := sqliteGateway(t, engine.endpoint, first.ActorID, "/result-limit", 90*time.Second)
+			if limit.ResultLimitCode != "sqlite_result_too_large" || !limit.ConnectionUsable {
+				t.Fatalf("result-limit recovery = %#v", limit)
+			}
 
 			beforeSleep := sqliteGateway(t, engine.endpoint, first.ActorID, "/count", 30*time.Second).Count
 			_ = sqliteGateway(t, engine.endpoint, first.ActorID, "/sleep", 30*time.Second)
@@ -128,7 +149,7 @@ func TestPerActorSQLiteConformance(t *testing.T) {
 				t.Fatalf("wake generation = %d, want greater than %d", secondStart.generation, firstStart.generation)
 			}
 
-			if transport == rivet.SQLiteTransportSocket {
+			{
 				_ = sqliteGateway(t, engine.endpoint, first.ActorID, "/lease-sleep", 30*time.Second)
 				var lease rivet.Tx
 				select {
@@ -141,12 +162,12 @@ func TestPerActorSQLiteConformance(t *testing.T) {
 				})
 				_, leaseErr := lease.Exec(context.Background(), "INSERT INTO todos(label) VALUES ('dead-lease')")
 				var structured *rivet.SQLiteError
-				if !errors.As(leaseErr, &structured) || structured.Code == "" {
-					t.Fatalf("old socket lease error = %T %v, want structured", leaseErr, leaseErr)
+				if !errors.As(leaseErr, &structured) || structured.Code != "sqlite_endpoint_closed" {
+					t.Fatalf("old %s lease error = %T %v, want sqlite_endpoint_closed", transport, leaseErr, leaseErr)
 				}
 				afterLeaseSleep := sqliteGateway(t, engine.endpoint, first.ActorID, "/label-count?label=dead-lease", rehydrateWindow)
 				if afterLeaseSleep.Count != 0 {
-					t.Fatalf("dead socket lease committed %d rows", afterLeaseSleep.Count)
+					t.Fatalf("dead %s lease committed %d rows", transport, afterLeaseSleep.Count)
 				}
 				currentStart = waitSQLiteStart(t, started, first.ActorID, rehydrateWindow)
 			}
@@ -223,6 +244,9 @@ func sqliteConformanceActor(
 					return 0, err
 				}
 				ctx.State().Saves++
+				if err := ctx.Save(opCtx); err != nil {
+					return 0, err
+				}
 				return ctx.State().Saves, nil
 			}),
 		},
@@ -274,6 +298,58 @@ func runSQLiteHTTPCase(
 		}
 		return sqliteHTTPResult{ValuesOK: valuesOK, RowsAffected: update.RowsAffected, LastInsertID: insert.LastInsertID}, nil
 
+	case "/value-fidelity":
+		text := "before\x00after"
+		rows, err := db.Query(
+			ctx,
+			"SELECT ?, ?, ?, ?, ?, ?, ?, ?",
+			int64(math.MinInt64),
+			int64(math.MaxInt64),
+			math.NaN(),
+			math.Inf(1),
+			math.Inf(-1),
+			text,
+			[]byte{},
+			nil,
+		)
+		if err != nil {
+			return sqliteHTTPResult{}, err
+		}
+		valuesOK := len(rows.Values) == 1 && len(rows.Values[0]) == 8
+		if valuesOK {
+			values := rows.Values[0]
+			emptyBlob, blobOK := values[6].([]byte)
+			positive, positiveOK := values[3].(float64)
+			negative, negativeOK := values[4].(float64)
+			valuesOK = values[0] == int64(math.MinInt64) &&
+				values[1] == int64(math.MaxInt64) &&
+				values[2] == nil &&
+				positiveOK && math.IsInf(positive, 1) &&
+				negativeOK && math.IsInf(negative, -1) &&
+				values[5] == text && blobOK && len(emptyBlob) == 0 && values[7] == nil
+		}
+		if !valuesOK {
+			return sqliteHTTPResult{}, fmt.Errorf("boundary SQLite row mismatch: columns=%#v values=%#v", rows.Columns, rows.Values)
+		}
+		blob := bytes.Repeat([]byte{0xa5}, 1<<20)
+		blobRows, err := db.Query(ctx, "SELECT ?", blob)
+		if err != nil {
+			return sqliteHTTPResult{}, err
+		}
+		if len(blobRows.Values) != 1 || len(blobRows.Values[0]) != 1 {
+			return sqliteHTTPResult{}, fmt.Errorf("blob boundary row shape = %#v", blobRows.Values)
+		}
+		gotBlob, ok := blobRows.Values[0][0].([]byte)
+		if !ok || !bytes.Equal(gotBlob, blob) {
+			return sqliteHTTPResult{}, fmt.Errorf("blob boundary result differs: type=%T length=%d", blobRows.Values[0][0], len(gotBlob))
+		}
+		_, tooLargeErr := db.Query(ctx, "SELECT ?", append(blob, 0))
+		var tooLarge *rivet.SQLiteError
+		if !errors.As(tooLargeErr, &tooLarge) || tooLarge.Code != "sqlite_argument_too_large" {
+			return sqliteHTTPResult{}, fmt.Errorf("oversized blob error = %T %v", tooLargeErr, tooLargeErr)
+		}
+		return sqliteHTTPResult{ValuesOK: true}, nil
+
 	case "/transactions":
 		commitTx, err := db.Begin(ctx)
 		if err != nil {
@@ -303,32 +379,135 @@ func runSQLiteHTTPCase(
 		if err != nil {
 			return sqliteHTTPResult{}, err
 		}
+
+		cancelTx, err := db.Begin(ctx)
+		if err != nil {
+			return sqliteHTTPResult{}, err
+		}
+		cancelled, cancelNow := context.WithCancel(context.Background())
+		cancelNow()
+		if _, err := cancelTx.Query(cancelled, "SELECT 1"); !errors.Is(err, context.Canceled) {
+			return sqliteHTTPResult{}, fmt.Errorf("cancelled transaction query = %T %v", err, err)
+		}
+		_, cancelRecoveryErr := cancelTx.Exec(ctx, "INSERT INTO todos(label) VALUES (?)", "cancel-recovery")
+		if rollbackErr := cancelTx.Rollback(ctx); rollbackErr != nil {
+			return sqliteHTTPResult{}, rollbackErr
+		}
+
+		interleaveTx, err := db.Begin(ctx)
+		if err != nil {
+			return sqliteHTTPResult{}, err
+		}
+		if _, err := interleaveTx.Exec(ctx, "INSERT INTO todos(label) VALUES (?)", "interleave-rollback"); err != nil {
+			return sqliteHTTPResult{}, err
+		}
+		interleaveCtx, interleaveCancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
+		_, interleaveErr := db.Query(interleaveCtx, "SELECT COUNT(*) FROM todos")
+		interleaveCancel()
+		if !errors.Is(interleaveErr, context.DeadlineExceeded) {
+			return sqliteHTTPResult{}, fmt.Errorf("non-transaction query interleaved with lease: %T %v", interleaveErr, interleaveErr)
+		}
+		if err := interleaveTx.Rollback(ctx); err != nil {
+			return sqliteHTTPResult{}, err
+		}
+		interleavedWrites, err := sqliteCount(ctx, db, "SELECT COUNT(*) FROM todos WHERE label = ?", "interleave-rollback")
+		if err != nil || interleavedWrites != 0 {
+			return sqliteHTTPResult{}, fmt.Errorf("interleaved rollback count = %d: %w", interleavedWrites, err)
+		}
+
+		openTx, err := db.Begin(ctx)
+		if err != nil {
+			return sqliteHTTPResult{}, err
+		}
+		_, secondErr := db.Begin(ctx)
+		var secondStructured *rivet.SQLiteError
+		if !errors.As(secondErr, &secondStructured) || secondStructured.Code != "transaction_already_open" {
+			return sqliteHTTPResult{}, fmt.Errorf("second Begin while lease open = %T %v", secondErr, secondErr)
+		}
+		if err := openTx.Rollback(ctx); err != nil {
+			return sqliteHTTPResult{}, err
+		}
+		recoveryCtx, recoveryCancel := context.WithTimeout(context.Background(), 3*time.Second)
+		_, recoveryErr := db.Query(recoveryCtx, "SELECT 1")
+		recoveryCancel()
+		if recoveryErr != nil {
+			return sqliteHTTPResult{}, fmt.Errorf("database remained gated after rejected second Begin: %w", recoveryErr)
+		}
+
 		leaseCtx, leaseCancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
 		leaseTx, err := db.Begin(leaseCtx)
 		if err != nil {
 			leaseCancel()
 			return sqliteHTTPResult{}, err
 		}
+		if _, err := leaseTx.Exec(ctx, "INSERT INTO todos(label) VALUES (?)", "expired-commit"); err != nil {
+			leaseCancel()
+			return sqliteHTTPResult{}, err
+		}
 		time.Sleep(400 * time.Millisecond)
 		_, leaseErr := leaseTx.Exec(context.Background(), "SELECT 1")
+		commitErr := leaseTx.Commit(context.Background())
 		leaseCancel()
-		var structured *rivet.SQLiteError
-		if !errors.As(leaseErr, &structured) {
-			return sqliteHTTPResult{}, fmt.Errorf("lease expiry returned %T: %v", leaseErr, leaseErr)
+		var leaseStructured, commitStructured *rivet.SQLiteError
+		if !errors.As(leaseErr, &leaseStructured) || !errors.As(commitErr, &commitStructured) {
+			return sqliteHTTPResult{}, fmt.Errorf("lease expiry errors: operation=%T %v commit=%T %v", leaseErr, leaseErr, commitErr, commitErr)
 		}
-		return sqliteHTTPResult{CommitVisible: committed == 1, RollbackInvisible: rolledBack == 0, LeaseErrorCode: structured.Code}, nil
+		expiredCommitCount, err := sqliteCount(ctx, db, "SELECT COUNT(*) FROM todos WHERE label = ?", "expired-commit")
+		if err != nil {
+			return sqliteHTTPResult{}, err
+		}
+
+		rollbackLeaseCtx, rollbackLeaseCancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
+		rollbackLease, err := db.Begin(rollbackLeaseCtx)
+		if err != nil {
+			rollbackLeaseCancel()
+			return sqliteHTTPResult{}, err
+		}
+		if _, err := rollbackLease.Exec(ctx, "INSERT INTO todos(label) VALUES (?)", "expired-rollback"); err != nil {
+			rollbackLeaseCancel()
+			return sqliteHTTPResult{}, err
+		}
+		time.Sleep(400 * time.Millisecond)
+		rollbackLeaseErr := rollbackLease.Rollback(context.Background())
+		rollbackLeaseCancel()
+		var rollbackStructured *rivet.SQLiteError
+		if !errors.As(rollbackLeaseErr, &rollbackStructured) {
+			return sqliteHTTPResult{}, fmt.Errorf("expired rollback error = %T %v", rollbackLeaseErr, rollbackLeaseErr)
+		}
+		expiredRollbackCount, err := sqliteCount(ctx, db, "SELECT COUNT(*) FROM todos WHERE label = ?", "expired-rollback")
+		if err != nil {
+			return sqliteHTTPResult{}, err
+		}
+		return sqliteHTTPResult{
+			CommitVisible:     committed == 1,
+			RollbackInvisible: rolledBack == 0 && expiredCommitCount == 0 && expiredRollbackCount == 0,
+			LeaseErrorCode:    leaseStructured.Code,
+			LeaseCommitCode:   commitStructured.Code,
+			LeaseRollbackCode: rollbackStructured.Code,
+			CancelledTxUsable: cancelRecoveryErr == nil,
+			InterleavingCode:  interleaveErr.Error(),
+			SecondBeginCode:   secondStructured.Code,
+		}, nil
 
 	case "/errors":
 		_, syntaxErr := db.Exec(ctx, "INSER broken SQL")
 		_, constraintErr := db.Exec(ctx, "INSERT INTO todos(label) VALUES (?)", "typed")
-		var syntax, constraint *rivet.SQLiteError
-		if !errors.As(syntaxErr, &syntax) || !errors.As(constraintErr, &constraint) {
-			return sqliteHTTPResult{}, fmt.Errorf("unstructured SQL errors: syntax=%T constraint=%T", syntaxErr, constraintErr)
+		_, multiErr := db.Exec(ctx, "INSERT INTO todos(label) VALUES ('multi-first'); INSERT INTO todos(label) VALUES ('multi-second')")
+		var syntax, constraint, multi *rivet.SQLiteError
+		if !errors.As(syntaxErr, &syntax) || !errors.As(constraintErr, &constraint) || !errors.As(multiErr, &multi) {
+			return sqliteHTTPResult{}, fmt.Errorf("unstructured SQL errors: syntax=%T constraint=%T multi=%T", syntaxErr, constraintErr, multiErr)
+		}
+		if multi.SQLiteCode != -1 || multi.StatementIndex != 0 {
+			return sqliteHTTPResult{}, fmt.Errorf("multi-statement error metadata = %#v", multi)
+		}
+		multiCount, err := sqliteCount(ctx, db, "SELECT COUNT(*) FROM todos WHERE label LIKE 'multi-%'")
+		if err != nil || multiCount != 0 {
+			return sqliteHTTPResult{}, fmt.Errorf("multi-statement Exec changed %d rows: %w", multiCount, err)
 		}
 		if _, err := db.Query(ctx, "SELECT 1"); err != nil {
 			return sqliteHTTPResult{}, fmt.Errorf("actor unhealthy after SQL errors: %w", err)
 		}
-		return sqliteHTTPResult{SyntaxErrorCode: syntax.Code, ConstraintCode: constraint.Code, SyntaxSQLiteCode: syntax.SQLiteCode, ConstraintSQLCode: constraint.SQLiteCode}, nil
+		return sqliteHTTPResult{SyntaxErrorCode: syntax.Code, ConstraintCode: constraint.Code, MultiExecCode: multi.Code, SyntaxSQLiteCode: syntax.SQLiteCode, ConstraintSQLCode: constraint.SQLiteCode}, nil
 
 	case "/concurrent":
 		var wait sync.WaitGroup
@@ -365,11 +544,27 @@ func runSQLiteHTTPCase(
 		count, err := sqliteCount(ctx, db, "SELECT COUNT(*) FROM todos")
 		return sqliteHTTPResult{Count: count, StateSaves: actor.State().Saves}, err
 	case "/large":
+		empty, err := db.Query(ctx, "SELECT 1 WHERE 0")
+		if err != nil {
+			return sqliteHTTPResult{}, err
+		}
+		if len(empty.Columns) != 1 || len(empty.Values) != 0 {
+			return sqliteHTTPResult{}, fmt.Errorf("empty SQLite result = %#v", empty)
+		}
 		rows, err := db.Query(ctx, `WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x < 2200) SELECT printf('%0600d', x) FROM n`)
 		if err != nil {
 			return sqliteHTTPResult{}, err
 		}
 		return sqliteHTTPResult{LargeRows: len(rows.Values)}, nil
+	case "/result-limit":
+		_, limitErr := db.Query(ctx, `WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x < 1024) SELECT zeroblob(32768) FROM n`)
+		var structured *rivet.SQLiteError
+		if !errors.As(limitErr, &structured) {
+			return sqliteHTTPResult{}, fmt.Errorf("oversized result error = %T %v", limitErr, limitErr)
+		}
+		rows, recoveryErr := db.Query(ctx, "SELECT 1")
+		usable := recoveryErr == nil && len(rows.Values) == 1 && len(rows.Values[0]) == 1 && rows.Values[0][0] == int64(1)
+		return sqliteHTTPResult{ResultLimitCode: structured.Code, ConnectionUsable: usable}, recoveryErr
 	case "/sleep":
 		return sqliteHTTPResult{}, actor.Sleep()
 	case "/lease-sleep":
