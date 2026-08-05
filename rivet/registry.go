@@ -39,13 +39,9 @@ type Config struct {
 	TotalSlots      uint32
 	LogLevel        string
 	ShutdownTimeout time.Duration
-	// SQLiteTransport selects the per-actor SQL path. The empty value
-	// defaults to "ffi" (the recommended transport: all platforms, chunked
-	// results, core's first-class SQLite API). "socket" selects the
-	// experimental Actor Runtime Socket client (Unix only, single-frame
-	// results, tracks an experimental upstream protocol) — see
-	// docs/reviews/M7-REVIEW.md for the comparison. "disabled" turns the
-	// public SQLite API off.
+	// SQLiteTransport selects the per-actor SQL path. Set it to "ffi" or
+	// "socket"; the empty value leaves the public SQLite API disabled so this
+	// milestone does not encode a default before the benchmark is reviewed.
 	SQLiteTransport SQLiteTransport
 	Hooks           Hooks
 	// Logger receives structured SDK lifecycle records. Nil discards Go-side
@@ -142,10 +138,9 @@ func (r *Registry) Serve(ctx context.Context, config Config) error {
 
 	actorNames, actorActions, actorHibernateWebSockets, handlers := r.snapshotActors()
 	config = withDefaults(config)
-	config.SQLiteTransport = resolveSQLiteTransport(
-		config.SQLiteTransport,
-		os.Getenv("RIVET_GO_SQLITE_TRANSPORT"),
-	)
+	if override := os.Getenv("RIVET_GO_SQLITE_TRANSPORT"); override != "" {
+		config.SQLiteTransport = SQLiteTransport(override)
+	}
 	if err := validateSQLiteTransport(config.SQLiteTransport); err != nil {
 		return err
 	}
@@ -158,7 +153,7 @@ func (r *Registry) Serve(ctx context.Context, config Config) error {
 		ActorNames:               actorNames,
 		ActorActions:             actorActions,
 		ActorHibernateWebSockets: actorHibernateWebSockets,
-		SQLiteTransport:          wireSQLiteTransport(config.SQLiteTransport),
+		SQLiteTransport:          string(config.SQLiteTransport),
 		LogLevel:                 config.LogLevel,
 	})
 	if err != nil {

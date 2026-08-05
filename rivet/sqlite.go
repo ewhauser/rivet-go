@@ -27,9 +27,8 @@ const (
 type SQLiteTransport string
 
 const (
-	SQLiteTransportFFI      SQLiteTransport = "ffi"
-	SQLiteTransportSocket   SQLiteTransport = "socket"
-	SQLiteTransportDisabled SQLiteTransport = "disabled"
+	SQLiteTransportFFI    SQLiteTransport = "ffi"
+	SQLiteTransportSocket SQLiteTransport = "socket"
 )
 
 // Result is the mutation metadata returned by Exec.
@@ -529,23 +528,11 @@ var sqliteLeaseSequence atomic.Uint64
 
 func validateSQLiteTransport(transport SQLiteTransport) error {
 	switch transport {
-	case SQLiteTransportFFI, SQLiteTransportSocket, SQLiteTransportDisabled:
+	case "", SQLiteTransportFFI, SQLiteTransportSocket:
 		return nil
 	default:
-		return fmt.Errorf(
-			"SQLiteTransport must be %q, %q, or %q",
-			SQLiteTransportFFI, SQLiteTransportSocket, SQLiteTransportDisabled,
-		)
+		return fmt.Errorf("SQLiteTransport must be %q or %q", SQLiteTransportFFI, SQLiteTransportSocket)
 	}
-}
-
-// wireSQLiteTransport maps the public transport value to the boundary
-// encoding, where the empty string means no per-actor database.
-func wireSQLiteTransport(transport SQLiteTransport) string {
-	if transport == SQLiteTransportDisabled {
-		return ""
-	}
-	return string(transport)
 }
 
 func validateSQLiteSQL(sql string) error {
@@ -701,16 +688,4 @@ func pointerValue(value *int64) int64 {
 		return 0
 	}
 	return *value
-}
-
-// resolveSQLiteTransport applies the environment override, then defaults the
-// empty value to the recommended FFI transport (docs/reviews/M7-REVIEW.md).
-func resolveSQLiteTransport(configured SQLiteTransport, envOverride string) SQLiteTransport {
-	if envOverride != "" {
-		configured = SQLiteTransport(envOverride)
-	}
-	if configured == "" {
-		return SQLiteTransportFFI
-	}
-	return configured
 }
