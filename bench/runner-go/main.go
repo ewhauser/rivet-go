@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -19,6 +21,13 @@ type counterState struct {
 }
 
 type echoState struct{}
+
+type todoState struct{}
+
+type todoRequest struct {
+	Kind  string `json:"kind"`
+	Title string `json:"title"`
+}
 
 type pumpStats struct {
 	mu       sync.Mutex
@@ -129,6 +138,29 @@ func run() error {
 	}); err != nil {
 		return err
 	}
+	if err := rivet.Register(registry, "todo", rivet.Actor[todoState]{
+		OnStart: func(ctx *rivet.Context[todoState]) error {
+			opCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+			defer cancel()
+			if _, err := ctx.DB().Exec(opCtx, "CREATE TABLE IF NOT EXISTS todos (id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT NOT NULL UNIQUE, done INTEGER NOT NULL DEFAULT 0)"); err != nil {
+				return err
+			}
+			_, err := ctx.DB().Exec(opCtx, "INSERT OR IGNORE INTO todos(id, title, done) VALUES (1, 'seed', 0)")
+			return err
+		},
+		OnFetch: func(ctx *rivet.Context[todoState], writer http.ResponseWriter, request *http.Request) {
+			writer.Header().Set("Content-Type", "application/json")
+			result, err := runTodoRequest(request.Context(), ctx.DB(), request)
+			if err != nil {
+				writer.WriteHeader(http.StatusInternalServerError)
+				_ = json.NewEncoder(writer).Encode(map[string]string{"error": err.Error()})
+				return
+			}
+			_ = json.NewEncoder(writer).Encode(result)
+		},
+	}); err != nil {
+		return err
+	}
 
 	var hooks rivet.Hooks
 	var stats *pumpStats
@@ -149,6 +181,70 @@ func run() error {
 		ShutdownTimeout: 10 * time.Second,
 		Hooks:           hooks,
 	})
+}
+
+func runTodoRequest(ctx context.Context, database *rivet.DB, request *http.Request) (map[string]int64, error) {
+	switch request.URL.Path {
+	case "/count":
+		rows, err := database.Query(ctx, "SELECT COUNT(*) FROM todos")
+		if err != nil {
+			return nil, err
+		}
+		if len(rows.Values) != 1 || len(rows.Values[0]) != 1 {
+			return nil, fmt.Errorf("count returned %d rows", len(rows.Values))
+		}
+		count, ok := rows.Values[0][0].(int64)
+		if !ok {
+			return nil, fmt.Errorf("count has type %T", rows.Values[0][0])
+		}
+		return map[string]int64{"count": count}, nil
+	case "/op":
+		var input todoRequest
+		if err := json.NewDecoder(request.Body).Decode(&input); err != nil {
+			return nil, err
+		}
+		switch input.Kind {
+		case "select":
+			rows, err := database.Query(ctx, "SELECT id, title, done FROM todos WHERE id = ?", int64(1))
+			if err != nil {
+				return nil, err
+			}
+			if len(rows.Values) != 1 {
+				return nil, fmt.Errorf("point SELECT returned %d rows", len(rows.Values))
+			}
+		case "insert":
+			if _, err := database.Exec(ctx, "INSERT INTO todos(title, done) VALUES (?, ?)", input.Title, int64(0)); err != nil {
+				return nil, err
+			}
+		case "transaction":
+			tx, err := database.Begin(ctx)
+			if err != nil {
+				return nil, err
+			}
+			if _, err = tx.Exec(ctx, "INSERT INTO todos(title, done) VALUES (?, ?)", input.Title, int64(0)); err == nil {
+				_, err = tx.Exec(ctx, "UPDATE todos SET done = 1 WHERE title = ?", input.Title)
+			}
+			var rows rivet.Rows
+			if err == nil {
+				rows, err = tx.Query(ctx, "SELECT done FROM todos WHERE title = ?", input.Title)
+				if err == nil && (len(rows.Values) != 1 || len(rows.Values[0]) != 1 || rows.Values[0][0] != int64(1)) {
+					err = errors.New("transaction SELECT did not observe its UPDATE")
+				}
+			}
+			if err != nil {
+				_ = tx.Rollback(context.Background())
+				return nil, err
+			}
+			if err := tx.Commit(ctx); err != nil {
+				return nil, err
+			}
+		default:
+			return nil, fmt.Errorf("unknown todo operation %q", input.Kind)
+		}
+		return map[string]int64{"count": 1}, nil
+	default:
+		return nil, fmt.Errorf("unknown todo path %q", request.URL.Path)
+	}
 }
 
 func envOr(name, fallback string) string {

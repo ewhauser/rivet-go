@@ -199,3 +199,19 @@ These counts are error-level log records, grouped by exact message patterns. The
 ## Go CPU profiles
 
 Profiling-only S1 and S3 runs are excluded from every table above. Their pprof data and text tops are in `bench/results-archive/2026-08-04-hibernation-fix/go-s1-cpu.pprof`, `bench/results-archive/2026-08-04-hibernation-fix/go-s3-cpu.pprof`, and the adjacent `*-pprof-top.txt` files.
+
+## S5 per-actor SQLite transport candidates
+
+Generated from two sequential repetitions per candidate; the last measured cell started at 2026-08-05T06:56:10Z. Raw JSON, process logs, environment data, and checksums are committed under `bench/results-archive/2026-08-05-sqlite`.
+
+Each repetition uses 32 workers mapped one-to-one to 32 actors, 10 seconds of excluded warmup, and a 45-second measured window. The deterministic operation cycle is 50% point `SELECT`, 40% single-row `INSERT`, and 10% one transaction containing `INSERT`, `UPDATE`, and `SELECT`. Throughput counts the transaction as one composite operation. Final per-actor row counts must equal the post-warmup baseline plus successful measured inserts.
+
+| Runner | Throughput ops/s r1/r2 (avg) | p50 ms r1/r2 | p95 ms r1/r2 | p99 ms r1/r2 | Runner CPU avg r1/r2 | Engine CPU avg r1/r2 | Row reconciliation r1/r2 | Valid |
+|---|---:|---:|---:|---:|---:|---:|---:|---|
+| Go-ffi | 317.6/304.8 (311.2) | 13.807/14.055 | 334.079/327.679 | 2668.543/2680.831 | 11.0%/10.2% | 127.0%/129.0% | 9515/9515; 8966/8966 | true/true |
+| Go-socket | 326.0/313.3 (319.7) | 13.815/13.959 | 332.287/332.287 | 2670.591/2660.351 | 9.1%/8.9% | 127.7%/128.2% | 9412/9412; 8907/8907 | true/true |
+| TypeScript `c.db` | 317.6/314.3 (315.9) | 13.903/14.439 | 331.263/337.407 | 2670.591/2639.871 | 13.6%/13.5% | 125.4%/129.7% | 9386/9386; 8930/8930 | true/true |
+
+All three suites start a fresh engine data directory. Both Go rows use core's `LocalNative` SQLite worker and differ only in the Go-to-core transport. The TypeScript reference uses `rivetkit@2.3.10` `c.db` raw `execute` and callback `transaction` APIs with the same statements and no ORM. The TypeScript wrapper returns object rows and manages the transaction callback, while the Go API returns column/value matrices and exposes an explicit lease-backed `Tx`; those API-shape costs remain part of the measured SDK paths.
+
+CPU is sampled process `%CPU`, where 100% is one fully occupied logical core. This section records the candidates without selecting a default.

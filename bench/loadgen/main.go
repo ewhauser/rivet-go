@@ -220,6 +220,17 @@ func (c *gatewayClient) action(ctx context.Context, actorID, action string, args
 	return response.Output, nil
 }
 
+func (c *gatewayClient) todoRequest(ctx context.Context, actorID, path string, input any, clientSlot int) (int64, error) {
+	var response struct {
+		Count int64 `json:"count"`
+	}
+	gatewayPath := "/gateway/" + url.PathEscape(actorID) + "/request/" + strings.TrimPrefix(path, "/")
+	if err := c.requestJSONFrom(ctx, http.MethodPost, gatewayPath, input, &response, benchmarkClientIP(clientSlot)); err != nil {
+		return 0, err
+	}
+	return response.Count, nil
+}
+
 func (c *gatewayClient) requestJSON(ctx context.Context, method, path string, input, output any) error {
 	return c.requestJSONFrom(ctx, method, path, input, output, "")
 }
@@ -378,6 +389,125 @@ func runActionScenario(ctx context.Context, cfg config, client *gatewayClient, a
 		Detail:   fmt.Sprintf("%d counter actor(s) reconciled after measured increments", actorCount),
 		OK:       correct && expected == observed,
 	}), nil
+}
+
+type todoPhaseCounts struct {
+	issuedInserts []atomic.Int64
+}
+
+func todoPhase(
+	ctx context.Context,
+	client *gatewayClient,
+	actorIDs []string,
+	duration time.Duration,
+	repetition int,
+	phase string,
+	record *recorder,
+) todoPhaseCounts {
+	counts := todoPhaseCounts{issuedInserts: make([]atomic.Int64, len(actorIDs))}
+	deadline := time.Now().Add(duration)
+	var workers sync.WaitGroup
+	workers.Add(len(actorIDs))
+	for worker, actorID := range actorIDs {
+		go func() {
+			defer workers.Done()
+			var sequence uint64
+			for time.Now().Before(deadline) {
+				sequence++
+				kind := "select"
+				issued := int64(0)
+				switch sequence % 10 {
+				case 0:
+					kind = "transaction"
+					issued = 1
+				case 6, 7, 8, 9:
+					kind = "insert"
+					issued = 1
+				}
+				title := fmt.Sprintf("%s-r%d-a%d-%d", phase, repetition, worker, sequence)
+				started := time.Now()
+				_, err := client.todoRequest(ctx, actorID, "op", map[string]any{"kind": kind, "title": title}, worker)
+				if err != nil {
+					if record != nil {
+						record.failure(err)
+					}
+					continue
+				}
+				counts.issuedInserts[worker].Add(issued)
+				if record != nil {
+					record.success(time.Since(started))
+				}
+			}
+		}()
+	}
+	workers.Wait()
+	return counts
+}
+
+func runSQLiteScenario(ctx context.Context, cfg config, client *gatewayClient) (*result, error) {
+	const actorCount = 32
+	actorIDs := make([]string, actorCount)
+	for index := range actorIDs {
+		actorID, err := client.createActor(ctx, "todo", fmt.Sprintf("s5-r%d-actor-%d", cfg.repetition, index))
+		if err != nil {
+			return nil, fmt.Errorf("create todo actor %d: %w", index, err)
+		}
+		actorIDs[index] = actorID
+	}
+
+	warmupRecord := newRecorder()
+	todoPhase(ctx, client, actorIDs, cfg.warmup, cfg.repetition, "warmup", warmupRecord)
+	baselines := make([]int64, actorCount)
+	for index, actorID := range actorIDs {
+		count, err := client.todoRequest(ctx, actorID, "count", struct{}{}, 10_000+index)
+		if err != nil {
+			warmupRecord.failure(fmt.Errorf("read actor %d warmup row count: %w", index, err))
+			continue
+		}
+		baselines[index] = count
+	}
+
+	record := newRecorder()
+	measurement, err := beginMeasurement(cfg)
+	if err != nil {
+		return nil, err
+	}
+	started := time.Now()
+	issued := todoPhase(ctx, client, actorIDs, cfg.measure, cfg.repetition, "measure", record)
+	elapsed := time.Since(started)
+	profilePath, finishErr := measurement.finish()
+	if finishErr != nil {
+		record.failure(finishErr)
+	}
+
+	var expected, observed int64
+	correct := true
+	for index, actorID := range actorIDs {
+		actorExpected := baselines[index] + issued.issuedInserts[index].Load()
+		expected += actorExpected
+		count, err := client.todoRequest(ctx, actorID, "count", struct{}{}, 20_000+index)
+		if err != nil {
+			record.failure(fmt.Errorf("read actor %d final row count: %w", index, err))
+			correct = false
+			continue
+		}
+		observed += count
+		if count != actorExpected {
+			record.failure(fmt.Errorf("actor %d row count = %d, want %d", index, count, actorExpected))
+			correct = false
+		}
+	}
+
+	res := makeResult(cfg, record, warmupRecord, elapsed, measurement.cpuSummary(), profilePath, correctnessResult{
+		Expected: expected,
+		Observed: observed,
+		Detail:   "32 per-actor todo tables reconciled with successful measured INSERTs",
+		OK:       correct && expected == observed,
+	})
+	res.Notes = append(res.Notes,
+		"S5 uses 32 workers across 32 actors: 50% point SELECT, 40% one-row INSERT, and 10% three-statement transaction (INSERT, UPDATE, SELECT).",
+	)
+	return res, nil
 }
 
 func runColdStart(ctx context.Context, cfg config, client *gatewayClient) (*result, error) {
@@ -792,7 +922,7 @@ func parseConfig() config {
 	flag.StringVar(&cfg.runnerName, "runner-name", "", "engine runner pool name")
 	flag.StringVar(&cfg.sdk, "sdk", "", "runner SDK label")
 	flag.StringVar(&cfg.variant, "variant", "persist", "persistence variant")
-	flag.StringVar(&cfg.scenario, "scenario", "", "s1, s2, s3, or s4")
+	flag.StringVar(&cfg.scenario, "scenario", "", "s1, s2, s3, s4, or s5")
 	flag.IntVar(&cfg.repetition, "repetition", 1, "repetition number")
 	flag.DurationVar(&cfg.warmup, "warmup", 10*time.Second, "excluded warmup duration")
 	flag.DurationVar(&cfg.measure, "measure", 60*time.Second, "measured duration for S1-S3")
@@ -815,11 +945,15 @@ func (cfg config) validate() error {
 	if cfg.repetition < 1 || cfg.warmup < 10*time.Second || cfg.measure <= 0 || cfg.coldActors < 1 {
 		return errors.New("repetition must be positive, warmup at least 10s, measure positive, and cold-actors positive")
 	}
-	if cfg.variant != "persist" && cfg.variant != "no-persist" && cfg.variant != "not-applicable" {
+	validVariant := cfg.variant == "persist" || cfg.variant == "no-persist" || cfg.variant == "not-applicable"
+	if cfg.scenario == "s5" {
+		validVariant = cfg.variant == "ffi" || cfg.variant == "socket" || cfg.variant == "raw-sql"
+	}
+	if !validVariant {
 		return fmt.Errorf("unknown variant %q", cfg.variant)
 	}
 	switch cfg.scenario {
-	case "s1", "s2", "s3", "s4":
+	case "s1", "s2", "s3", "s4", "s5":
 	default:
 		return fmt.Errorf("unknown scenario %q", cfg.scenario)
 	}
@@ -862,6 +996,8 @@ func main() {
 		res, err = runWebSocket(ctx, cfg, client)
 	case "s4":
 		res, err = runColdStart(ctx, cfg, client)
+	case "s5":
+		res, err = runSQLiteScenario(ctx, cfg, client)
 	}
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "loadgen:", err)
