@@ -2590,8 +2590,12 @@ fn sqlite_result_events(request_id: u64, result: ExecuteResult) -> Result<Vec<Ev
                 Vec::new()
             },
             values,
-            rows_affected: result.changes,
-            last_insert_id: result.last_insert_row_id,
+            rows_affected: if index == 0 { result.changes } else { 0 },
+            last_insert_id: if index == 0 {
+                result.last_insert_row_id
+            } else {
+                None
+            },
             error: None,
         })
         .collect())
@@ -2640,7 +2644,25 @@ fn sqlite_wire_error(error: &anyhow::Error) -> WireError {
             statement_index: Some(statement.statement_index),
         };
     }
+    if error
+        .downcast_ref::<depot_client::worker::SqliteWorkerOverloadedError>()
+        .is_some()
+    {
+        return WireError::new("sqlite_queue_full", error.to_string());
+    }
+    if error
+        .downcast_ref::<depot_client::worker::SqliteWorkerClosingError>()
+        .is_some()
+        || error
+            .downcast_ref::<depot_client::worker::SqliteWorkerDeadError>()
+            .is_some()
+    {
+        return WireError::new("sqlite_endpoint_closed", error.to_string());
+    }
     let structured = RivetError::extract(error);
+    if structured.group() == "actor" && structured.code() == "overloaded" {
+        return WireError::new("sqlite_queue_full", structured.message());
+    }
     WireError::new(structured.code(), structured.message())
 }
 
@@ -2764,6 +2786,114 @@ mod tests {
             value_count += values.len();
         }
         assert_eq!(value_count, 2_200);
+    }
+
+    #[test]
+    fn sqlite_result_chunk_boundaries_and_metadata_are_exact() {
+        fn result(values: Vec<ColumnValue>) -> ExecuteResult {
+            ExecuteResult {
+                columns: vec!["value".to_owned()],
+                rows: values.into_iter().map(|value| vec![value]).collect(),
+                changes: 7,
+                last_insert_row_id: Some(11),
+            }
+        }
+
+        let empty = sqlite_result_events(1, result(Vec::new())).expect("empty SQLite result");
+        assert_eq!(empty.len(), 1);
+        let Event::SqliteResult { done, values, .. } = &empty[0] else {
+            panic!("unexpected empty SQLite event")
+        };
+        assert!(*done);
+        assert!(values.is_empty());
+
+        let value_boundary = sqlite_result_events(2, result(vec![ColumnValue::Null; 1_025]))
+            .expect("1025-value SQLite result");
+        assert_eq!(value_boundary.len(), 2);
+        let Event::SqliteResult { values, .. } = &value_boundary[0] else {
+            panic!("unexpected first value-boundary event")
+        };
+        assert_eq!(values.len(), 1_024);
+        let Event::SqliteResult { values, .. } = &value_boundary[1] else {
+            panic!("unexpected second value-boundary event")
+        };
+        assert_eq!(values.len(), 1);
+
+        let exact_payload = "x".repeat(MAX_SQLITE_CHUNK_BYTES - 17);
+        let exact = sqlite_result_events(
+            3,
+            result(vec![
+                ColumnValue::Text(exact_payload.clone()),
+                ColumnValue::Null,
+            ]),
+        )
+        .expect("exact-byte-boundary SQLite result");
+        assert_eq!(exact.len(), 1);
+
+        let over = sqlite_result_events(
+            4,
+            result(vec![
+                ColumnValue::Text(exact_payload),
+                ColumnValue::Null,
+                ColumnValue::Null,
+            ]),
+        )
+        .expect("one-byte-over-boundary SQLite result");
+        assert_eq!(over.len(), 2);
+        for (index, event) in over.iter().enumerate() {
+            let Event::SqliteResult {
+                rows_affected,
+                last_insert_id,
+                ..
+            } = event
+            else {
+                panic!("unexpected byte-boundary event")
+            };
+            if index == 0 {
+                assert_eq!(*rows_affected, 7);
+                assert_eq!(*last_insert_id, Some(11));
+            } else {
+                assert_eq!(*rows_affected, 0);
+                assert_eq!(*last_insert_id, None);
+            }
+        }
+    }
+
+    #[test]
+    fn sqlite_result_total_limit_is_enforced() {
+        let exact_value = "x".repeat(MAX_SQLITE_CHUNK_BYTES - 16);
+        let mut rows = (0..32)
+            .map(|_| vec![ColumnValue::Text(exact_value.clone())])
+            .collect::<Vec<_>>();
+        rows[0] = vec![ColumnValue::Text(
+            "x".repeat(MAX_SQLITE_CHUNK_BYTES - 16 - "value".len()),
+        )];
+        let exact = ExecuteResult {
+            columns: vec!["value".to_owned()],
+            rows: rows.clone(),
+            changes: 0,
+            last_insert_row_id: None,
+        };
+        sqlite_result_events(5, exact).expect("exact-total-limit SQLite result");
+
+        rows.push(vec![ColumnValue::Null]);
+        let oversized = ExecuteResult {
+            columns: vec!["value".to_owned()],
+            rows,
+            changes: 0,
+            last_insert_row_id: None,
+        };
+        let error = sqlite_result_events(6, oversized).expect_err("oversized SQLite result");
+        assert_eq!(error.code, "sqlite_result_too_large");
+    }
+
+    #[test]
+    fn sqlite_worker_queue_full_matches_socket_error_code() {
+        let error = anyhow::Error::new(depot_client::worker::SqliteWorkerOverloadedError);
+        assert_eq!(sqlite_wire_error(&error).code, "sqlite_queue_full");
+
+        let error = anyhow::Error::new(depot_client::worker::SqliteWorkerClosingError);
+        assert_eq!(sqlite_wire_error(&error).code, "sqlite_endpoint_closed");
     }
 
     #[tokio::test]

@@ -326,7 +326,7 @@ func decodeHello(payload []byte) (uint32, error) {
 		return 0, fmt.Errorf("ServerHello maxFrameBytes %d is too small", maxFrame)
 	}
 	if maxFrame > maxSupportedFrame {
-		return 0, fmt.Errorf("ServerHello maxFrameBytes %d exceeds the Go SDK limit %d", maxFrame, maxSupportedFrame)
+		maxFrame = maxSupportedFrame
 	}
 	return maxFrame, nil
 }
