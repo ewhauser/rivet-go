@@ -46,6 +46,12 @@ struct ActorIdentity {
     generation: u64,
 }
 
+struct ActorStartupPayload {
+    input: Vec<u8>,
+    persisted_state: Option<Vec<u8>>,
+    sqlite_socket_path: Option<String>,
+}
+
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
 struct SqliteLeaseIdentity {
     actor: ActorIdentity,
@@ -799,9 +805,11 @@ impl ActorProxy {
             .run_actor_inner(
                 &identity,
                 &ctx,
-                input.unwrap_or_default(),
-                snapshot,
-                sqlite_socket_path,
+                ActorStartupPayload {
+                    input: input.unwrap_or_default(),
+                    persisted_state: snapshot,
+                    sqlite_socket_path,
+                },
                 &mut events,
                 startup_ready,
             )
@@ -842,9 +850,7 @@ impl ActorProxy {
         &self,
         identity: &ActorIdentity,
         ctx: &ActorContext,
-        input: Vec<u8>,
-        persisted_state: Option<Vec<u8>>,
-        sqlite_socket_path: Option<String>,
+        startup: ActorStartupPayload,
         events: &mut rivetkit_core::ActorEvents,
         startup_ready: Option<tokio::sync::oneshot::Sender<Result<()>>>,
     ) -> Result<bool> {
@@ -864,9 +870,9 @@ impl ActorProxy {
                     // engine actor create timestamp. The stable field remains
                     // present and uses the documented zero sentinel.
                     create_ts: 0,
-                    input,
-                    persisted_state,
-                    sqlite_socket_path,
+                    input: startup.input,
+                    persisted_state: startup.persisted_state,
+                    sqlite_socket_path: startup.sqlite_socket_path,
                 },
                 None,
             )

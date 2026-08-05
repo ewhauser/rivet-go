@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -216,6 +217,20 @@ type actionFailure struct {
 	Message string `json:"message"`
 }
 
+type actionFailureError struct {
+	action  string
+	failure actionFailure
+}
+
+func (e *actionFailureError) Error() string {
+	return fmt.Sprintf("action %s failed: %s/%s: %s", e.action, e.failure.Group, e.failure.Code, e.failure.Message)
+}
+
+func isActionFailure(err error, group, code string) bool {
+	var failure *actionFailureError
+	return errors.As(err, &failure) && failure.failure.Group == group && failure.failure.Code == code
+}
+
 func gatewayAction[T any](
 	ctx context.Context,
 	api *engineAPI,
@@ -232,7 +247,7 @@ func gatewayAction[T any](
 		if decodeErr := json.Unmarshal(body, &failure); decodeErr != nil {
 			return output, fmt.Errorf("action %s returned %d: %s", action, status, body)
 		}
-		return output, fmt.Errorf("action %s failed: %s/%s: %s", action, failure.Group, failure.Code, failure.Message)
+		return output, &actionFailureError{action: action, failure: failure}
 	}
 	var response struct {
 		Output T `json:"output"`

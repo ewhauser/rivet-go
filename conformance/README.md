@@ -146,4 +146,6 @@ not claim live-generation failover.
 The suite is intentionally part of normal `go test ./conformance` and the full
 `go test -race -count=1 ./...` gate. It is not skipped as a long test. No fuzz
 or deliberately malformed socket-input cases live here; the supervisor owns
-that work.
+that work. The package raises Go's injected 10-minute test timeout to 20
+minutes because the unshortened race-enabled real-engine suite now exceeds the
+default; a larger caller-supplied timeout is preserved.

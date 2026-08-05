@@ -942,19 +942,39 @@ func (r *soakRun) restartChaos(ctx context.Context, _ int) error {
 			return fmt.Errorf("reconnect client after engine restart: %w", err)
 		}
 	}
-	actual, err := gatewayAction[alarmState](ctx, r.api, r.alarmActor, "resleep", struct{}{})
-	if err != nil {
-		return fmt.Errorf("rehydrate alarm actor after engine restart: %w", err)
+	var actual alarmState
+	rehydrateCtx, cancelRehydrate := context.WithTimeout(ctx, 30*time.Second)
+	defer cancelRehydrate()
+	retry := time.NewTicker(100 * time.Millisecond)
+	defer retry.Stop()
+	for {
+		var err error
+		actual, err = gatewayAction[alarmState](rehydrateCtx, r.api, r.alarmActor, "resleep", struct{}{})
+		if err == nil {
+			break
+		}
+		// The old generation can still be completing its 22-second loss
+		// transition after the new engine advertises the actor. Retry only this
+		// explicit pinned transitional response; every other failure is final.
+		if !isActionFailure(err, "actor", "stopping") {
+			return fmt.Errorf("rehydrate alarm actor after engine restart: %w", err)
+		}
+		select {
+		case <-rehydrateCtx.Done():
+			return fmt.Errorf("rehydrate alarm actor after engine restart: %w", rehydrateCtx.Err())
+		case <-retry.C:
+		}
 	}
 	if err := waitUntil(ctx, 25*time.Millisecond, func() (bool, error) {
 		compareErr := compareAlarm(actual, r.alarmOracle.truth())
 		if compareErr == nil {
 			return true, nil
 		}
-		actual, err = gatewayAction[alarmState](ctx, r.api, r.alarmActor, "snapshot", struct{}{})
+		refreshed, err := gatewayAction[alarmState](ctx, r.api, r.alarmActor, "snapshot", struct{}{})
 		if err != nil {
 			return false, err
 		}
+		actual = refreshed
 		compareErr = compareAlarm(actual, r.alarmOracle.truth())
 		return compareErr == nil, compareErr
 	}); err != nil {
