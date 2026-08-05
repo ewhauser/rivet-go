@@ -201,6 +201,7 @@ returns a clear error at `rivet.Serve`.
 | M4 | WebSockets + events: connection objects, broadcast, message acks | Conformance: two WS clients see each other's broadcasts | 1–2 wk | Complete — [review](reviews/M4-REVIEW.md) |
 | M5 | Scheduling + sleep: alarms, sleep/wake, hibernating WS (`canHibernate`) | Conformance: alarm fires after actor slept; WS survives hibernation | 2 wk | Complete — [review](reviews/M5-REVIEW.md) |
 | M6 | Production hardening: graceful drain, panic firewall, soak/chaos, metrics hooks, docs + examples | Configurable strict soak harness; bounded 15-minute run clean; 24-hour release soak documented; README quickstart works from scratch | 2–3 wk | Complete — [review](reviews/M6-REVIEW.md) |
+| M7 | Per-actor SQLite through FFI-pump and actor-runtime-socket candidates behind one `Context.DB` API; conformance and S5 comparison | Both transports pass the same durability/isolation/transaction suite; two-repetition S5 archive includes Go-ffi, Go-socket, and TypeScript `c.db` raw SQL | 2–3 wk | Complete — candidate review pending; no default selected |
 
 Roughly 9–13 weeks solo to a production-ready v0. M0–M3 (~4–6 wk) is the
 demo-quality milestone and the point of maximum learning — reassess the
@@ -228,6 +229,11 @@ approach there.
 - Alarm mutation completion includes the pin-specific four-second transport
   fence, and the engine's 16-second workflow tick prevents low-latency timing
   guarantees.
+- Per-actor SQL has no default transport while M7 is under review. Applications
+  must select `ffi` or `socket`; the socket candidate is Unix-only. Results are
+  fully buffered, bounded to 32 MiB overall, 1 MiB per SQL/text/blob value,
+  1,024 parameters and columns, and an active transaction exclusively gates
+  other operations for up to its 60-second default lease.
 - Each runner uses one blocking, OS-thread-pinned poller. Submissions and
   operability hooks run elsewhere, but event decoding and dispatch are
   intentionally single-poller.
@@ -590,3 +596,88 @@ the 1,024 actor-name limit, the Go shape scanner accepts the exact-bound map,
 and Rust rejects keys that are not present in `actor_names`. It adds no event,
 command, blob, or unbounded allocation surface. No fuzz or deliberately
 malformed-input test was added.
+
+## M7 per-actor SQLite notes — 2026-08-05
+
+M7 resolves the pin's `LocalNative` terminology from core source. It means
+SQLite statement execution and transaction coordination run in the embedded
+runner process. It does not mean actor data is local-only: core's native SQLite
+worker uses the Depot VFS, whose page reads and commits travel through the
+envoy to engine Depot and FoundationDB/filesystem storage. A successful commit
+is durable at the engine commit boundary. `RemoteEnvoy`, used by the M2 state
+mapping, instead executes SQL on the engine/envoy side.
+
+The embedding compiles both core features. With no SQLite transport selected,
+the existing state and actor-KV path remains `RemoteEnvoy` and `Context.DB()`
+returns `sqlite_transport_not_configured`. Selecting either `ffi` or `socket`
+sets `ActorConfig.remote_sqlite = false`, enables the actor database, and uses
+the same `LocalNative` database. This makes S5 a transport comparison against
+one backend mode. Core's FFI-visible `SqliteDb` API can operate against either
+backend, but the Actor Runtime Socket rejects every database other than an
+enabled `LocalNative` one, so comparing FFI/remote with socket/local would
+confound transport and execution placement.
+
+`Config.SQLiteTransport` accepts only `rivet.SQLiteTransportFFI` (`"ffi"`) or
+`rivet.SQLiteTransportSocket` (`"socket"`).
+`RIVET_GO_SQLITE_TRANSPORT` overrides it for a complete runner invocation.
+There is intentionally no fallback or recommendation while the M7 result is
+reviewed. The socket candidate also enables
+`ActorConfig.enable_actor_runtime_socket`, provisions the Unix endpoint before
+`ActorStart`, and passes its generation-scoped path to Go. The endpoint is
+closed and recreated on sleep/wake; an open socket transaction is rolled back
+when Go closes that connection before requesting sleep.
+
+Both candidates expose one generation-bound `DB` with `Exec`, `Query`, and
+`Begin`; `Tx` has `Exec`, `Query`, `Commit`, and `Rollback`. Values map exactly
+between SQL NULL/integer/real/text/blob and Go
+`nil`/`int64`/`float64`/`string`/`[]byte`. The 60-second core transaction lease
+is shortened to the remaining `Begin` context deadline when one exists. Lease
+expiry rolls back and returns structured code `transaction_expired`; actor
+stop, socket disconnect, and runner shutdown also make the lease terminal.
+Core's 128-entry transaction coordinator admission queue allows concurrent
+regular operations under a shared gate, serializes transaction operations,
+and gives one active transaction an exclusive gate. The Go actor dispatcher
+does not add a second SQL lock, so both transports inherit those same rules.
+
+ABI 7 adds the transport config, optional `ActorStart.sqlite_socket_path`, five
+request-ID-correlated SQLite commands, and chunked `SqliteResult` events. FFI
+responses are split into at most 1 MiB or 1,024-value chunks and reassembled by
+Go, with a 32 MiB content ceiling. The socket v1 BARE response is one negotiated
+frame and therefore has a 32 MiB frame ceiling including encoding overhead.
+The shared API restricts SQL, text and blob arguments to 1 MiB, arguments and
+columns to 1,024, and results to the transport's 32 MiB ceiling. Results are
+fully buffered. Context cancellation abandons the Go correlation ID while a
+late completion is consumed safely; neither core operation is forcibly
+preempted after submission.
+
+The socket client is pure Go. It vendors
+`engine/sdks/rust/actor-runtime-socket-protocol/schemas/v1.bare` at commit
+`957d4e482f404913ca1955d8ecc357533f6fd081`, implements the two-byte vbare
+embedded-version prefix, BARE types, big-endian u32 frame length, hello
+exchange, server `maxFrameBytes`, u32 request IDs, and connection-owned lease
+keys. The upstream `SqliteExec` request accepts an unparameterized script and
+returns no mutation metadata, so public parameterized `Exec` uses the protocol's
+`SqliteQuery` request and discards rows while retaining `changes` and
+`lastInsertRowid`.
+
+Two pin/build deviations were required for faithful LocalNative behavior.
+Pinned Depot SQLite requires `SQLITE_ENABLE_BATCH_ATOMIC_WRITE`, now set in the
+workspace Cargo configuration just as it is upstream. The exact v2.3.10 Depot
+query decoder also treated a valid zero-length `SQLITE_BLOB` as NULL when
+`sqlite3_column_blob` returned a null data pointer. Seven source files are
+vendored from the same pinned checkout and selected with a Cargo patch; the
+only behavior change preserves `Blob(Vec::new())` after
+`sqlite3_column_type == SQLITE_BLOB`. The dependency version and Rivet commit
+do not change.
+
+Real-engine conformance runs the same CRUD, five-type values, commit/rollback,
+lease expiry, structured SQL errors, concurrency, actor isolation, KV/state
+coexistence, sleep/wake, and same-data-directory engine replacement cases for
+both candidates. The FFI-specific case proves a result larger than one batch
+is reconstructed. The socket-specific case sleeps mid-lease and proves the
+old connection and lease are dead. At this pin, an actor left live across an
+abrupt standalone engine replacement remains bound to its old envoy session;
+the durable SQL fixture therefore sleeps the actor, stops the runner, replaces
+the engine against the same data directory, starts a new runner, and
+demand-wakes the actor. This proves persisted storage recovery, not seamless
+rescheduling of a live generation across a crash.

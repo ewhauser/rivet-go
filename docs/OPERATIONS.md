@@ -28,6 +28,42 @@ raw WebSockets have already received 1001, `Registry.Serve` returns an error,
 and the runnable examples exit with code 1. Treat that forced path as a
 production incident even when the process must continue exiting.
 
+## Per-actor SQLite transport
+
+M7 deliberately has no default SQL transport. Select one for the complete
+runner invocation:
+
+```go
+config.SQLiteTransport = rivet.SQLiteTransportFFI
+// or: rivet.SQLiteTransportSocket
+```
+
+`RIVET_GO_SQLITE_TRANSPORT=ffi|socket` overrides the config and is primarily
+used by the candidate benchmark. An empty setting preserves the existing
+remote state/KV backend, but `ctx.DB()` operations return the structured
+`sqlite_transport_not_configured` error. Do not silently choose a candidate in
+application configuration until the review pass selects a default.
+
+Both explicit choices run core's LocalNative SQLite worker against the same
+engine-backed per-actor Depot storage. `ffi` sends correlated commands through
+the existing MessagePack pump and reconstructs chunked results. `socket` uses
+core's experimental generation-scoped Unix endpoint and is unavailable on
+Windows. The endpoint is replaced on every wake; a transaction from an older
+generation or connection cannot be reused.
+
+Transactions lease core's exclusive per-actor database gate for 60 seconds by
+default. A deadline on `Begin` shortens the lease. Expiry, actor sleep, socket
+disconnect, or runner shutdown rolls the transaction back and makes its `Tx`
+terminal. Keep transactions short and do not call the outer `DB` while holding
+one: regular operations wait behind the active transaction and may consume the
+caller deadline.
+
+SQL results are fully buffered. SQL text, text values, and blob values are
+limited to 1 MiB each; requests accept at most 1,024 arguments and results at
+most 1,024 columns. FFI results have a 32 MiB content limit and cross in 1 MiB
+chunks. Socket results must fit one negotiated frame capped at 32 MiB including
+protocol overhead. Large result APIs should paginate explicitly.
+
 ## Metrics and logging
 
 `Config.Hooks` accepts a concurrency-safe implementation of:
@@ -176,7 +212,7 @@ download dependency.
 
 ## Known v2.3.10 limitations
 
-The following 13 bullets are the grouped, complete deviation summary for the
+The following 15 bullets are the grouped, complete deviation summary for the
 pin-specific notes in `docs/FFI-BOUNDARY.md`:
 
 - Core calls runner registration an envoy and exposes it through `/envoys`.
@@ -186,8 +222,18 @@ pin-specific notes in `docs/FFI-BOUNDARY.md`:
 - Actor creation time is unavailable to the adapter and crosses as zero.
   Core reduces stop causes to sleep or destroy, with the Go panic-stop path
   adding stop.
-- State and actor KV use core's remote SQLite backend. The native-local backend
-  needs an atomic-write SQLite build and is not shipped.
+- With no M7 SQL transport selected, state and actor KV use core's remote
+  SQLite backend. Either explicit SQL candidate switches that actor to the
+  LocalNative worker while retaining engine-backed Depot durability. The build
+  supplies SQLite batch-atomic-write support required by that mode.
+- Per-actor SQL has no default recommendation. FFI and socket share one public
+  API and one LocalNative backend for comparison; the experimental socket is
+  Unix-only and generation-scoped, while FFI is supported on all six targets.
+- SQL results are fully buffered and bounded: 1 MiB SQL/text/blob values,
+  1,024 arguments/columns, and 32 MiB results. FFI chunks within that total;
+  a socket response must fit one frame including protocol overhead. The exact
+  pin's Depot decoder is locally corrected so an empty BLOB remains distinct
+  from NULL.
 - Gateway JSON action arguments are normalized to CBOR by core. `RawAction`
   therefore exposes the exact CBOR argument array, not original JSON bytes.
   Actions use the pin's 60-second cooperative deadline; Go cannot preempt a

@@ -24,6 +24,44 @@ Rust leave their corresponding actor options at the same false default. This
 keeps private boundary acknowledgement bookkeeping and per-message engine
 hibernation acknowledgements out of the echo comparison.
 
+## S5 per-actor SQLite candidates
+
+S5 compares Go-ffi, Go-socket, and TypeScript `rivetkit@2.3.10` `c.db` as an
+external raw-SQL reference. Both Go candidates use the same core LocalNative
+SQLite backend; only the Go-to-core transport changes. TypeScript calls
+`c.db.execute` and its callback `transaction` directly with no ORM. The SQL
+statements match, but TypeScript returns object rows and manages the transaction
+callback while Go returns column/value matrices and exposes a lease-backed
+`Tx`.
+
+Each suite starts one fresh engine data directory and runs two sequential
+repetitions. A repetition maps 32 workers one-to-one to 32 actors, excludes a
+10-second warmup, and measures a 45-second window. The deterministic mix is
+50% point `SELECT`, 40% single-row `INSERT`, and 10% one explicit transaction
+containing `INSERT`, `UPDATE`, and `SELECT`. That transaction counts as one
+composite operation. Each actor's final row count must equal its post-warmup
+baseline plus every successful measured insert.
+
+Run only S5 with:
+
+```sh
+./bench/run-s5.sh
+```
+
+The script refuses to overwrite a dated archive, builds both runners, sets
+`RIVET_GO_SQLITE_TRANSPORT` for the Go cells, samples runner and engine CPU,
+appends the labeled table to `RESULTS.md`, and archives JSON, complete process
+logs, environment data, and SHA-256 checksums. `report-s5` rejects a missing or
+duplicate cell, any non-10/45 timing request, missing CPU samples, load errors,
+or failed row reconciliation.
+
+The recorded 2026-08-05 run had no load-generator errors. Its TypeScript
+reference log contains 128 teardown-only `transaction_closed` schedule cleanup
+records after its two measured repetitions, and its engine log contains two
+request-metrics timeouts. Both Go transport logs contain no error-level record.
+Those diagnostics are archived for review and are not counted as successful
+operations or hidden by the row oracle.
+
 Run the complete, sequential evaluation with:
 
 ```sh

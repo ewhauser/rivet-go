@@ -98,7 +98,7 @@ instance ID, `gen` = generation; both assigned by core.
 | `RunnerConnected` | runner_id, engine metadata | — |
 | `RunnerDisconnected` | reason; core auto-reconnects | — |
 | `RunnerStopped` | drain report | — (pump exits) |
-| `ActorStart` | aid, gen, name, key, create_ts, input, persisted_state (optional; absent differs from present-empty) | `ActorStartResult { aid, gen, ok / error }` |
+| `ActorStart` | aid, gen, name, key, create_ts, input, persisted_state (optional; absent differs from present-empty), sqlite_socket_path? | `ActorStartResult { aid, gen, ok / error }` |
 | `ActorStop` | aid, gen, reason (stop cmd / sleep intent / drain) | `ActorStopResult { aid, gen }` after handler cleanup |
 | `ActorAlarm` | aid, gen, alarm_ts | `AlarmHandled { aid, gen }` |
 | `ActorIntentResult` | op_id, error? | completes the matching `SetAlarm` or `SleepIntent` admission |
@@ -111,6 +111,7 @@ instance ID, `gen` = generation; both assigned by core.
 | `WsClose` | ws_id, code?, reason? | — |
 | `KvResult` | kv_id, ok payload / error | — (completes pending Go future) |
 | `StatePersisted` | aid, gen, state_version | — (completes pending save) |
+| `SqliteResult` | request_id, chunk_index, done, first-chunk columns, row-major typed values, rows_affected, last_insert_id?, structured error? | — (completes pending Go SQL future after ordered reassembly) |
 
 ## Command catalog (Go → Rust)
 
@@ -127,6 +128,9 @@ instance ID, `gen` = generation; both assigned by core.
 | `SetAlarm` | op_id, aid, gen, alarm_ts? (null clears) | `ActorIntentResult` after the core schedule operation succeeds or fails |
 | `SleepIntent` | op_id, aid, gen | `ActorIntentResult` after exact-generation admission; eventual `ActorStop` reports eviction |
 | `StopIntent` | aid | eventual `ActorStop` |
+| `SqliteExec` / `SqliteQuery` | request_id, aid, gen, deadline_ms, SQL, typed args, lease_key? | one or more ordered `SqliteResult` events |
+| `SqliteBegin` | request_id, aid, gen, deadline_ms, lease_key, timeout_ms | `SqliteResult` |
+| `SqliteCommit` / `SqliteRollback` | request_id, aid, gen, deadline_ms, lease_key | `SqliteResult` |
 
 The catalogs deliberately mirror runner-protocol concepts
 (`engine/sdks/schemas/runner-protocol/v7.bare`) at one level higher — actions
@@ -138,6 +142,10 @@ tunnels. Where a name matches the wire protocol, semantics must match
 
 - HTTP/WS bodies cross as chunks (the tunnel protocol is already chunked;
   proxies map 1:1). Max chunk size fixed at 1 MiB — larger writes are split.
+- FFI SQLite results are flattened row-major and split at 1 MiB of value
+  content or 1,024 values, whichever comes first. Only chunk zero carries the
+  columns and mutation metadata. The complete content limit is 32 MiB; Go
+  buffers and reassembles it before returning `Rows`.
 - `rk_runner_submit` queue is bounded (default 1024 commands); a full queue
   returns a `Backpressure` error and the Go writer retries with jitter — this
   propagates engine-side tunnel backpressure to `http.ResponseWriter.Write`.
@@ -621,3 +629,112 @@ the shape scanner accepts a valid map at that exact bound, values are booleans,
 and unknown actor keys are rejected before the registry starts. It adds no
 event/command variant, binary blob, nested container, or new native allocation
 ownership rule. No fuzz or deliberately malformed-input test was added.
+
+## M7 SQLite transports and ABI 7 — 2026-08-05
+
+ABI 7 is single-sourced by Rust and generated into the cbindgen header and Go
+loader for all six artifacts. `RunnerConfig.sqlite_transport` accepts empty,
+`ffi`, or `socket`. Empty retains the M2 `RemoteEnvoy` state/KV database and
+does not expose public SQL. Both explicit candidates enable the actor database
+with `ActorConfig.remote_sqlite = false`, selecting `SqliteBackend::LocalNative`;
+only `socket` also sets `enable_actor_runtime_socket`.
+
+At this pin, LocalNative means the native SQLite worker and transaction
+coordinator execute in the embedded runner. Its Depot VFS still obtains pages
+and commits through the envoy/engine storage service, so the durability
+boundary is the engine's successful Depot commit, not a runner-local file.
+RemoteEnvoy sends statement execution through the envoy instead. Core compiles
+both modes in this library, and the FFI command proxy could call either, but
+`ActorRuntimeSocketEndpoint::provision` explicitly requires an enabled
+LocalNative database. M7 therefore compares both transports against
+LocalNative and does not mix backend placement into the benchmark.
+
+### FFI-pump contract
+
+The five SQLite commands use a u64 request ID from the pump's existing
+correlation allocator. Every command carries actor ID, exact generation, and a
+positive deadline in milliseconds. Rust rejects stale generations, reserves
+the request before spawning core work, and returns a structured `SqliteResult`
+error on timeout, SQL failure, transaction failure, shutdown, or size limit.
+Go context cancellation removes the caller but retains a tombstone so a late
+native completion cannot be mistaken for a wrapped request ID. Actor stop and
+runner free wake all pending callers.
+
+`SqliteExec` maps to `SqliteDb::execute` or
+`SqliteTransaction::execute`; `SqliteQuery` uses the same core method and
+returns rows. Begin uses `begin_transaction_with_key`, while commit and
+rollback use the retained `SqliteTransaction`. Lease keys are unique per Go
+process and scoped again by actor ID/generation in the FFI map. A successful
+or failed terminal operation removes the retained transaction.
+
+SQL and every text/blob argument are capped at 1 MiB, argument and column
+lists at 1,024, and lease keys at 256 bytes. A complete FFI result may contain
+32 MiB of columns and values. It is emitted as ordered chunks capped at 1 MiB
+of value content or 1,024 values, so the unchanged Go scanner limits remain
+valid. Go requires chunk indexes to start at zero, remain contiguous, repeat
+no columns after the first chunk, and finish once. Rows must be rectangular.
+The API fully buffers the reconstructed result.
+
+### Actor Runtime Socket contract
+
+The socket endpoint is Unix-only and generation-scoped. Rust provisions it
+before `ActorStart` and sends the filesystem path in
+`sqlite_socket_path`; Go opens a new connection during each generation's
+startup and closes it before sleep or stop. A reconnect is therefore a new
+endpoint and all prior connection-owned leases are terminal. Windows builds
+support the FFI candidate but reject `SQLiteTransportSocket` during runner
+configuration.
+
+`internal/sqlitesocket/schema/v1.bare` is copied from
+`engine/sdks/rust/actor-runtime-socket-protocol/schemas/v1.bare` at
+`957d4e482f404913ca1955d8ecc357533f6fd081`. The pure-Go client implements only
+those v1 types. Each hello and request/response payload begins with the vbare
+u16 embedded version in little-endian order. The outer frame is a big-endian
+u32 length. BARE fixed-width values are little-endian; variants and collection
+lengths use unsigned varints. The 10-second hello must return version 1 and a
+positive `maxFrameBytes`; the client honors the smaller of that value and
+core's 32 MiB default.
+
+Requests use nonzero u32 IDs with a correlation table, serialized writer, and
+reader goroutine. A canceled request leaves a tombstone until its response is
+consumed. Disconnect fails every live request and closes the generation's DB
+handle; reconnect happens only through the next `ActorStart`. Transaction
+begin sends the Go lease key plus its timeout. Other transaction operations
+carry that key exactly where the upstream schema requires it, and connection
+close makes core expire every active lease. Public parameterized `Exec` uses
+the schema's `SqliteQuery` request because `SqliteExec` accepts only a script
+and returns neither `changes` nor `lastInsertRowid`.
+
+Socket responses are not chunked by the upstream protocol. Columns and all
+rows, including encoding overhead, must fit one negotiated frame. The client
+applies the same 1 MiB value and 1,024 parameter/column limits as the public
+API, then the negotiated 32 MiB frame ceiling. Every decoder checks declared
+length against bytes remaining before allocation, validates rectangular rows,
+and rejects trailing bytes.
+
+### Shared concurrency, errors, and build deviations
+
+Both transports end at the same core `TransactionCoordinator`. It admits at
+most 128 queued/in-flight entries, permits concurrent regular operations under
+a shared gate, gives one active transaction the exclusive write gate, and
+serializes operations within that transaction. Its default lease is 60
+seconds. `Begin` shortens that to its context deadline; expiry rolls back.
+Go adds no transport-specific actor lock. Structured errors preserve core's
+stable code and message plus extended SQLite code and statement index when the
+failure came from a statement.
+
+LocalNative requires bundled SQLite to be compiled with
+`SQLITE_ENABLE_BATCH_ATOMIC_WRITE`; `.cargo/config.toml` supplies the same flag
+as the pinned upstream workspace. The pinned Depot decoder also collapsed a
+zero-length BLOB to NULL when SQLite reported `SQLITE_BLOB` with a null data
+pointer. The workspace Cargo patch vendors the exact v2.3.10 seven-file Depot
+client and changes only that branch to return an empty blob. This is a local
+pin correction, not a dependency or Rivet version change.
+
+New decode surfaces: ABI 7 adds the bounded `sqlite_transport` string, optional
+ActorStart socket-path string, five SQLite command variants, the chunked
+`SqliteResult` event, and the `SqliteValue` union to the existing MessagePack
+scanner. The pure-Go socket client additionally decodes the u32 frame length,
+vbare hello, `ServerFrame`/`ResponsePayload` variants, structured socket error
+metadata, column strings, row/value lists, and optional last-insert ID from the
+vendored BARE schema. No fuzz or deliberately malformed-input test was added.

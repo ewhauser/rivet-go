@@ -117,3 +117,33 @@ The soak is intentionally separate from `go test`: `cmd/soak` owns its engine,
 runner, gateway clients, chaos schedule, strict truth models, and final leak
 oracles. Its two-minute default is suitable for a smoke job; the 24-hour
 release procedure is documented in `docs/OPERATIONS.md`.
+
+## M7 per-actor SQLite
+
+`TestPerActorSQLiteConformance` is one real-engine test parameterized over
+`ffi` and `socket`. Each candidate runs CRUD, parameter binding for NULL,
+integer, real, text, blob, and distinct empty-blob values, commit and rollback,
+lease expiry, syntax and constraint errors, concurrent access, per-actor
+isolation, SQL plus public state/KV, ordinary sleep/wake, and engine process
+replacement against the same data directory. SQL errors must retain structured
+codes and the actor must remain healthy.
+
+FFI additionally queries a result larger than one boundary batch and requires
+ordered reconstruction. Socket additionally sleeps the actor while a
+transaction lease is open; Go closes the old generation's endpoint before the
+sleep intent, the lease rolls back, and the stale `Tx` cannot affect the
+rehydrated actor.
+
+Pinned engine behavior constrains the restart fixture. A generation left live
+across abrupt standalone engine replacement remains associated with its old
+envoy session rather than being seamlessly assigned to the reconnected runner.
+The test therefore first sleeps the actor and observes its generation stop,
+stops the runner, kills and restarts the engine with the same data directory,
+starts a new runner, and demand-wakes the actor. The recovered SQL rows and Go
+state prove storage durability across process replacement; the fixture does
+not claim live-generation failover.
+
+The suite is intentionally part of normal `go test ./conformance` and the full
+`go test -race -count=1 ./...` gate. It is not skipped as a long test. No fuzz
+or deliberately malformed socket-input cases live here; the supervisor owns
+that work.
