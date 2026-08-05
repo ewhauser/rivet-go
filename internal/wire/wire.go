@@ -72,6 +72,7 @@ type RunnerConfig struct {
 	ActorNames               []string            `msgpack:"actor_names"`
 	ActorActions             map[string][]string `msgpack:"actor_actions"`
 	ActorHibernateWebSockets map[string]bool     `msgpack:"actor_hibernate_websockets"`
+	ActorDatabases           map[string]bool     `msgpack:"actor_databases"`
 	SQLiteTransport          string              `msgpack:"sqlite_transport"`
 	LogLevel                 string              `msgpack:"log_level"`
 }

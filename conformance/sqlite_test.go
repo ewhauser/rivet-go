@@ -203,12 +203,140 @@ func TestPerActorSQLiteConformance(t *testing.T) {
 	}
 }
 
+func TestDatabaseActorLiveGenerationDoesNotRehydrateAcrossEngineCrash(t *testing.T) {
+	if testing.Short() {
+		t.Skip("real-engine SQLite crash recovery conformance is disabled by -short")
+	}
+	engineBinary, err := acquireEngine(context.Background())
+	if err != nil {
+		t.Fatalf("obtain Rivet engine %s: %v\n%s", engineTag, err, engineRemediation())
+	}
+	engine := startEngine(t, engineBinary)
+	type observation struct {
+		actorID    string
+		generation uint64
+		count      int
+	}
+	started := make(chan observation, 4)
+	stopped := make(chan observation, 2)
+	definition := rivet.Actor[persistentCounterState]{
+		Database: true,
+		OnStart: func(ctx *rivet.Context[persistentCounterState]) error {
+			if ctx.State().Count == 0 {
+				ctx.State().Count = 41
+				saveCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+				defer cancel()
+				if err := ctx.Save(saveCtx); err != nil {
+					return err
+				}
+			}
+			started <- observation{actorID: ctx.ActorID(), generation: ctx.Generation(), count: ctx.State().Count}
+			return nil
+		},
+		OnStop: func(ctx *rivet.Context[persistentCounterState]) error {
+			stopped <- observation{actorID: ctx.ActorID(), generation: ctx.Generation(), count: ctx.State().Count}
+			return nil
+		},
+	}
+
+	registry := rivet.NewRegistry()
+	if err := rivet.Register(registry, "m7-live-crash", definition); err != nil {
+		t.Fatalf("register live-crash SQLite actor: %v", err)
+	}
+	runnerName := fmt.Sprintf("rivet-go-m7-live-crash-%d", time.Now().UnixNano())
+	served := startRegistry(t, engine, runnerName, registry)
+	key := "m7-live-database-crash"
+	actor := createActor(t, engine.endpoint, "m7-live-crash", runnerName, "restart", &key, nil)
+	var first observation
+	select {
+	case first = <-started:
+	case <-time.After(30 * time.Second):
+		t.Fatal("database actor did not start before engine crash")
+	}
+	if first.actorID != actor.ActorID || first.count != 41 {
+		t.Fatalf("first database actor observation = %#v", first)
+	}
+	waitForActor(t, engine.endpoint, actor.ActorID, false, func(actor actorRecord) bool {
+		return actor.ConnectableTS != nil && actor.DestroyTS == nil
+	})
+
+	engine.kill(t)
+	select {
+	case stoppedActor := <-stopped:
+		if stoppedActor.actorID != actor.ActorID || stoppedActor.generation != first.generation || stoppedActor.count != 41 {
+			t.Fatalf("pre-restart database actor stop = %#v", stoppedActor)
+		}
+	case err := <-served.result:
+		served.stopOnce.Do(func() {
+			served.cancel()
+			served.stopErr = err
+		})
+		t.Fatalf("runner exited while the engine was stopped: %v", err)
+	case <-time.After(disconnectLivenessWindow + 10*time.Second):
+		t.Fatal("database actor worker did not stop after engine loss")
+	}
+
+	engine.start(t)
+	eventually(t, 30*time.Second, func() (bool, error) {
+		envoys, err := listEnvoys(engine.endpoint, runnerName)
+		if err != nil {
+			return false, err
+		}
+		for _, envoy := range envoys {
+			if envoy.PoolName == runnerName && envoy.StopTS == nil {
+				return true, nil
+			}
+		}
+		return false, nil
+	})
+	// v2.3.10 retains the old live generation through its 22-second envoy
+	// liveness window. Even after that window, LocalNative database actors are
+	// not converted into a wakeable new generation by standalone replacement.
+	liveness := time.NewTimer(disconnectLivenessWindow)
+	defer liveness.Stop()
+	<-liveness.C
+	stale, err := getActor(engine.endpoint, actor.ActorID, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stale.ConnectableTS == nil || stale.SleepTS != nil || stale.DestroyTS != nil || len(stale.Error) != 0 {
+		t.Fatalf("post-crash live database actor metadata = %#v, want the old generation to remain connectable", stale)
+	}
+
+	response, body, wakeErr := gatewayRequest(
+		engine.endpoint,
+		actor.ActorID,
+		"/m2-rehydrate",
+		nil,
+		10*time.Second,
+	)
+	if wakeErr != nil {
+		t.Fatalf("post-crash database request: %v", wakeErr)
+	}
+	if response == nil || response.StatusCode != http.StatusServiceUnavailable || strings.TrimSpace(string(body)) != "Actor not found" {
+		t.Fatalf("post-crash database request = %s body=%q, want 503 Actor not found", responseStatus(response), body)
+	}
+	select {
+	case observation := <-started:
+		t.Fatalf("post-crash database wake reached Go ActorStart: %#v", observation)
+	default:
+	}
+	stillStale, err := getActor(engine.endpoint, actor.ActorID, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stillStale.ConnectableTS == nil || stillStale.SleepTS != nil || stillStale.DestroyTS != nil || len(stillStale.Error) != 0 {
+		t.Fatalf("post-request live database actor metadata = %#v, want the old generation to remain assigned", stillStale)
+	}
+}
+
 func sqliteConformanceActor(
 	started chan<- sqliteStartObservation,
 	stopped chan<- sqliteStartObservation,
 	oldLease chan<- rivet.Tx,
 ) rivet.Actor[sqliteConformanceState] {
 	return rivet.Actor[sqliteConformanceState]{
+		Database: true,
 		OnStart: func(ctx *rivet.Context[sqliteConformanceState]) error {
 			opCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 			defer cancel()

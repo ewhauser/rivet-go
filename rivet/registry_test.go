@@ -25,6 +25,7 @@ func TestRegisterBuildsSortedManifestAndRejectsDuplicates(t *testing.T) {
 	registry := NewRegistry()
 	if err := Register(registry, "zeta", Actor[struct{}]{
 		HibernateWebSockets: true,
+		Database:            true,
 		Actions: Actions[struct{}]{
 			"z": Action(func(*Context[struct{}], struct{}) (struct{}, error) { return struct{}{}, nil }),
 			"a": Action(func(*Context[struct{}], struct{}) (struct{}, error) { return struct{}{}, nil }),
@@ -38,7 +39,7 @@ func TestRegisterBuildsSortedManifestAndRejectsDuplicates(t *testing.T) {
 	if err := Register(registry, "alpha", Actor[int]{HibernateWebSockets: true}); err == nil {
 		t.Fatal("duplicate Register succeeded")
 	}
-	names, actions, hibernateWebSockets, handlers := registry.snapshotActors()
+	names, actions, hibernateWebSockets, databases, handlers := registry.snapshotActors()
 	if !reflect.DeepEqual(names, []string{"alpha", "zeta"}) {
 		t.Fatalf("actor names = %#v", names)
 	}
@@ -50,6 +51,9 @@ func TestRegisterBuildsSortedManifestAndRejectsDuplicates(t *testing.T) {
 	}
 	if !reflect.DeepEqual(hibernateWebSockets, map[string]bool{"alpha": false, "zeta": true}) {
 		t.Fatalf("actor WebSocket hibernation manifest = %#v", hibernateWebSockets)
+	}
+	if !reflect.DeepEqual(databases, map[string]bool{"alpha": false, "zeta": true}) {
+		t.Fatalf("actor database manifest = %#v", databases)
 	}
 }
 
@@ -69,9 +73,12 @@ func TestRegisterEnforcesActorManifestBound(t *testing.T) {
 		!strings.Contains(err.Error(), "already registered") {
 		t.Fatalf("duplicate registration at bound error = %v", err)
 	}
-	_, _, hibernation, _ := registry.snapshotActors()
+	_, _, hibernation, databases, _ := registry.snapshotActors()
 	if hibernation["actor-0000"] {
 		t.Fatal("rejected duplicate changed the actor hibernation manifest")
+	}
+	if databases["actor-0000"] {
+		t.Fatal("rejected duplicate changed the actor database manifest")
 	}
 }
 

@@ -423,6 +423,7 @@ impl ActorProxy {
         actor_names: &[String],
         actor_actions: &BTreeMap<String, Vec<String>>,
         actor_hibernate_websockets: &BTreeMap<String, bool>,
+        actor_databases: &BTreeMap<String, bool>,
         sqlite_transport: &str,
     ) {
         *self
@@ -431,15 +432,17 @@ impl ActorProxy {
             .expect("SQLite transport mutex poisoned") = sqlite_transport.to_owned();
         for actor_name in actor_names {
             let proxy = self.clone();
+            let has_database = !sqlite_transport.is_empty()
+                && actor_databases.get(actor_name).copied().unwrap_or(false);
             let config = ActorConfig {
                 name: Some(actor_name.clone()),
                 has_state: true,
-                // Existing state/KV-only runners retain RemoteEnvoy. Both M7
-                // public SQLite transports use the same LocalNative worker so
-                // the benchmark varies only the Go-to-core transport.
-                has_database: !sqlite_transport.is_empty(),
-                remote_sqlite: sqlite_transport.is_empty(),
-                enable_actor_runtime_socket: sqlite_transport == "socket",
+                // Database-less actors retain RemoteEnvoy for state/KV and
+                // its live-generation recovery behavior. Declaring actors use
+                // LocalNative through the selected public SQL transport.
+                has_database,
+                remote_sqlite: !has_database,
+                enable_actor_runtime_socket: has_database && sqlite_transport == "socket",
                 no_sleep: false,
                 can_hibernate_websocket: CanHibernateWebSocket::Bool(
                     actor_hibernate_websockets
@@ -462,7 +465,7 @@ impl ActorProxy {
                 actor_name,
                 ActorFactory::new_with_manual_startup_ready(config, move |start| {
                     let proxy = proxy.clone();
-                    Box::pin(async move { proxy.run_actor(start).await })
+                    Box::pin(async move { proxy.run_actor(start, has_database).await })
                 }),
             );
         }
@@ -745,7 +748,7 @@ impl ActorProxy {
         }
     }
 
-    async fn run_actor(&self, start: ActorStart) -> Result<()> {
+    async fn run_actor(&self, start: ActorStart, has_database: bool) -> Result<()> {
         let ActorStart {
             ctx,
             input,
@@ -762,12 +765,13 @@ impl ActorProxy {
             .generation
             .unwrap_or(0);
         let identity = ActorIdentity::new(ctx.actor_id(), generation);
-        let sqlite_socket_path = if self
-            .sqlite_transport
-            .lock()
-            .expect("SQLite transport mutex poisoned")
-            .as_str()
-            == "socket"
+        let sqlite_socket_path = if has_database
+            && self
+                .sqlite_transport
+                .lock()
+                .expect("SQLite transport mutex poisoned")
+                .as_str()
+                == "socket"
         {
             Some(
                 ctx.provision_actor_runtime_socket()

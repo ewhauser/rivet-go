@@ -29,6 +29,7 @@ func TestRustRunnerConfigGolden(t *testing.T) {
 		ActorNames:               []string{"counter"},
 		ActorActions:             map[string][]string{"counter": {"increment"}},
 		ActorHibernateWebSockets: map[string]bool{"counter": true},
+		ActorDatabases:           map[string]bool{"counter": true},
 		SQLiteTransport:          "ffi",
 		LogLevel:                 "info",
 	}

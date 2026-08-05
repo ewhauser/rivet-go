@@ -39,9 +39,10 @@ type Config struct {
 	TotalSlots      uint32
 	LogLevel        string
 	ShutdownTimeout time.Duration
-	// SQLiteTransport selects the per-actor SQL path. Set it to "ffi" or
-	// "socket"; the empty value leaves the public SQLite API disabled so this
-	// milestone does not encode a default before the benchmark is reviewed.
+	// SQLiteTransport selects the transport used by actors that declare
+	// Database. The empty value defaults to "ffi". "socket" selects the
+	// experimental Unix-only Actor Runtime Socket client, and "disabled"
+	// force-disables databases for every actor.
 	SQLiteTransport SQLiteTransport
 	Hooks           Hooks
 	// Logger receives structured SDK lifecycle records. Nil discards Go-side
@@ -136,11 +137,12 @@ func (r *Registry) Serve(ctx context.Context, config Config) error {
 	serveCtx, stopSignals := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
 	defer stopSignals()
 
-	actorNames, actorActions, actorHibernateWebSockets, handlers := r.snapshotActors()
+	actorNames, actorActions, actorHibernateWebSockets, actorDatabases, handlers := r.snapshotActors()
 	config = withDefaults(config)
-	if override := os.Getenv("RIVET_GO_SQLITE_TRANSPORT"); override != "" {
-		config.SQLiteTransport = SQLiteTransport(override)
-	}
+	config.SQLiteTransport = resolveSQLiteTransport(
+		config.SQLiteTransport,
+		os.Getenv("RIVET_GO_SQLITE_TRANSPORT"),
+	)
 	if err := validateSQLiteTransport(config.SQLiteTransport); err != nil {
 		return err
 	}
@@ -153,7 +155,8 @@ func (r *Registry) Serve(ctx context.Context, config Config) error {
 		ActorNames:               actorNames,
 		ActorActions:             actorActions,
 		ActorHibernateWebSockets: actorHibernateWebSockets,
-		SQLiteTransport:          string(config.SQLiteTransport),
+		ActorDatabases:           actorDatabases,
+		SQLiteTransport:          wireSQLiteTransport(config.SQLiteTransport),
 		LogLevel:                 config.LogLevel,
 	})
 	if err != nil {
@@ -196,6 +199,7 @@ func (r *Registry) snapshotActors() (
 	[]string,
 	map[string][]string,
 	map[string]bool,
+	map[string]bool,
 	map[string]pump.ActorHandler,
 ) {
 	r.mu.RLock()
@@ -204,6 +208,7 @@ func (r *Registry) snapshotActors() (
 	handlers := make(map[string]pump.ActorHandler, len(r.actors))
 	actions := make(map[string][]string, len(r.actors))
 	hibernateWebSockets := make(map[string]bool, len(r.actors))
+	databases := make(map[string]bool, len(r.actors))
 	for name, handler := range r.actors {
 		names = append(names, name)
 		handlers[name] = handler
@@ -215,9 +220,12 @@ func (r *Registry) snapshotActors() (
 		if definition, ok := handler.(interface{ hibernateWebSockets() bool }); ok {
 			hibernateWebSockets[name] = definition.hibernateWebSockets()
 		}
+		if definition, ok := handler.(interface{ database() bool }); ok {
+			databases[name] = definition.database()
+		}
 	}
 	sort.Strings(names)
-	return names, actions, hibernateWebSockets, handlers
+	return names, actions, hibernateWebSockets, databases, handlers
 }
 
 func withDefaults(config Config) Config {

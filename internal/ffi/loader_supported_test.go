@@ -31,7 +31,7 @@ func TestLoadAndABIVersion(t *testing.T) {
 }
 
 func TestLoaderRejectsOlderABILibraries(t *testing.T) {
-	for _, version := range []uint32{1, 5, 6} {
+	for _, version := range []uint32{1, 5, 6, 7} {
 		t.Run(fmt.Sprintf("ABI%d", version), func(t *testing.T) {
 			filename := fmt.Sprintf("librivetkit_go_ffi_abi%d.so", version)
 			switch runtime.GOOS {
@@ -47,7 +47,7 @@ func TestLoaderRejectsOlderABILibraries(t *testing.T) {
 				"-o",
 				libraryPath,
 			}
-			if version == 5 || version == 6 {
+			if version == 5 || version == 6 || version == 7 {
 				arguments = append([]string{"--cfg", fmt.Sprintf("rk_abi_%d", version)}, arguments...)
 			}
 			command := exec.Command("rustc", arguments...)

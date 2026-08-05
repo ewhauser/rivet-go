@@ -1889,6 +1889,7 @@ func expectRunnerNewError(t *testing.T, endpoint string) ffi.ErrorPayload {
 		ActorNames:               []string{},
 		ActorActions:             map[string][]string{},
 		ActorHibernateWebSockets: map[string]bool{},
+		ActorDatabases:           map[string]bool{},
 		LogLevel:                 "error",
 	})
 	if err != nil {
@@ -1928,6 +1929,7 @@ func startNativeRunnerWithActors(t *testing.T, endpoint, name string, actorNames
 		ActorNames:               actorNames,
 		ActorActions:             map[string][]string{},
 		ActorHibernateWebSockets: map[string]bool{},
+		ActorDatabases:           map[string]bool{},
 		LogLevel:                 "error",
 	})
 	if err != nil {

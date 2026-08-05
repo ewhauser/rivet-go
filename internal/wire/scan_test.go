@@ -111,15 +111,17 @@ func TestValidateShapeAcceptsMaximumM3HTTPChunkAndHeaderSchema(t *testing.T) {
 	}
 }
 
-func TestValidateShapeAcceptsMaximumActorManifestAndHibernationMap(t *testing.T) {
+func TestValidateShapeAcceptsMaximumActorManifestCapabilityMaps(t *testing.T) {
 	names := make([]string, 0, maxArrayEntries)
 	actions := make(map[string][]string, maxMapEntries)
 	hibernation := make(map[string]bool, maxMapEntries)
+	databases := make(map[string]bool, maxMapEntries)
 	for index := range maxArrayEntries {
 		name := fmt.Sprintf("actor-%04d", index)
 		names = append(names, name)
 		actions[name] = []string{}
 		hibernation[name] = index%2 == 0
+		databases[name] = index%3 == 0
 	}
 	data, err := EncodeRunnerConfig(RunnerConfig{
 		EngineEndpoint:           "http://127.0.0.1:6420",
@@ -130,6 +132,7 @@ func TestValidateShapeAcceptsMaximumActorManifestAndHibernationMap(t *testing.T)
 		ActorNames:               names,
 		ActorActions:             actions,
 		ActorHibernateWebSockets: hibernation,
+		ActorDatabases:           databases,
 		LogLevel:                 "info",
 	})
 	if err != nil {
@@ -235,6 +238,7 @@ func TestGoEncoderOutputsPassShapeValidation(t *testing.T) {
 			ActorNames:               []string{},
 			ActorActions:             map[string][]string{},
 			ActorHibernateWebSockets: map[string]bool{},
+			ActorDatabases:           map[string]bool{},
 			LogLevel:                 "info",
 		},
 		CommandBatch{Commands: []Command{}},

@@ -139,6 +139,7 @@ func run() error {
 		return err
 	}
 	if err := rivet.Register(registry, "todo", rivet.Actor[todoState]{
+		Database: true,
 		OnStart: func(ctx *rivet.Context[todoState]) error {
 			opCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 			defer cancel()

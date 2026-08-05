@@ -66,6 +66,8 @@ pub(crate) struct RunnerConfig {
     #[serde(default)]
     pub actor_hibernate_websockets: BTreeMap<String, bool>,
     #[serde(default)]
+    pub actor_databases: BTreeMap<String, bool>,
+    #[serde(default)]
     pub sqlite_transport: String,
     pub log_level: String,
 }
@@ -967,6 +969,7 @@ mod tests {
             actor_names: vec!["counter".to_owned()],
             actor_actions: BTreeMap::from([("counter".to_owned(), vec!["increment".to_owned()])]),
             actor_hibernate_websockets: BTreeMap::from([("counter".to_owned(), true)]),
+            actor_databases: BTreeMap::from([("counter".to_owned(), true)]),
             sqlite_transport: "ffi".to_owned(),
             log_level: "info".to_owned(),
         };

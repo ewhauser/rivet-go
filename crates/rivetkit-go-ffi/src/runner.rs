@@ -327,6 +327,14 @@ fn validate_config(config: &RunnerConfig) -> Result<(), ErrorPayload> {
             ));
         }
     }
+    for actor_name in config.actor_databases.keys() {
+        if !seen_actor_names.contains(actor_name) {
+            return Err(ErrorPayload::new(
+                "invalid_config",
+                format!("actor_databases contains unknown actor `{actor_name}`"),
+            ));
+        }
+    }
     if !matches!(config.sqlite_transport.as_str(), "" | "ffi" | "socket") {
         return Err(ErrorPayload::new(
             "invalid_config",
@@ -407,6 +415,7 @@ async fn run_runner(
         &config.actor_names,
         &config.actor_actions,
         &config.actor_hibernate_websockets,
+        &config.actor_databases,
         &config.sqlite_transport,
     );
     let serve_config = ServeConfig {
@@ -741,6 +750,7 @@ mod tests {
             actor_names: Vec::new(),
             actor_actions: BTreeMap::new(),
             actor_hibernate_websockets: BTreeMap::new(),
+            actor_databases: BTreeMap::new(),
             sqlite_transport: String::new(),
             log_level: "info".to_owned(),
         }
@@ -757,6 +767,7 @@ mod tests {
         config
             .actor_hibernate_websockets
             .insert("actor".to_owned(), true);
+        config.actor_databases.insert("actor".to_owned(), true);
         assert!(validate_config(&config).is_ok());
         config.actor_names.push("actor".to_owned());
         assert_eq!(
@@ -778,13 +789,23 @@ mod tests {
         );
 
         let mut config = valid_config();
+        config.actor_databases.insert("unknown".to_owned(), true);
+        assert_eq!(
+            validate_config(&config)
+                .expect_err("unknown database actor")
+                .code,
+            "invalid_config"
+        );
+
+        let mut config = valid_config();
         for index in 0..1_024 {
             let name = format!("actor-{index:04}");
             config.actor_names.push(name.clone());
             config.actor_actions.insert(name.clone(), Vec::new());
             config
                 .actor_hibernate_websockets
-                .insert(name, index % 2 == 0);
+                .insert(name.clone(), index % 2 == 0);
+            config.actor_databases.insert(name, index % 3 == 0);
         }
         assert!(validate_config(&config).is_ok());
         config.actor_names.push("actor-over-limit".to_owned());

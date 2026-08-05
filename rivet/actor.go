@@ -18,6 +18,11 @@ import (
 // Actor defines typed state, lifecycle hooks, actions, raw HTTP handling, and
 // raw gateway WebSocket handling.
 type Actor[T any] struct {
+	// Database provisions a durable per-actor SQLite database and enables
+	// Context.DB for this actor. It is opt-in because database actors use the
+	// pinned LocalNative backend, whose live-generation crash recovery differs
+	// from the default remote state/KV path.
+	Database bool
 	// HibernateWebSockets keeps raw gateway WebSockets connected while this
 	// actor sleeps. It is opt-in because the pinned engine acknowledges every
 	// message on hibernatable connections. A recorded single-machine loopback
@@ -82,7 +87,8 @@ func (c *Context[T]) Generation() uint64 {
 
 // DB returns this actor generation's SQLite handle. The handle is safe for
 // concurrent use. Transactions remain generation-local and expire after their
-// lease timeout.
+// lease timeout. Operations return sqlite_transport_not_configured unless the
+// actor declares Database and the runner transport is active.
 func (c *Context[T]) DB() *DB {
 	if c == nil {
 		return nil
@@ -169,6 +175,10 @@ func (a *actorAdapter[T]) hibernateWebSockets() bool {
 	return a.definition.HibernateWebSockets
 }
 
+func (a *actorAdapter[T]) database() bool {
+	return a.definition.Database
+}
+
 func (a *actorAdapter[T]) Start(
 	_ context.Context,
 	session *pump.ActorSession,
@@ -178,7 +188,7 @@ func (a *actorAdapter[T]) Start(
 	if err != nil {
 		return nil, err
 	}
-	db, err := newDB(session)
+	db, err := newDB(session, a.definition.Database)
 	if err != nil {
 		return nil, err
 	}

@@ -23,12 +23,13 @@ const (
 	maxSQLiteValueBytes       = 1 << 20
 )
 
-// SQLiteTransport selects one of the two M7 candidate transports.
+// SQLiteTransport selects how database-declaring actors reach core SQLite.
 type SQLiteTransport string
 
 const (
-	SQLiteTransportFFI    SQLiteTransport = "ffi"
-	SQLiteTransportSocket SQLiteTransport = "socket"
+	SQLiteTransportFFI      SQLiteTransport = "ffi"
+	SQLiteTransportSocket   SQLiteTransport = "socket"
+	SQLiteTransportDisabled SQLiteTransport = "disabled"
 )
 
 // Result is the mutation metadata returned by Exec.
@@ -123,8 +124,8 @@ func makeDB(backend sqliteBackend) *DB {
 	return database
 }
 
-func newDB(session *pump.ActorSession) (*DB, error) {
-	if session == nil {
+func newDB(session *pump.ActorSession, enabled bool) (*DB, error) {
+	if session == nil || !enabled {
 		return makeDB(disabledSQLiteBackend{}), nil
 	}
 	switch SQLiteTransport(session.SQLiteTransport()) {
@@ -506,7 +507,7 @@ func (b disabledSQLiteBackend) failure() error {
 	}
 	message := b.message
 	if message == "" {
-		message = "set rivet.Config.SQLiteTransport to ffi or socket"
+		message = "set Database: true on the actor and ensure rivet.Config.SQLiteTransport is not disabled"
 	}
 	return &SQLiteError{Code: code, Message: message}
 }
@@ -528,11 +529,23 @@ var sqliteLeaseSequence atomic.Uint64
 
 func validateSQLiteTransport(transport SQLiteTransport) error {
 	switch transport {
-	case "", SQLiteTransportFFI, SQLiteTransportSocket:
+	case SQLiteTransportFFI, SQLiteTransportSocket, SQLiteTransportDisabled:
 		return nil
 	default:
-		return fmt.Errorf("SQLiteTransport must be %q or %q", SQLiteTransportFFI, SQLiteTransportSocket)
+		return fmt.Errorf(
+			"SQLiteTransport must be %q, %q, or %q",
+			SQLiteTransportFFI, SQLiteTransportSocket, SQLiteTransportDisabled,
+		)
 	}
+}
+
+// wireSQLiteTransport maps the public disabled selection to the boundary's
+// empty transport, which prevents every actor database from being provisioned.
+func wireSQLiteTransport(transport SQLiteTransport) string {
+	if transport == SQLiteTransportDisabled {
+		return ""
+	}
+	return string(transport)
 }
 
 func validateSQLiteSQL(sql string) error {
@@ -688,4 +701,16 @@ func pointerValue(value *int64) int64 {
 		return 0
 	}
 	return *value
+}
+
+// resolveSQLiteTransport applies the environment override, then defaults an
+// empty selection to the all-platform FFI transport.
+func resolveSQLiteTransport(configured SQLiteTransport, envOverride string) SQLiteTransport {
+	if envOverride != "" {
+		configured = SQLiteTransport(envOverride)
+	}
+	if configured == "" {
+		return SQLiteTransportFFI
+	}
+	return configured
 }
