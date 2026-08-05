@@ -44,6 +44,13 @@ remote state/KV backend, but `ctx.DB()` operations return the structured
 `sqlite_transport_not_configured` error. Do not silently choose a candidate in
 application configuration until the review pass selects a default.
 
+| Build target | FFI SQLite | Socket SQLite |
+|---|---|---|
+| macOS arm64 | Supported | Supported |
+| Linux amd64/arm64, glibc or musl | Supported | Supported |
+| Windows amd64 | Supported | Rejected during runner configuration because the endpoint is Unix-only |
+| Other targets, including macOS amd64 | Unsupported-platform runner stub | Unsupported-platform runner stub |
+
 Both explicit choices run core's LocalNative SQLite worker against the same
 engine-backed per-actor Depot storage. `ffi` sends correlated commands through
 the existing MessagePack pump and reconstructs chunked results. `socket` uses
@@ -56,13 +63,29 @@ default. A deadline on `Begin` shortens the lease. Expiry, actor sleep, socket
 disconnect, or runner shutdown rolls the transaction back and makes its `Tx`
 terminal. Keep transactions short and do not call the outer `DB` while holding
 one: regular operations wait behind the active transaction and may consume the
-caller deadline.
+caller deadline. A second `Begin` on the same generation returns
+`transaction_already_open` immediately. Sleep and stop reject new SQL, roll
+back the open lease, wait for already-admitted calls, and close the transport
+before lifecycle completion.
+
+Public `Exec` and `Query` each accept one SQL statement. Both transports reject
+a multi-statement string as `sqlite_error` before any statement runs. Valid
+UTF-8 text may contain embedded NULs; invalid UTF-8 text arguments are rejected.
+SQLite converts bound NaN values to NULL, while infinities remain REAL values.
+Invalid bytes already stored with SQLite TEXT affinity are returned with UTF-8
+replacement by the shared pinned Depot decoder.
 
 SQL results are fully buffered. SQL text, text values, and blob values are
 limited to 1 MiB each; requests accept at most 1,024 arguments and results at
 most 1,024 columns. FFI results have a 32 MiB content limit and cross in 1 MiB
 chunks. Socket results must fit one negotiated frame capped at 32 MiB including
 protocol overhead. Large result APIs should paginate explicitly.
+
+SQL commits and actor-state saves are durable but separate; there is no atomic
+transaction spanning them. A SQL mutation returns after its Depot commit, and
+`Context.Save` returns after its state commit. Normal action completion also
+saves state before releasing the action result. `ActorStopResult` follows the
+actor stop callback, DB close, and core's admitted-operation fence.
 
 ## Metrics and logging
 

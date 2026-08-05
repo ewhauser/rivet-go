@@ -671,9 +671,10 @@ SQL and every text/blob argument are capped at 1 MiB, argument and column
 lists at 1,024, and lease keys at 256 bytes. A complete FFI result may contain
 32 MiB of columns and values. It is emitted as ordered chunks capped at 1 MiB
 of value content or 1,024 values, so the unchanged Go scanner limits remain
-valid. Go requires chunk indexes to start at zero, remain contiguous, repeat
-no columns after the first chunk, and finish once. Rows must be rectangular.
-The API fully buffers the reconstructed result.
+valid. Columns, mutation count, and last-insert ID appear only on chunk zero.
+Go requires chunk indexes to start at zero, remain contiguous, repeat no
+columns or mutation metadata after the first chunk, and finish once. Rows must
+be rectangular. The API fully buffers the reconstructed result.
 
 ### Actor Runtime Socket contract
 
@@ -703,7 +704,9 @@ begin sends the Go lease key plus its timeout. Other transaction operations
 carry that key exactly where the upstream schema requires it, and connection
 close makes core expire every active lease. Public parameterized `Exec` uses
 the schema's `SqliteQuery` request because `SqliteExec` accepts only a script
-and returns neither `changes` nor `lastInsertRowid`.
+and returns neither `changes` nor `lastInsertRowid`. The shared public API is
+single-statement for both `Exec` and `Query`; multi-statement input returns
+`sqlite_error` with statement index zero before either statement executes.
 
 Socket responses are not chunked by the upstream protocol. Columns and all
 rows, including encoding overhead, must fit one negotiated frame. The client
@@ -718,10 +721,30 @@ Both transports end at the same core `TransactionCoordinator`. It admits at
 most 128 queued/in-flight entries, permits concurrent regular operations under
 a shared gate, gives one active transaction the exclusive write gate, and
 serializes operations within that transaction. Its default lease is 60
-seconds. `Begin` shortens that to its context deadline; expiry rolls back.
-Go adds no transport-specific actor lock. Structured errors preserve core's
-stable code and message plus extended SQLite code and statement index when the
-failure came from a statement.
+seconds. `Begin` shortens that to its context deadline; expiry rolls back. Go
+reserves one transaction slot before transport submission, so a second Begin
+returns `transaction_already_open` without creating a queued, callerless
+lease. Non-transaction work waits behind the open transaction. Go adds no
+transport-specific lock around ordinary SQL. Its generation lifecycle gate
+rejects new calls, rolls back an open lease, waits for admitted calls, and
+closes the transport before sleep or stop proceeds. Structured errors preserve
+core's stable code and message plus extended SQLite code and statement index
+when the failure came from a statement. FFI worker backpressure and worker
+close are normalized to the socket codes `sqlite_queue_full` and
+`sqlite_endpoint_closed`.
+
+All text entering from Go must be valid UTF-8 and can contain embedded NULs.
+Integer bounds, infinities, empty blobs, and NULL remain distinct and exact;
+SQLite itself stores a bound NaN as NULL. The pinned Depot decoder uses lossy
+UTF-8 replacement when an SQLite TEXT cell contains invalid bytes, before the
+result reaches either transport.
+
+SQL and actor state are separate engine commits. Successful SQL mutation calls
+return after the Depot commit, explicit state `Save` returns after its own KV
+commit, and action completion performs its state save before returning the
+action result. There is no atomic transaction spanning SQL and state. Sleep
+performs the Go SQL lifecycle fence first, and core does not accept
+`ActorStopResult` until the actor stop callback and admitted core work finish.
 
 LocalNative requires bundled SQLite to be compiled with
 `SQLITE_ENABLE_BATCH_ATOMIC_WRITE`; `.cargo/config.toml` supplies the same flag

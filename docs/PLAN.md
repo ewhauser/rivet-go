@@ -625,19 +625,35 @@ reviewed. The socket candidate also enables
 `ActorConfig.enable_actor_runtime_socket`, provisions the Unix endpoint before
 `ActorStart`, and passes its generation-scoped path to Go. The endpoint is
 closed and recreated on sleep/wake; an open socket transaction is rolled back
-when Go closes that connection before requesting sleep.
+when Go closes that connection before requesting sleep. The shared Go DB
+lifecycle now applies the same ordering to both candidates: reject new SQL,
+roll back the open lease, wait for already-admitted SQL calls, close the
+transport, and only then submit the sleep intent.
 
 Both candidates expose one generation-bound `DB` with `Exec`, `Query`, and
 `Begin`; `Tx` has `Exec`, `Query`, `Commit`, and `Rollback`. Values map exactly
 between SQL NULL/integer/real/text/blob and Go
-`nil`/`int64`/`float64`/`string`/`[]byte`. The 60-second core transaction lease
-is shortened to the remaining `Begin` context deadline when one exists. Lease
-expiry rolls back and returns structured code `transaction_expired`; actor
-stop, socket disconnect, and runner shutdown also make the lease terminal.
+`nil`/`int64`/`float64`/`string`/`[]byte`. Empty blobs remain distinct from
+NULL, signed 64-bit boundaries and infinities round-trip, and embedded NULs in
+valid UTF-8 text are preserved. SQLite converts a bound NaN to SQL NULL. Text
+arguments must be valid UTF-8; the pinned Depot decoder replaces invalid UTF-8
+bytes read from an SQLite TEXT cell, before either transport sees the value.
+The public `Exec` and `Query` calls each accept one statement; a script is
+rejected as `sqlite_error` before any statement runs.
+
+The 60-second core transaction lease is shortened to the remaining `Begin`
+context deadline when one exists. Lease expiry rolls back and returns
+structured code `transaction_expired`; actor stop, socket disconnect, and
+runner shutdown also make the lease terminal. The shared SDK permits one open
+`Tx` handle per generation and rejects another `Begin` immediately with
+`transaction_already_open`, avoiding an abandoned Begin later acquiring an
+invisible lease. A regular DB call submitted while that transaction is open
+waits behind it and can exhaust its context without interleaving.
 Core's 128-entry transaction coordinator admission queue allows concurrent
 regular operations under a shared gate, serializes transaction operations,
 and gives one active transaction an exclusive gate. The Go actor dispatcher
-does not add a second SQL lock, so both transports inherit those same rules.
+does not serialize ordinary SQL calls; its lifecycle and single-transaction
+guards are shared by both transports.
 
 ABI 7 adds the transport config, optional `ActorStart.sqlite_socket_path`, five
 request-ID-correlated SQLite commands, and chunked `SqliteResult` events. FFI
@@ -648,7 +664,8 @@ The shared API restricts SQL, text and blob arguments to 1 MiB, arguments and
 columns to 1,024, and results to the transport's 32 MiB ceiling. Results are
 fully buffered. Context cancellation abandons the Go correlation ID while a
 late completion is consumed safely; neither core operation is forcibly
-preempted after submission.
+preempted after submission. Already-canceled contexts are rejected before
+submission.
 
 The socket client is pure Go. It vendors
 `engine/sdks/rust/actor-runtime-socket-protocol/schemas/v1.bare` at commit
@@ -670,14 +687,22 @@ only behavior change preserves `Blob(Vec::new())` after
 `sqlite3_column_type == SQLITE_BLOB`. The dependency version and Rivet commit
 do not change.
 
-Real-engine conformance runs the same CRUD, five-type values, commit/rollback,
-lease expiry, structured SQL errors, concurrency, actor isolation, KV/state
-coexistence, sleep/wake, and same-data-directory engine replacement cases for
-both candidates. The FFI-specific case proves a result larger than one batch
-is reconstructed. The socket-specific case sleeps mid-lease and proves the
-old connection and lease are dead. At this pin, an actor left live across an
+Real-engine conformance runs the same CRUD, value boundaries, commit/rollback,
+lease expiry with read-after rollback, rejected nested Begin, transaction
+gating and cancellation, single-statement errors, result-limit recovery,
+concurrency, actor isolation, state/SQL coexistence, sleep/wake, dirty-lease
+sleep, and same-data-directory engine replacement cases for both candidates.
+The FFI-specific case proves an empty and a multi-chunk result are reconstructed.
+At this pin, an actor left live across an
 abrupt standalone engine replacement remains bound to its old envoy session;
 the durable SQL fixture therefore sleeps the actor, stops the runner, replaces
 the engine against the same data directory, starts a new runner, and
 demand-wakes the actor. This proves persisted storage recovery, not seamless
 rescheduling of a live generation across a crash.
+
+SQL and actor state use separate engine commit operations, not a cross-store
+transaction. A successful SQL `Exec` or `Tx.Commit` is durable before it
+returns. Explicit `Save` is durable before it returns, and the ordinary action
+path saves state before releasing the action result. Sleep first completes the
+SQL lifecycle fence above; `ActorStopResult` is not sent until `OnStop`, the DB
+close, and the core operation fence complete.

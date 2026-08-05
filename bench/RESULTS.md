@@ -215,3 +215,9 @@ Each repetition uses 32 workers mapped one-to-one to 32 actors, 10 seconds of ex
 All three suites start a fresh engine data directory. Both Go rows use core's `LocalNative` SQLite worker and differ only in the Go-to-core transport. The TypeScript reference uses `rivetkit@2.3.10` `c.db` raw `execute` and callback `transaction` APIs with the same statements and no ORM. The TypeScript wrapper returns object rows and manages the transaction callback, while the Go API returns column/value matrices and exposes an explicit lease-backed `Tx`; those API-shape costs remain part of the measured SDK paths.
 
 CPU is sampled process `%CPU`, where 100% is one fully occupied logical core. This section records the candidates without selecting a default.
+The engine stayed near 127% CPU in every cell while runner CPU remained below
+14%. This workload is therefore principally engine/Depot-bound: the measured
+end-to-end tie is useful evidence that neither Go transport dominates here,
+but it does not isolate transport overhead or predict a runner-bound workload.
+The 2.7% difference between the Go averages is smaller than the roughly 4%
+movement between repetitions of either Go candidate.
