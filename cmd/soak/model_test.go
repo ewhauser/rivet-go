@@ -1,9 +1,24 @@
 package main
 
 import (
+	"errors"
+	"net/http"
 	"strings"
 	"testing"
 )
+
+func TestActionStatusMatchesPinnedTransient(t *testing.T) {
+	err := &actionStatusError{action: "resleep", status: http.StatusServiceUnavailable, body: "Actor not found"}
+	if !isActionStatus(err, http.StatusServiceUnavailable, "Actor not found") {
+		t.Fatal("exact action status did not match")
+	}
+	if isActionStatus(err, http.StatusBadGateway, "Actor not found") {
+		t.Fatal("wrong action status matched")
+	}
+	if isActionStatus(errors.New(err.Error()), http.StatusServiceUnavailable, "Actor not found") {
+		t.Fatal("untyped lookalike error matched")
+	}
+}
 
 func TestCounterTruthComparesEveryField(t *testing.T) {
 	initial := counterState{Value: 7, Operations: 3, LastToken: "old", LastDelta: -2, Checksum: 41}
@@ -82,6 +97,7 @@ func TestChaosActivationGuardRejectsVacuousRun(t *testing.T) {
 	counts.hibernatingWSWakes.Store(1)
 	counts.nonHibernatingCloses.Store(1)
 	counts.stalls.Store(1)
+	counts.sqlOperations.Store(1)
 	if err := counts.validate(); err == nil || !strings.Contains(err.Error(), "action_panic") {
 		t.Fatalf("activation error = %v", err)
 	}

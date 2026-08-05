@@ -47,6 +47,15 @@ type alarmArgs struct {
 	DelayMillis int64  `json:"delayMillis"`
 }
 
+type sqlArgs struct {
+	Token string `json:"token"`
+}
+
+type sqlResult struct {
+	RowsAffected int64 `json:"rowsAffected"`
+	InsertedRows int64 `json:"insertedRows"`
+}
+
 func actorCounterUpdate(state *counterState, args counterArgs) {
 	state.Value += args.Delta
 	state.Operations++
@@ -443,6 +452,7 @@ type activationCounts struct {
 	nonHibernatingCloses atomic.Int64
 	stalls               atomic.Int64
 	panics               atomic.Int64
+	sqlOperations        atomic.Int64
 }
 
 func (a *activationCounts) validate() error {
@@ -454,6 +464,7 @@ func (a *activationCounts) validate() error {
 		"non_hibernating_ws_close": a.nonHibernatingCloses.Load(),
 		"stalled_ws_client":        a.stalls.Load(),
 		"action_panic":             a.panics.Load(),
+		"sqlite_operation":         a.sqlOperations.Load(),
 	}
 	var missing []string
 	for name, value := range values {

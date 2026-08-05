@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strings"
 	"time"
 )
 
@@ -231,6 +232,21 @@ func isActionFailure(err error, group, code string) bool {
 	return errors.As(err, &failure) && failure.failure.Group == group && failure.failure.Code == code
 }
 
+type actionStatusError struct {
+	action string
+	status int
+	body   string
+}
+
+func (e *actionStatusError) Error() string {
+	return fmt.Sprintf("action %s returned %d: %s", e.action, e.status, e.body)
+}
+
+func isActionStatus(err error, status int, body string) bool {
+	var failure *actionStatusError
+	return errors.As(err, &failure) && failure.status == status && failure.body == body
+}
+
 func gatewayAction[T any](
 	ctx context.Context,
 	api *engineAPI,
@@ -245,7 +261,11 @@ func gatewayAction[T any](
 	if status != http.StatusOK {
 		var failure actionFailure
 		if decodeErr := json.Unmarshal(body, &failure); decodeErr != nil {
-			return output, fmt.Errorf("action %s returned %d: %s", action, status, body)
+			return output, &actionStatusError{
+				action: action,
+				status: status,
+				body:   strings.TrimSpace(string(body)),
+			}
 		}
 		return output, &actionFailureError{action: action, failure: failure}
 	}

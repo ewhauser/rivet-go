@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log/slog"
 	"math/rand/v2"
+	"net/http"
 	"os"
 	"os/signal"
 	"runtime"
@@ -50,6 +51,7 @@ type soakSummary struct {
 	ExpectedReceipts  int              `json:"expected_receipts"`
 	ReceivedReceipts  int              `json:"received_receipts"`
 	AlarmFires        uint64           `json:"alarm_fires"`
+	SQLiteRows        int64            `json:"sqlite_rows"`
 	Chaos             map[string]int64 `json:"chaos"`
 	Metrics           map[string]int64 `json:"metrics"`
 	GoroutinesBefore  int              `json:"goroutines_before"`
@@ -144,6 +146,8 @@ type soakRun struct {
 	clients                    *clientManager
 	chatActor                  string
 	alarmActor                 string
+	sqlActor                   string
+	sqlRows                    int64
 	chatSlept                  chan struct{}
 	nonHibernatingStopped      chan struct{}
 	nonHibernatingDisconnected chan struct{}
@@ -366,6 +370,7 @@ func runSoak(parent context.Context, config soakConfig) (summary soakSummary, ru
 		ExpectedReceipts:  expectedReceipts,
 		ReceivedReceipts:  receivedReceipts,
 		AlarmFires:        alarmTruth.Fired,
+		SQLiteRows:        run.sqlRows,
 		Chaos: map[string]int64{
 			"engine_restarts":           run.activations.engineRestarts.Load(),
 			"client_disconnects":        run.activations.disconnects.Load(),
@@ -520,6 +525,57 @@ func (r *soakRun) registry() (*rivet.Registry, error) {
 	}); err != nil {
 		return nil, err
 	}
+	if err := rivet.Register(registry, "soak-sql", rivet.Actor[struct{}]{
+		Database: true,
+		OnStart: func(ctx *rivet.Context[struct{}]) error {
+			opCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+			defer cancel()
+			_, err := ctx.DB().Exec(opCtx, `CREATE TABLE IF NOT EXISTS soak_rows (
+				token TEXT PRIMARY KEY
+			)`)
+			return err
+		},
+		Actions: rivet.Actions[struct{}]{
+			"insert": rivet.Action(func(ctx *rivet.Context[struct{}], args sqlArgs) (sqlResult, error) {
+				opCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+				defer cancel()
+				mutation, err := ctx.DB().Exec(opCtx, "INSERT INTO soak_rows(token) VALUES (?)", args.Token)
+				if err != nil {
+					return sqlResult{}, err
+				}
+				rows, err := ctx.DB().Query(opCtx, "SELECT COUNT(*) FROM soak_rows")
+				if err != nil {
+					return sqlResult{}, err
+				}
+				count, err := oneSQLiteCount(rows)
+				if err != nil {
+					return sqlResult{}, err
+				}
+				if err := ctx.Sleep(); err != nil {
+					return sqlResult{}, err
+				}
+				return sqlResult{RowsAffected: mutation.RowsAffected, InsertedRows: count}, nil
+			}),
+			"snapshot": rivet.Action(func(ctx *rivet.Context[struct{}], _ struct{}) (sqlResult, error) {
+				opCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+				defer cancel()
+				rows, err := ctx.DB().Query(opCtx, "SELECT COUNT(*) FROM soak_rows")
+				if err != nil {
+					return sqlResult{}, err
+				}
+				count, err := oneSQLiteCount(rows)
+				if err != nil {
+					return sqlResult{}, err
+				}
+				if err := ctx.Sleep(); err != nil {
+					return sqlResult{}, err
+				}
+				return sqlResult{InsertedRows: count}, nil
+			}),
+		},
+	}); err != nil {
+		return nil, err
+	}
 	if err := rivet.Register(registry, "soak-sacrificial", rivet.Actor[struct{}]{
 		Actions: rivet.Actions[struct{}]{
 			"panic": rivet.Action(func(*rivet.Context[struct{}], struct{}) (struct{}, error) {
@@ -533,6 +589,8 @@ func (r *soakRun) registry() (*rivet.Registry, error) {
 }
 
 func (r *soakRun) createWorkload(ctx context.Context) error {
+	connectCtx, cancel := context.WithTimeout(ctx, 90*time.Second)
+	defer cancel()
 	for index := range r.config.counters {
 		actorID, err := r.api.createActor(ctx, "soak-counter", r.runnerName, fmt.Sprintf("counter-%d", index))
 		if err != nil {
@@ -550,9 +608,22 @@ func (r *soakRun) createWorkload(ctx context.Context) error {
 		return err
 	}
 	r.alarmActor = alarmActor
+	sqlActor, err := r.api.createActor(ctx, "soak-sql", r.runnerName, "sql")
+	if err != nil {
+		return err
+	}
+	r.sqlActor = sqlActor
+	initialSQL, err := gatewayAction[sqlResult](connectCtx, r.api, r.sqlActor, "snapshot", struct{}{})
+	if err != nil {
+		return fmt.Errorf("initialize SQL workload: %w", err)
+	}
+	if initialSQL.InsertedRows != 0 {
+		return fmt.Errorf("initial SQL row count = %d, want 0", initialSQL.InsertedRows)
+	}
+	if err := r.api.waitActorSleeping(connectCtx, r.sqlActor); err != nil {
+		return fmt.Errorf("park SQL actor before workload: %w", err)
+	}
 	r.clients = newClientManager(r.engine.Endpoint, r.chatActor, r.chatOracle, r.errors)
-	connectCtx, cancel := context.WithTimeout(ctx, 90*time.Second)
-	defer cancel()
 	for range r.config.clients {
 		if _, err := r.clients.connect(connectCtx); err != nil {
 			return err
@@ -655,6 +726,11 @@ func (r *soakRun) startWorkload(ctx context.Context, wait *sync.WaitGroup) {
 		defer wait.Done()
 		r.runChat(ctx, chatRate)
 	}()
+	wait.Add(1)
+	go func() {
+		defer wait.Done()
+		r.runSQL(ctx)
+	}()
 	if r.config.sleepWakes {
 		wait.Add(1)
 		go func() {
@@ -663,6 +739,50 @@ func (r *soakRun) startWorkload(ctx context.Context, wait *sync.WaitGroup) {
 		}()
 	}
 	r.startChaos(ctx, wait)
+}
+
+func (r *soakRun) runSQL(ctx context.Context) {
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+	var sequence uint64
+	for {
+		if err := r.gate.acquire(ctx); err != nil {
+			return
+		}
+		sequence++
+		expected := r.sqlRows + 1
+		// Finish one admitted SQL mutation even when the active-duration timer
+		// fires so the committed-row oracle cannot lose an acknowledged insert.
+		actionCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		actual, err := gatewayAction[sqlResult](
+			actionCtx,
+			r.api,
+			r.sqlActor,
+			"insert",
+			sqlArgs{Token: fmt.Sprintf("sql-%012d", sequence)},
+		)
+		if err == nil && (actual.RowsAffected != 1 || actual.InsertedRows != expected) {
+			err = fmt.Errorf("SQL insert reconciliation = %#v, want rows_affected=1 inserted_rows=%d", actual, expected)
+		}
+		if err == nil {
+			r.sqlRows = expected
+			r.activations.sqlOperations.Add(1)
+			err = r.api.waitActorSleeping(actionCtx, r.sqlActor)
+		}
+		cancel()
+		r.gate.release()
+		if err != nil {
+			if ctx.Err() == nil {
+				r.errors.report(fmt.Errorf("SQL workload: %w", err))
+			}
+			return
+		}
+		select {
+		case <-ticker.C:
+		case <-ctx.Done():
+			return
+		}
+	}
 }
 
 func (r *soakRun) runCounter(ctx context.Context, index int, rng *rand.Rand, interval time.Duration) {
@@ -953,10 +1073,12 @@ func (r *soakRun) restartChaos(ctx context.Context, _ int) error {
 		if err == nil {
 			break
 		}
-		// The old generation can still be completing its 22-second loss
-		// transition after the new engine advertises the actor. Retry only this
-		// explicit pinned transitional response; every other failure is final.
-		if !isActionFailure(err, "actor", "stopping") {
+		// The old generation can still be completing its loss transition after
+		// the new engine advertises the actor. The pin returns either a structured
+		// stopping error or a plain 503 until failover assigns a wakeable
+		// generation. Every other failure is final.
+		if !isActionFailure(err, "actor", "stopping") &&
+			!isActionStatus(err, http.StatusServiceUnavailable, "Actor not found") {
 			return fmt.Errorf("rehydrate alarm actor after engine restart: %w", err)
 		}
 		select {
@@ -1013,6 +1135,24 @@ func (r *soakRun) finalOracles(ctx context.Context) error {
 	if chatActual.Messages == 0 {
 		return errors.New("chat actor handled zero messages")
 	}
+	if r.sqlRows != 0 {
+		if err := r.api.waitActorSleeping(ctx, r.sqlActor); err != nil {
+			return fmt.Errorf("wait for final SQL sleep: %w", err)
+		}
+	}
+	sqlActual, err := gatewayAction[sqlResult](ctx, r.api, r.sqlActor, "snapshot", struct{}{})
+	if err != nil {
+		return fmt.Errorf("final SQL snapshot: %w", err)
+	}
+	if sqlActual.InsertedRows != r.sqlRows {
+		return fmt.Errorf("final SQL rows=%d want=%d", sqlActual.InsertedRows, r.sqlRows)
+	}
+	if r.activations.sqlOperations.Load() == 0 || r.sqlRows == 0 {
+		return errors.New("SQL workload executed zero inserts")
+	}
+	if err := r.api.waitActorSleeping(ctx, r.sqlActor); err != nil {
+		return fmt.Errorf("park SQL actor after final snapshot: %w", err)
+	}
 	for {
 		truth := r.alarmOracle.truth()
 		if truth.Fired > truth.Armed {
@@ -1061,6 +1201,17 @@ func (r *soakRun) finalOracles(ctx context.Context) error {
 		return fmt.Errorf("metric %s was never activated", rivet.MetricPollLatency)
 	}
 	return nil
+}
+
+func oneSQLiteCount(rows rivet.Rows) (int64, error) {
+	if len(rows.Columns) != 1 || len(rows.Values) != 1 || len(rows.Values[0]) != 1 {
+		return 0, fmt.Errorf("SQLite count result = %#v", rows)
+	}
+	count, ok := rows.Values[0][0].(int64)
+	if !ok {
+		return 0, fmt.Errorf("SQLite count has type %T", rows.Values[0][0])
+	}
+	return count, nil
 }
 
 func headerValue(headers map[string]string, name string) string {
