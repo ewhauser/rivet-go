@@ -29,6 +29,7 @@ func TestRustRunnerConfigGolden(t *testing.T) {
 		ActorNames:               []string{"counter"},
 		ActorActions:             map[string][]string{"counter": {"increment"}},
 		ActorHibernateWebSockets: map[string]bool{"counter": true},
+		SQLiteTransport:          "ffi",
 		LogLevel:                 "info",
 	}
 	var got RunnerConfig
@@ -73,6 +74,7 @@ func TestRustEventBatchGoldens(t *testing.T) {
 		{"event_ws_open.msgpack", EventWSOpen, 14},
 		{"event_ws_message.msgpack", EventWSMessage, 15},
 		{"event_ws_close.msgpack", EventWSClose, 16},
+		{"event_sqlite_result.msgpack", EventSQLiteResult, 19},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -93,6 +95,42 @@ func TestRustEventBatchGoldens(t *testing.T) {
 				t.Fatal("WebSocket open golden does not carry the M5 resume marker")
 			}
 		})
+	}
+}
+
+func TestRustM7CommandBatchGolden(t *testing.T) {
+	data := golden(t, "command_m7.msgpack")
+	var batch CommandBatch
+	if err := decode(data, &batch); err != nil {
+		t.Fatal(err)
+	}
+	want := []CommandKind{
+		CommandSQLiteExec,
+		CommandSQLiteQuery,
+		CommandSQLiteBegin,
+		CommandSQLiteCommit,
+		CommandSQLiteRollback,
+	}
+	if len(batch.Commands) != len(want) {
+		t.Fatalf("command count = %d, want %d", len(batch.Commands), len(want))
+	}
+	for index, kind := range want {
+		if batch.Commands[index].Kind != kind {
+			t.Fatalf("command %d kind = %q, want %q", index, batch.Commands[index].Kind, kind)
+		}
+	}
+	if batch.Commands[0].SQLiteRequestID != 51 || batch.Commands[0].SQLArgs[0].Text == nil {
+		t.Fatalf("unexpected SQLite exec command: %#v", batch.Commands[0])
+	}
+	if batch.Commands[2].LeaseKey == nil || batch.Commands[2].TimeoutMS != 60_000 {
+		t.Fatalf("unexpected SQLite begin command: %#v", batch.Commands[2])
+	}
+	encoded, err := EncodeCommandBatch(batch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(encoded, data) {
+		t.Fatal("Go CommandBatch encoding differs from the Rust-generated M7 golden")
 	}
 }
 

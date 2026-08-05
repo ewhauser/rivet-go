@@ -1,0 +1,32 @@
+[package]
+name = "rivet-depot-client"
+version = "2.3.10"
+edition = "2024"
+publish = false
+description = "Pinned Rivet Depot client with the documented zero-length BLOB correction"
+
+[lints.rust]
+# The pinned source predates explicit unsafe blocks inside unsafe functions,
+# and two metrics-only locals are unused with this exact dependency feature set.
+unsafe_op_in_unsafe_fn = "allow"
+unused_variables = "allow"
+
+[lib]
+name = "depot_client"
+crate-type = ["lib"]
+test = false
+doctest = false
+
+[dependencies]
+anyhow = "1.0.82"
+async-trait = "0.1"
+crossbeam-channel = "0.5"
+libsqlite3-sys = { version = "0.30", features = ["bundled"] }
+tokio = "1"
+tracing = "0.1"
+getrandom = "0.2"
+rivet-envoy-protocol = { git = "https://github.com/rivet-dev/rivet", tag = "v2.3.10" }
+depot-client-types = { package = "rivet-depot-client-types", git = "https://github.com/rivet-dev/rivet", tag = "v2.3.10" }
+moka = { version = "0.12", default-features = false, features = ["sync"] }
+parking_lot = "0.12"
+scc = "3.6.12"

@@ -45,6 +45,7 @@ type Actor[T any] struct {
 // typed value loaded from core's persisted snapshot.
 type Context[T any] struct {
 	session       *pump.ActorSession
+	db            *DB
 	state         T
 	saveMu        sync.Mutex
 	connectionsMu sync.Mutex
@@ -79,6 +80,16 @@ func (c *Context[T]) Generation() uint64 {
 	return c.session.Generation()
 }
 
+// DB returns this actor generation's SQLite handle. The handle is safe for
+// concurrent use. Transactions remain generation-local and expire after their
+// lease timeout.
+func (c *Context[T]) DB() *DB {
+	if c == nil {
+		return nil
+	}
+	return c.db
+}
+
 // Schedule replaces this actor's one durable alarm. The engine wakes a
 // sleeping actor before invoking OnAlarm.
 func (c *Context[T]) Schedule(at time.Time) error {
@@ -108,6 +119,14 @@ func (c *Context[T]) ClearSchedule() error {
 func (c *Context[T]) Sleep() error {
 	if c == nil || c.session == nil {
 		return errors.New("actor context is unavailable")
+	}
+	// The runtime socket owns transaction leases per connection. Close it
+	// before requesting eviction so an open lease is rolled back immediately
+	// instead of gating core's sleep bookkeeping until its timeout.
+	if c.db != nil {
+		if err := c.db.closeForSleep(); err != nil {
+			return fmt.Errorf("close actor SQLite transport for sleep: %w", err)
+		}
 	}
 	return c.session.Sleep()
 }
@@ -159,13 +178,19 @@ func (a *actorAdapter[T]) Start(
 	if err != nil {
 		return nil, err
 	}
+	db, err := newDB(session)
+	if err != nil {
+		return nil, err
+	}
 	actorContext := &Context[T]{
 		session:     session,
+		db:          db,
 		state:       state,
 		connections: make(map[string]*Connection),
 	}
 	if a.definition.OnStart != nil {
 		if err := a.definition.OnStart(actorContext); err != nil {
+			_ = actorContext.db.close()
 			return nil, err
 		}
 	}
@@ -183,9 +208,13 @@ func (a *actorAdapter[T]) Stop(
 		return errors.New("typed actor context is unavailable during stop")
 	}
 	if a.definition.OnStop == nil {
-		return nil
+		return actorContext.db.close()
 	}
-	return a.definition.OnStop(actorContext)
+	if err := a.definition.OnStop(actorContext); err != nil {
+		_ = actorContext.db.close()
+		return err
+	}
+	return actorContext.db.close()
 }
 
 func (a *actorAdapter[T]) Action(

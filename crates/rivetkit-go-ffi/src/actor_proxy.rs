@@ -10,14 +10,14 @@ use crossbeam_channel::Sender;
 use rivet_error::{RivetError, RivetErrorKind};
 use rivetkit_core::actor::ShutdownKind;
 use rivetkit_core::{
-    ActionDefinition, ActorConfig, ActorContext, ActorEvent, ActorFactory, ActorStart,
-    CanHibernateWebSocket, ConnHandle, CoreRegistry, ListOpts, Response, StateDelta, WebSocket,
-    WsMessage, format_actor_key,
+    ActionDefinition, ActorConfig, ActorContext, ActorEvent, ActorFactory, ActorStart, BindParam,
+    CanHibernateWebSocket, ColumnValue, ConnHandle, CoreRegistry, ExecuteResult, ListOpts,
+    Response, SqliteTransaction, StateDelta, WebSocket, WsMessage, format_actor_key,
 };
 use serde::{Deserialize, Serialize};
 
 use crate::correlation::{CorrelationError, CorrelationTable};
-use crate::wire::{Command, Event, KvEntry, WireError};
+use crate::wire::{Command, Event, KvEntry, SqliteValue, WireError};
 
 const LIFECYCLE_RESULT_TIMEOUT: Duration = Duration::from_secs(30);
 const SAVE_STATE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -37,11 +37,19 @@ const WS_OUTBOUND_QUEUE_CAPACITY: usize = 64;
 const WS_BACKPRESSURE_CLOSE_CODE: u16 = 1013;
 const WS_MESSAGE_ACK_TIMEOUT: Duration = Duration::from_secs(60);
 const INTERNAL_ALARM_ACTION: &str = "__rivet_go_alarm";
+const MAX_SQLITE_RESULT_BYTES: usize = 32 * 1024 * 1024;
+const MAX_SQLITE_CHUNK_BYTES: usize = 1 << 20;
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
 struct ActorIdentity {
     aid: String,
     generation: u64,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+struct SqliteLeaseIdentity {
+    actor: ActorIdentity,
+    lease_key: String,
 }
 
 impl ActorIdentity {
@@ -380,6 +388,8 @@ pub(crate) struct ActorProxy {
     active_http: Arc<Mutex<HashSet<u64>>>,
     http_responses: Arc<Mutex<HashMap<u64, HttpResponseAssembly>>>,
     runner_draining: Arc<AtomicBool>,
+    sqlite_transport: Arc<Mutex<String>>,
+    sqlite_transactions: Arc<Mutex<HashMap<SqliteLeaseIdentity, SqliteTransaction>>>,
 }
 
 impl ActorProxy {
@@ -396,6 +406,8 @@ impl ActorProxy {
             active_http: Arc::new(Mutex::new(HashSet::new())),
             http_responses: Arc::new(Mutex::new(HashMap::new())),
             runner_draining: Arc::new(AtomicBool::new(false)),
+            sqlite_transport: Arc::new(Mutex::new(String::new())),
+            sqlite_transactions: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -405,17 +417,23 @@ impl ActorProxy {
         actor_names: &[String],
         actor_actions: &BTreeMap<String, Vec<String>>,
         actor_hibernate_websockets: &BTreeMap<String, bool>,
+        sqlite_transport: &str,
     ) {
+        *self
+            .sqlite_transport
+            .lock()
+            .expect("SQLite transport mutex poisoned") = sqlite_transport.to_owned();
         for actor_name in actor_names {
             let proxy = self.clone();
             let config = ActorConfig {
                 name: Some(actor_name.clone()),
                 has_state: true,
-                // Core's remote SQLite backend persists actor state through
-                // the engine/envoy. The local backend requires an
-                // atomic-write-enabled SQLite build that the Go SDK does not
-                // otherwise need to ship.
-                remote_sqlite: true,
+                // Existing state/KV-only runners retain RemoteEnvoy. Both M7
+                // public SQLite transports use the same LocalNative worker so
+                // the benchmark varies only the Go-to-core transport.
+                has_database: !sqlite_transport.is_empty(),
+                remote_sqlite: sqlite_transport.is_empty(),
+                enable_actor_runtime_socket: sqlite_transport == "socket",
                 no_sleep: false,
                 can_hibernate_websocket: CanHibernateWebSocket::Bool(
                     actor_hibernate_websockets
@@ -581,6 +599,85 @@ impl ActorProxy {
                 r#gen: generation,
                 state,
             } => self.dispatch_save_state(aid, generation, state),
+            Command::SqliteExec {
+                request_id,
+                aid,
+                r#gen: generation,
+                sql,
+                args,
+                lease_key,
+                deadline_ms,
+            } => self.dispatch_sqlite_execute(
+                request_id,
+                aid,
+                generation,
+                sql,
+                args,
+                lease_key,
+                deadline_ms,
+                false,
+            ),
+            Command::SqliteQuery {
+                request_id,
+                aid,
+                r#gen: generation,
+                sql,
+                args,
+                lease_key,
+                deadline_ms,
+            } => self.dispatch_sqlite_execute(
+                request_id,
+                aid,
+                generation,
+                sql,
+                args,
+                lease_key,
+                deadline_ms,
+                true,
+            ),
+            Command::SqliteBegin {
+                request_id,
+                aid,
+                r#gen: generation,
+                lease_key,
+                timeout_ms,
+                deadline_ms,
+            } => self.dispatch_sqlite_begin(
+                request_id,
+                aid,
+                generation,
+                lease_key,
+                timeout_ms,
+                deadline_ms,
+            ),
+            Command::SqliteCommit {
+                request_id,
+                aid,
+                r#gen: generation,
+                lease_key,
+                deadline_ms,
+            } => self.dispatch_sqlite_finish(
+                request_id,
+                aid,
+                generation,
+                lease_key,
+                deadline_ms,
+                true,
+            ),
+            Command::SqliteRollback {
+                request_id,
+                aid,
+                r#gen: generation,
+                lease_key,
+                deadline_ms,
+            } => self.dispatch_sqlite_finish(
+                request_id,
+                aid,
+                generation,
+                lease_key,
+                deadline_ms,
+                false,
+            ),
             command => {
                 let proxy = self.clone();
                 tokio::spawn(async move {
@@ -627,6 +724,10 @@ impl ActorProxy {
             .lock()
             .expect("HTTP response table poisoned")
             .clear();
+        self.sqlite_transactions
+            .lock()
+            .expect("SQLite transaction table poisoned")
+            .clear();
     }
 
     pub(crate) fn begin_shutdown(&self) {
@@ -655,6 +756,22 @@ impl ActorProxy {
             .generation
             .unwrap_or(0);
         let identity = ActorIdentity::new(ctx.actor_id(), generation);
+        let sqlite_socket_path = if self
+            .sqlite_transport
+            .lock()
+            .expect("SQLite transport mutex poisoned")
+            .as_str()
+            == "socket"
+        {
+            Some(
+                ctx.provision_actor_runtime_socket()
+                    .await
+                    .context("provision Actor Runtime Socket")?
+                    .path,
+            )
+        } else {
+            None
+        };
         self.actors
             .lock()
             .expect("active actor table poisoned")
@@ -684,6 +801,7 @@ impl ActorProxy {
                 &ctx,
                 input.unwrap_or_default(),
                 snapshot,
+                sqlite_socket_path,
                 &mut events,
                 startup_ready,
             )
@@ -713,6 +831,10 @@ impl ActorProxy {
             .lock()
             .expect("active actor table poisoned")
             .remove(&identity);
+        self.sqlite_transactions
+            .lock()
+            .expect("SQLite transaction table poisoned")
+            .retain(|key, _| key.actor != identity);
         result.map(|_| ())
     }
 
@@ -722,6 +844,7 @@ impl ActorProxy {
         ctx: &ActorContext,
         input: Vec<u8>,
         persisted_state: Option<Vec<u8>>,
+        sqlite_socket_path: Option<String>,
         events: &mut rivetkit_core::ActorEvents,
         startup_ready: Option<tokio::sync::oneshot::Sender<Result<()>>>,
     ) -> Result<bool> {
@@ -743,6 +866,7 @@ impl ActorProxy {
                     create_ts: 0,
                     input,
                     persisted_state,
+                    sqlite_socket_path,
                 },
                 None,
             )
@@ -1029,8 +1153,277 @@ impl ActorProxy {
             | Command::StopIntent { .. }
             | Command::SetAlarm { .. }
             | Command::SleepIntent { .. }
+            | Command::SqliteExec { .. }
+            | Command::SqliteQuery { .. }
+            | Command::SqliteBegin { .. }
+            | Command::SqliteCommit { .. }
+            | Command::SqliteRollback { .. }
             | Command::Unknown => {}
         }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn dispatch_sqlite_execute(
+        &self,
+        request_id: u64,
+        aid: String,
+        generation: u64,
+        sql: String,
+        args: Vec<SqliteValue>,
+        lease_key: Option<String>,
+        deadline_ms: u32,
+        include_rows: bool,
+    ) {
+        let identity = ActorIdentity::new(aid, generation);
+        let Some(actor) = self.actor_exact(&identity) else {
+            self.emit_sqlite_error(
+                request_id,
+                WireError::new(
+                    "actor_generation_stale",
+                    format!(
+                        "actor {} generation {} is not active",
+                        identity.aid, identity.generation
+                    ),
+                ),
+            );
+            return;
+        };
+        let Some(operation) = actor.operations.begin() else {
+            self.emit_sqlite_error(
+                request_id,
+                WireError::new("actor_stopping", "actor generation is stopping"),
+            );
+            return;
+        };
+        let params = args.into_iter().map(sqlite_bind_param).collect::<Vec<_>>();
+        let transaction = lease_key.as_ref().and_then(|lease_key| {
+            self.sqlite_transactions
+                .lock()
+                .expect("SQLite transaction table poisoned")
+                .get(&SqliteLeaseIdentity {
+                    actor: identity.clone(),
+                    lease_key: lease_key.clone(),
+                })
+                .cloned()
+        });
+        if lease_key.is_some() && transaction.is_none() {
+            self.emit_sqlite_error(
+                request_id,
+                WireError::new(
+                    "invalid_lease_key",
+                    "SQLite transaction lease is not active",
+                ),
+            );
+            return;
+        }
+        let proxy = self.clone();
+        tokio::spawn(async move {
+            let _operation = operation;
+            let execute = async {
+                match transaction {
+                    Some(transaction) => transaction.execute(sql, Some(params)).await,
+                    None => actor.ctx.sql().execute(sql, Some(params)).await,
+                }
+            };
+            match tokio::time::timeout(Duration::from_millis(u64::from(deadline_ms)), execute).await
+            {
+                Ok(Ok(mut result)) => {
+                    if !include_rows {
+                        result.columns.clear();
+                        result.rows.clear();
+                    }
+                    proxy.emit_sqlite_execute_result(request_id, result);
+                }
+                Ok(Err(error)) => proxy.emit_sqlite_error(request_id, sqlite_wire_error(&error)),
+                Err(_) => proxy.emit_sqlite_error(
+                    request_id,
+                    WireError::new(
+                        "sqlite_deadline_exceeded",
+                        format!("SQLite operation exceeded its {deadline_ms} ms boundary deadline"),
+                    ),
+                ),
+            }
+        });
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn dispatch_sqlite_begin(
+        &self,
+        request_id: u64,
+        aid: String,
+        generation: u64,
+        lease_key: String,
+        timeout_ms: u64,
+        deadline_ms: u32,
+    ) {
+        let identity = ActorIdentity::new(aid, generation);
+        let Some(actor) = self.actor_exact(&identity) else {
+            self.emit_sqlite_error(
+                request_id,
+                WireError::new("actor_generation_stale", "actor generation is not active"),
+            );
+            return;
+        };
+        let Some(operation) = actor.operations.begin() else {
+            self.emit_sqlite_error(
+                request_id,
+                WireError::new("actor_stopping", "actor generation is stopping"),
+            );
+            return;
+        };
+        let key = SqliteLeaseIdentity {
+            actor: identity,
+            lease_key: lease_key.clone(),
+        };
+        if self
+            .sqlite_transactions
+            .lock()
+            .expect("SQLite transaction table poisoned")
+            .contains_key(&key)
+        {
+            self.emit_sqlite_error(
+                request_id,
+                WireError::new(
+                    "invalid_lease_key",
+                    "SQLite transaction lease was already used",
+                ),
+            );
+            return;
+        }
+        let proxy = self.clone();
+        tokio::spawn(async move {
+            let _operation = operation;
+            let begin = actor
+                .ctx
+                .sql()
+                .begin_transaction_with_key(lease_key, Some(Duration::from_millis(timeout_ms)));
+            match tokio::time::timeout(Duration::from_millis(u64::from(deadline_ms)), begin).await {
+                Ok(Ok(transaction)) => {
+                    proxy
+                        .sqlite_transactions
+                        .lock()
+                        .expect("SQLite transaction table poisoned")
+                        .insert(key, transaction);
+                    proxy.emit_sqlite_execute_result(
+                        request_id,
+                        ExecuteResult {
+                            columns: Vec::new(),
+                            rows: Vec::new(),
+                            changes: 0,
+                            last_insert_row_id: None,
+                        },
+                    );
+                }
+                Ok(Err(error)) => proxy.emit_sqlite_error(request_id, sqlite_wire_error(&error)),
+                Err(_) => proxy.emit_sqlite_error(
+                    request_id,
+                    WireError::new(
+                        "sqlite_deadline_exceeded",
+                        format!("SQLite begin exceeded its {deadline_ms} ms boundary deadline"),
+                    ),
+                ),
+            }
+        });
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn dispatch_sqlite_finish(
+        &self,
+        request_id: u64,
+        aid: String,
+        generation: u64,
+        lease_key: String,
+        deadline_ms: u32,
+        commit: bool,
+    ) {
+        let identity = ActorIdentity::new(aid, generation);
+        let Some(actor) = self.actor_exact(&identity) else {
+            self.emit_sqlite_error(
+                request_id,
+                WireError::new("actor_generation_stale", "actor generation is not active"),
+            );
+            return;
+        };
+        let Some(operation) = actor.operations.begin() else {
+            self.emit_sqlite_error(
+                request_id,
+                WireError::new("actor_stopping", "actor generation is stopping"),
+            );
+            return;
+        };
+        let key = SqliteLeaseIdentity {
+            actor: identity,
+            lease_key,
+        };
+        let transaction = self
+            .sqlite_transactions
+            .lock()
+            .expect("SQLite transaction table poisoned")
+            .remove(&key);
+        let Some(transaction) = transaction else {
+            self.emit_sqlite_error(
+                request_id,
+                WireError::new(
+                    "invalid_lease_key",
+                    "SQLite transaction lease is not active",
+                ),
+            );
+            return;
+        };
+        let proxy = self.clone();
+        tokio::spawn(async move {
+            let _operation = operation;
+            let finish = async {
+                if commit {
+                    transaction.commit().await
+                } else {
+                    transaction.rollback().await
+                }
+            };
+            match tokio::time::timeout(Duration::from_millis(u64::from(deadline_ms)), finish).await {
+                Ok(Ok(())) => proxy.emit_sqlite_execute_result(
+                    request_id,
+                    ExecuteResult {
+                        columns: Vec::new(),
+                        rows: Vec::new(),
+                        changes: 0,
+                        last_insert_row_id: None,
+                    },
+                ),
+                Ok(Err(error)) => proxy.emit_sqlite_error(request_id, sqlite_wire_error(&error)),
+                Err(_) => proxy.emit_sqlite_error(
+                    request_id,
+                    WireError::new(
+                        "sqlite_deadline_exceeded",
+                        format!("SQLite transaction finish exceeded its {deadline_ms} ms boundary deadline"),
+                    ),
+                ),
+            }
+        });
+    }
+
+    fn emit_sqlite_execute_result(&self, request_id: u64, result: ExecuteResult) {
+        match sqlite_result_events(request_id, result) {
+            Ok(events) => {
+                for event in events {
+                    let _ = self.events.send(event);
+                }
+            }
+            Err(error) => self.emit_sqlite_error(request_id, error),
+        }
+    }
+
+    fn emit_sqlite_error(&self, request_id: u64, error: WireError) {
+        let _ = self.events.send(Event::SqliteResult {
+            request_id,
+            chunk_index: 0,
+            done: true,
+            columns: Vec::new(),
+            values: Vec::new(),
+            rows_affected: 0,
+            last_insert_id: None,
+            error: Some(error),
+        });
     }
 
     fn dispatch_set_alarm(&self, op_id: u64, aid: String, generation: u64, alarm_ts: Option<i64>) {
@@ -2122,6 +2515,129 @@ fn shutdown_reason(reason: ShutdownKind) -> &'static str {
     }
 }
 
+fn sqlite_bind_param(value: SqliteValue) -> BindParam {
+    match value {
+        SqliteValue::Null => BindParam::Null,
+        SqliteValue::Integer { integer } => BindParam::Integer(integer),
+        SqliteValue::Real { bits } => BindParam::Float(f64::from_bits(bits)),
+        SqliteValue::Text { text } => BindParam::Text(text),
+        SqliteValue::Blob { blob } => BindParam::Blob(blob),
+    }
+}
+
+fn sqlite_result_events(request_id: u64, result: ExecuteResult) -> Result<Vec<Event>, WireError> {
+    let column_count = result.columns.len();
+    if column_count > 1_024 {
+        return Err(WireError::new(
+            "sqlite_result_too_wide",
+            "SQLite result exceeds the 1024-column boundary limit",
+        ));
+    }
+    let mut total_bytes = result.columns.iter().map(String::len).sum::<usize>();
+    let mut chunks = vec![Vec::new()];
+    let mut chunk_bytes = 0usize;
+
+    for row in result.rows {
+        if row.len() != column_count {
+            return Err(WireError::new(
+                "sqlite_result_invalid",
+                format!(
+                    "SQLite row has {} values for {column_count} columns",
+                    row.len()
+                ),
+            ));
+        }
+        for value in row {
+            let (value, value_bytes) = sqlite_column_value(value)?;
+            total_bytes = total_bytes.saturating_add(value_bytes);
+            if total_bytes > MAX_SQLITE_RESULT_BYTES {
+                return Err(WireError::new(
+                    "sqlite_result_too_large",
+                    format!(
+                        "SQLite result exceeds the {MAX_SQLITE_RESULT_BYTES}-byte result limit"
+                    ),
+                ));
+            }
+            if chunk_bytes != 0
+                && (chunk_bytes.saturating_add(value_bytes) > MAX_SQLITE_CHUNK_BYTES
+                    || chunks.last().expect("SQLite chunk exists").len() >= 1_024)
+            {
+                chunks.push(Vec::new());
+                chunk_bytes = 0;
+            }
+            chunk_bytes = chunk_bytes.saturating_add(value_bytes);
+            chunks.last_mut().expect("SQLite chunk exists").push(value);
+        }
+    }
+
+    let final_index = chunks.len() - 1;
+    Ok(chunks
+        .into_iter()
+        .enumerate()
+        .map(|(index, values)| Event::SqliteResult {
+            request_id,
+            chunk_index: index as u32,
+            done: index == final_index,
+            columns: if index == 0 {
+                result.columns.clone()
+            } else {
+                Vec::new()
+            },
+            values,
+            rows_affected: result.changes,
+            last_insert_id: result.last_insert_row_id,
+            error: None,
+        })
+        .collect())
+}
+
+fn sqlite_column_value(value: ColumnValue) -> Result<(SqliteValue, usize), WireError> {
+    const FIXED_VALUE_BYTES: usize = 16;
+    match value {
+        ColumnValue::Null => Ok((SqliteValue::Null, 1)),
+        ColumnValue::Integer(integer) => Ok((SqliteValue::Integer { integer }, FIXED_VALUE_BYTES)),
+        ColumnValue::Float(value) => Ok((
+            SqliteValue::Real {
+                bits: value.to_bits(),
+            },
+            FIXED_VALUE_BYTES,
+        )),
+        ColumnValue::Text(text) => {
+            if text.len() > MAX_BODY_CHUNK {
+                return Err(WireError::new(
+                    "sqlite_value_too_large",
+                    format!("SQLite text value exceeds the {MAX_BODY_CHUNK}-byte value limit"),
+                ));
+            }
+            let bytes = text.len().saturating_add(FIXED_VALUE_BYTES);
+            Ok((SqliteValue::Text { text }, bytes))
+        }
+        ColumnValue::Blob(blob) => {
+            if blob.len() > MAX_BODY_CHUNK {
+                return Err(WireError::new(
+                    "sqlite_value_too_large",
+                    format!("SQLite blob value exceeds the {MAX_BODY_CHUNK}-byte value limit"),
+                ));
+            }
+            let bytes = blob.len().saturating_add(FIXED_VALUE_BYTES);
+            Ok((SqliteValue::Blob { blob }, bytes))
+        }
+    }
+}
+
+fn sqlite_wire_error(error: &anyhow::Error) -> WireError {
+    if let Some(statement) = error.downcast_ref::<depot_client::query::SqliteStatementError>() {
+        return WireError {
+            code: "sqlite_error".to_owned(),
+            message: statement.message.clone(),
+            sqlite_code: Some(statement.code),
+            statement_index: Some(statement.statement_index),
+        };
+    }
+    let structured = RivetError::extract(error);
+    WireError::new(structured.code(), structured.message())
+}
+
 fn clear_ws_acknowledgements(active: &ActiveWebSocket) {
     let Some(acknowledgements) = &active.acknowledgements else {
         return;
@@ -2208,6 +2724,41 @@ mod tests {
     use crossbeam_channel::bounded;
 
     use super::*;
+
+    #[test]
+    fn sqlite_results_over_one_batch_are_chunked_in_order() {
+        let result = ExecuteResult {
+            columns: vec!["payload".to_owned()],
+            rows: (0..2_200)
+                .map(|index| vec![ColumnValue::Text(format!("{index:0600}"))])
+                .collect(),
+            changes: 0,
+            last_insert_row_id: None,
+        };
+        let events = sqlite_result_events(17, result).expect("chunk SQLite result");
+        assert!(events.len() > 1);
+        let mut value_count = 0;
+        for (index, event) in events.iter().enumerate() {
+            let Event::SqliteResult {
+                request_id,
+                chunk_index,
+                done,
+                columns,
+                values,
+                ..
+            } = event
+            else {
+                panic!("unexpected SQLite event")
+            };
+            assert_eq!(*request_id, 17);
+            assert_eq!(*chunk_index as usize, index);
+            assert_eq!(*done, index + 1 == events.len());
+            assert_eq!(columns.is_empty(), index != 0);
+            assert!(values.len() <= 1_024);
+            value_count += values.len();
+        }
+        assert_eq!(value_count, 2_200);
+    }
 
     #[tokio::test]
     async fn actor_stop_waits_for_reserved_state_operations() {

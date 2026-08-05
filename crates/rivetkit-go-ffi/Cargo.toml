@@ -28,8 +28,9 @@ url = "2"
 
 # v2.3.10 is the newest stable, non-RC engine release in rivet-dev/rivet as of
 # 2026-08-02. Keep this exact tag in sync with docs/PINNED-VERSION.md.
-rivetkit-core = { git = "https://github.com/rivet-dev/rivet", tag = "v2.3.10", default-features = false, features = ["native-runtime", "sqlite-remote"] }
+rivetkit-core = { git = "https://github.com/rivet-dev/rivet", tag = "v2.3.10", default-features = false, features = ["native-runtime", "sqlite-local", "sqlite-remote"] }
 rivet-error = { git = "https://github.com/rivet-dev/rivet", tag = "v2.3.10" }
+rivet-depot-client = { git = "https://github.com/rivet-dev/rivet", tag = "v2.3.10" }
 
 [dev-dependencies]
 proptest = "1"

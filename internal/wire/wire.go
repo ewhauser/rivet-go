@@ -4,6 +4,7 @@ package wire
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"unicode/utf8"
 
@@ -29,6 +30,7 @@ const (
 	EventWSClose            EventKind = "ws_close"
 	EventKVResult           EventKind = "kv_result"
 	EventStatePersisted     EventKind = "state_persisted"
+	EventSQLiteResult       EventKind = "sqlite_result"
 )
 
 type CommandKind string
@@ -53,6 +55,11 @@ const (
 	CommandKVList            CommandKind = "kv_list"
 	CommandKVPut             CommandKind = "kv_put"
 	CommandKVDelete          CommandKind = "kv_delete"
+	CommandSQLiteExec        CommandKind = "sqlite_exec"
+	CommandSQLiteQuery       CommandKind = "sqlite_query"
+	CommandSQLiteBegin       CommandKind = "sqlite_begin"
+	CommandSQLiteCommit      CommandKind = "sqlite_commit"
+	CommandSQLiteRollback    CommandKind = "sqlite_rollback"
 )
 
 // RunnerConfig is consumed by rk_runner_new.
@@ -65,6 +72,7 @@ type RunnerConfig struct {
 	ActorNames               []string            `msgpack:"actor_names"`
 	ActorActions             map[string][]string `msgpack:"actor_actions"`
 	ActorHibernateWebSockets map[string]bool     `msgpack:"actor_hibernate_websockets"`
+	SQLiteTransport          string              `msgpack:"sqlite_transport"`
 	LogLevel                 string              `msgpack:"log_level"`
 }
 
@@ -77,44 +85,52 @@ type EventBatch struct {
 // Event is the M5 event union. Fields not selected by Kind are absent from
 // Rust's encoded map and remain zero-valued after decoding.
 type Event struct {
-	Kind            EventKind         `msgpack:"kind"`
-	RunnerID        string            `msgpack:"runner_id,omitempty"`
-	Metadata        map[string]string `msgpack:"metadata,omitempty"`
-	Reason          string            `msgpack:"reason,omitempty"`
-	DrainReport     *DrainReport      `msgpack:"drain_report,omitempty"`
-	AID             string            `msgpack:"aid,omitempty"`
-	Generation      uint64            `msgpack:"gen,omitempty"`
-	Name            string            `msgpack:"name,omitempty"`
-	Key             string            `msgpack:"key,omitempty"`
-	CreateTS        int64             `msgpack:"create_ts,omitempty"`
-	Input           []byte            `msgpack:"input,omitempty"`
-	PersistedState  []byte            `msgpack:"persisted_state,omitempty"`
-	KVID            uint64            `msgpack:"kv_id,omitempty"`
-	Value           []byte            `msgpack:"value,omitempty"`
-	Entries         []KVEntry         `msgpack:"entries,omitempty"`
-	StateVersion    uint64            `msgpack:"state_version,omitempty"`
-	Error           *WireError        `msgpack:"error,omitempty"`
-	CallID          uint64            `msgpack:"call_id,omitempty"`
-	Action          string            `msgpack:"action,omitempty"`
-	ActionTimeoutMS uint32            `msgpack:"timeout_ms,omitempty"`
-	Args            []byte            `msgpack:"args,omitempty"`
-	ConnID          *string           `msgpack:"conn_id,omitempty"`
-	RequestID       uint64            `msgpack:"req_id,omitempty"`
-	Method          string            `msgpack:"method,omitempty"`
-	Path            string            `msgpack:"path,omitempty"`
-	Headers         map[string]string `msgpack:"headers,omitempty"`
-	Body            []byte            `msgpack:"body,omitempty"`
-	Stream          bool              `msgpack:"stream,omitempty"`
-	Finish          bool              `msgpack:"finish,omitempty"`
-	WSID            string            `msgpack:"ws_id,omitempty"`
-	CanHibernate    bool              `msgpack:"can_hibernate,omitempty"`
-	Resumed         bool              `msgpack:"resumed,omitempty"`
-	Data            []byte            `msgpack:"data,omitempty"`
-	Binary          bool              `msgpack:"binary,omitempty"`
-	MessageIndex    uint16            `msgpack:"msg_index,omitempty"`
-	CloseCode       *uint16           `msgpack:"code,omitempty"`
-	AlarmTS         int64             `msgpack:"alarm_ts,omitempty"`
-	OperationID     uint64            `msgpack:"op_id,omitempty"`
+	Kind             EventKind         `msgpack:"kind"`
+	RunnerID         string            `msgpack:"runner_id,omitempty"`
+	Metadata         map[string]string `msgpack:"metadata,omitempty"`
+	Reason           string            `msgpack:"reason,omitempty"`
+	DrainReport      *DrainReport      `msgpack:"drain_report,omitempty"`
+	AID              string            `msgpack:"aid,omitempty"`
+	Generation       uint64            `msgpack:"gen,omitempty"`
+	Name             string            `msgpack:"name,omitempty"`
+	Key              string            `msgpack:"key,omitempty"`
+	CreateTS         int64             `msgpack:"create_ts,omitempty"`
+	Input            []byte            `msgpack:"input,omitempty"`
+	PersistedState   []byte            `msgpack:"persisted_state,omitempty"`
+	SQLiteSocketPath string            `msgpack:"sqlite_socket_path,omitempty"`
+	KVID             uint64            `msgpack:"kv_id,omitempty"`
+	Value            []byte            `msgpack:"value,omitempty"`
+	Entries          []KVEntry         `msgpack:"entries,omitempty"`
+	StateVersion     uint64            `msgpack:"state_version,omitempty"`
+	Error            *WireError        `msgpack:"error,omitempty"`
+	CallID           uint64            `msgpack:"call_id,omitempty"`
+	Action           string            `msgpack:"action,omitempty"`
+	ActionTimeoutMS  uint32            `msgpack:"timeout_ms,omitempty"`
+	Args             []byte            `msgpack:"args,omitempty"`
+	ConnID           *string           `msgpack:"conn_id,omitempty"`
+	RequestID        uint64            `msgpack:"req_id,omitempty"`
+	Method           string            `msgpack:"method,omitempty"`
+	Path             string            `msgpack:"path,omitempty"`
+	Headers          map[string]string `msgpack:"headers,omitempty"`
+	Body             []byte            `msgpack:"body,omitempty"`
+	Stream           bool              `msgpack:"stream,omitempty"`
+	Finish           bool              `msgpack:"finish,omitempty"`
+	WSID             string            `msgpack:"ws_id,omitempty"`
+	CanHibernate     bool              `msgpack:"can_hibernate,omitempty"`
+	Resumed          bool              `msgpack:"resumed,omitempty"`
+	Data             []byte            `msgpack:"data,omitempty"`
+	Binary           bool              `msgpack:"binary,omitempty"`
+	MessageIndex     uint16            `msgpack:"msg_index,omitempty"`
+	CloseCode        *uint16           `msgpack:"code,omitempty"`
+	AlarmTS          int64             `msgpack:"alarm_ts,omitempty"`
+	OperationID      uint64            `msgpack:"op_id,omitempty"`
+	SQLiteValues     []SQLiteValue     `msgpack:"values,omitempty"`
+	Columns          []string          `msgpack:"columns,omitempty"`
+	RowsAffected     int64             `msgpack:"rows_affected,omitempty"`
+	LastInsertID     *int64            `msgpack:"last_insert_id,omitempty"`
+	ChunkIndex       uint32            `msgpack:"chunk_index,omitempty"`
+	Done             bool              `msgpack:"done,omitempty"`
+	SQLiteRequestID  uint64            `msgpack:"request_id,omitempty"`
 }
 
 type DrainReport struct {
@@ -125,8 +141,10 @@ type DrainReport struct {
 }
 
 type WireError struct {
-	Code    string `msgpack:"code"`
-	Message string `msgpack:"message"`
+	Code           string  `msgpack:"code"`
+	Message        string  `msgpack:"message"`
+	SQLiteCode     *int32  `msgpack:"sqlite_code,omitempty"`
+	StatementIndex *uint32 `msgpack:"statement_index,omitempty"`
 }
 
 func (e WireError) Error() string {
@@ -141,6 +159,14 @@ type KVEntry struct {
 	Value []byte `msgpack:"value"`
 }
 
+type SQLiteValue struct {
+	Kind    string  `msgpack:"kind"`
+	Integer *int64  `msgpack:"integer,omitempty"`
+	Bits    *uint64 `msgpack:"bits,omitempty"`
+	Text    *string `msgpack:"text,omitempty"`
+	Blob    *[]byte `msgpack:"blob,omitempty"`
+}
+
 type CommandBatch struct {
 	Commands []Command `msgpack:"commands"`
 }
@@ -149,39 +175,45 @@ type CommandBatch struct {
 // values, state, and generation zero remain distinguishable from a missing
 // required field. Rust ignores fields that do not belong to the selected kind.
 type Command struct {
-	Kind         CommandKind       `msgpack:"kind"`
-	AID          string            `msgpack:"aid"`
-	Generation   uint64            `msgpack:"gen"`
-	OK           bool              `msgpack:"ok"`
-	Error        *WireError        `msgpack:"error"`
-	State        []byte            `msgpack:"state"`
-	KVID         uint64            `msgpack:"kv_id"`
-	Key          []byte            `msgpack:"key"`
-	Prefix       []byte            `msgpack:"prefix"`
-	Reverse      bool              `msgpack:"reverse"`
-	Limit        *uint32           `msgpack:"limit"`
-	Value        []byte            `msgpack:"value"`
-	CallID       uint64            `msgpack:"call_id"`
-	Output       []byte            `msgpack:"output"`
-	RequestID    uint64            `msgpack:"req_id"`
-	Status       uint16            `msgpack:"status"`
-	Headers      map[string]string `msgpack:"headers"`
-	Body         []byte            `msgpack:"body"`
-	Stream       bool              `msgpack:"stream"`
-	Finish       bool              `msgpack:"finish"`
-	WSID         string            `msgpack:"ws_id"`
-	Accept       bool              `msgpack:"accept"`
-	Data         []byte            `msgpack:"data"`
-	Binary       bool              `msgpack:"binary"`
-	MessageIndex uint16            `msgpack:"msg_index"`
-	CloseCode    *uint16           `msgpack:"code"`
-	CloseReason  *string           `msgpack:"reason"`
-	Hibernate    bool              `msgpack:"hibernate"`
-	Event        string            `msgpack:"event"`
-	Payload      []byte            `msgpack:"payload"`
-	ExcludeConn  *string           `msgpack:"exclude_conn"`
-	AlarmTS      *int64            `msgpack:"alarm_ts"`
-	OperationID  uint64            `msgpack:"op_id"`
+	Kind            CommandKind       `msgpack:"kind"`
+	AID             string            `msgpack:"aid"`
+	Generation      uint64            `msgpack:"gen"`
+	OK              bool              `msgpack:"ok"`
+	Error           *WireError        `msgpack:"error"`
+	State           []byte            `msgpack:"state"`
+	KVID            uint64            `msgpack:"kv_id"`
+	Key             []byte            `msgpack:"key"`
+	Prefix          []byte            `msgpack:"prefix"`
+	Reverse         bool              `msgpack:"reverse"`
+	Limit           *uint32           `msgpack:"limit"`
+	Value           []byte            `msgpack:"value"`
+	CallID          uint64            `msgpack:"call_id"`
+	Output          []byte            `msgpack:"output"`
+	RequestID       uint64            `msgpack:"req_id"`
+	Status          uint16            `msgpack:"status"`
+	Headers         map[string]string `msgpack:"headers"`
+	Body            []byte            `msgpack:"body"`
+	Stream          bool              `msgpack:"stream"`
+	Finish          bool              `msgpack:"finish"`
+	WSID            string            `msgpack:"ws_id"`
+	Accept          bool              `msgpack:"accept"`
+	Data            []byte            `msgpack:"data"`
+	Binary          bool              `msgpack:"binary"`
+	MessageIndex    uint16            `msgpack:"msg_index"`
+	CloseCode       *uint16           `msgpack:"code"`
+	CloseReason     *string           `msgpack:"reason"`
+	Hibernate       bool              `msgpack:"hibernate"`
+	Event           string            `msgpack:"event"`
+	Payload         []byte            `msgpack:"payload"`
+	ExcludeConn     *string           `msgpack:"exclude_conn"`
+	AlarmTS         *int64            `msgpack:"alarm_ts"`
+	OperationID     uint64            `msgpack:"op_id"`
+	SQLiteRequestID uint64            `msgpack:"request_id"`
+	SQL             string            `msgpack:"sql"`
+	SQLArgs         []SQLiteValue     `msgpack:"args"`
+	LeaseKey        *string           `msgpack:"lease_key"`
+	DeadlineMS      uint32            `msgpack:"deadline_ms"`
+	TimeoutMS       uint64            `msgpack:"timeout_ms"`
 }
 
 func EncodeRunnerConfig(config RunnerConfig) ([]byte, error) {
@@ -236,6 +268,9 @@ func validateEvent(event Event) error {
 	case EventActorStart:
 		if event.AID == "" || event.Name == "" {
 			return fmt.Errorf("%s event requires aid and name", event.Kind)
+		}
+		if event.SQLiteSocketPath != "" && event.SQLiteSocketPath[0] != '/' {
+			return fmt.Errorf("%s event has a non-absolute SQLite socket path", event.Kind)
 		}
 	case EventActorStop:
 		if event.AID == "" || event.Reason == "" {
@@ -309,11 +344,70 @@ func validateEvent(event Event) error {
 		if event.AID == "" {
 			return fmt.Errorf("%s event has empty aid", event.Kind)
 		}
+	case EventSQLiteResult:
+		if event.SQLiteRequestID == 0 {
+			return fmt.Errorf("%s event has invalid request_id", event.Kind)
+		}
+		if event.Error != nil && (!event.Done || len(event.Columns) != 0 || len(event.SQLiteValues) != 0) {
+			return fmt.Errorf("%s error event must be terminal and contain no rows", event.Kind)
+		}
+		for index, value := range event.SQLiteValues {
+			if err := validateSQLiteValue(value); err != nil {
+				return fmt.Errorf("%s value %d: %w", event.Kind, index, err)
+			}
+		}
 	default:
 		return fmt.Errorf("unknown event kind %q", event.Kind)
 	}
 	if event.Error != nil && (event.Error.Code == "" || event.Error.Message == "") {
 		return fmt.Errorf("%s event has incomplete structured error", event.Kind)
+	}
+	return nil
+}
+
+func validateSQLiteValue(value SQLiteValue) error {
+	set := 0
+	if value.Integer != nil {
+		set++
+	}
+	if value.Bits != nil {
+		set++
+	}
+	if value.Text != nil {
+		set++
+		if len(*value.Text) > 1<<20 {
+			return errors.New("text exceeds the one MiB value limit")
+		}
+	}
+	if value.Blob != nil {
+		set++
+		if len(*value.Blob) > 1<<20 {
+			return errors.New("blob exceeds the one MiB value limit")
+		}
+	}
+	switch value.Kind {
+	case "null":
+		if set != 0 {
+			return errors.New("null has a payload")
+		}
+	case "integer":
+		if value.Integer == nil || set != 1 {
+			return errors.New("integer requires exactly one integer payload")
+		}
+	case "real":
+		if value.Bits == nil || set != 1 {
+			return errors.New("real requires exactly one bits payload")
+		}
+	case "text":
+		if value.Text == nil || set != 1 {
+			return errors.New("text requires exactly one text payload")
+		}
+	case "blob":
+		if value.Blob == nil || set != 1 {
+			return errors.New("blob requires exactly one blob payload")
+		}
+	default:
+		return fmt.Errorf("unknown SQLite value kind %q", value.Kind)
 	}
 	return nil
 }

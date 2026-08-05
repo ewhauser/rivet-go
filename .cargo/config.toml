@@ -1,0 +1,4 @@
+[env]
+# LocalNative uses Depot's VFS batch-atomic commit path. Match the pinned
+# rivet workspace build so libsqlite3-sys includes the required SQLite code.
+LIBSQLITE3_FLAGS = "SQLITE_ENABLE_BATCH_ATOMIC_WRITE"

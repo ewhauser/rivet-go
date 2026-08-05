@@ -327,6 +327,19 @@ fn validate_config(config: &RunnerConfig) -> Result<(), ErrorPayload> {
             ));
         }
     }
+    if !matches!(config.sqlite_transport.as_str(), "" | "ffi" | "socket") {
+        return Err(ErrorPayload::new(
+            "invalid_config",
+            "sqlite_transport must be empty, ffi, or socket",
+        ));
+    }
+    #[cfg(not(unix))]
+    if config.sqlite_transport == "socket" {
+        return Err(ErrorPayload::new(
+            "invalid_config",
+            "sqlite_transport socket requires a Unix platform",
+        ));
+    }
     if !matches!(
         config.log_level.as_str(),
         "trace" | "debug" | "info" | "warn" | "error"
@@ -394,6 +407,7 @@ async fn run_runner(
         &config.actor_names,
         &config.actor_actions,
         &config.actor_hibernate_websockets,
+        &config.sqlite_transport,
     );
     let serve_config = ServeConfig {
         version: config.version,
@@ -727,6 +741,7 @@ mod tests {
             actor_names: Vec::new(),
             actor_actions: BTreeMap::new(),
             actor_hibernate_websockets: BTreeMap::new(),
+            sqlite_transport: String::new(),
             log_level: "info".to_owned(),
         }
     }

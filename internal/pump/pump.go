@@ -24,6 +24,7 @@ const (
 	defaultIntentTimeout   = 35 * time.Second
 	defaultHTTPSubmitLimit = 30 * time.Second
 	defaultWSSubmitLimit   = 30 * time.Second
+	defaultSQLiteTimeout   = 65 * time.Second
 	defaultSubmitQueue     = 1_024
 	maxSubmitBatch         = 1_024
 	actorEventQueue        = 64
@@ -64,6 +65,7 @@ type Options struct {
 	Hooks           Hooks
 	Logger          *slog.Logger
 	ShutdownTimeout time.Duration
+	SQLiteTransport string
 }
 
 // Runner is implemented by the owned internal/ffi runner handle.
@@ -166,11 +168,14 @@ type ActorSession struct {
 	savePoisoned bool
 	saveStateMu  sync.Mutex
 
-	lifecycleMu   sync.Mutex
-	lifecycleCond *sync.Cond
-	accepting     bool
-	activeSaves   int
-	doneClosed    bool
+	lifecycleMu      sync.Mutex
+	lifecycleCond    *sync.Cond
+	accepting        bool
+	activeSaves      int
+	activeSQLite     int
+	doneClosed       bool
+	sqliteTransport  string
+	sqliteSocketPath string
 }
 
 // HTTPRequest is one raw actor request delivered through the engine gateway.
@@ -181,6 +186,13 @@ type HTTPRequest struct {
 	Path    string
 	Headers map[string]string
 	Body    io.ReadCloser
+}
+
+type SQLiteResponse struct {
+	Columns      []string
+	Values       []wire.SQLiteValue
+	RowsAffected int64
+	LastInsertID *int64
 }
 
 type httpRequestState struct {
@@ -227,6 +239,20 @@ func (s *ActorSession) PersistedState() []byte {
 		return nil
 	}
 	return cloneBytes(s.persistedState)
+}
+
+func (s *ActorSession) SQLiteTransport() string {
+	if s == nil {
+		return ""
+	}
+	return s.sqliteTransport
+}
+
+func (s *ActorSession) SQLiteSocketPath() string {
+	if s == nil {
+		return ""
+	}
+	return s.sqliteSocketPath
 }
 
 // HTTPRequest returns the request state prepared for an HttpRequest event.
@@ -719,6 +745,166 @@ func (s *ActorSession) kv(ctx context.Context, command wire.Command) (wire.Event
 	}
 }
 
+func (s *ActorSession) SQLiteExec(
+	ctx context.Context,
+	sql string,
+	args []wire.SQLiteValue,
+	leaseKey *string,
+) (SQLiteResponse, error) {
+	sqlArgs := make([]wire.SQLiteValue, len(args))
+	copy(sqlArgs, args)
+	return s.sqlite(ctx, wire.Command{
+		Kind:     wire.CommandSQLiteExec,
+		SQL:      sql,
+		SQLArgs:  sqlArgs,
+		LeaseKey: cloneStringPointer(leaseKey),
+	})
+}
+
+func (s *ActorSession) SQLiteQuery(
+	ctx context.Context,
+	sql string,
+	args []wire.SQLiteValue,
+	leaseKey *string,
+) (SQLiteResponse, error) {
+	sqlArgs := make([]wire.SQLiteValue, len(args))
+	copy(sqlArgs, args)
+	return s.sqlite(ctx, wire.Command{
+		Kind:     wire.CommandSQLiteQuery,
+		SQL:      sql,
+		SQLArgs:  sqlArgs,
+		LeaseKey: cloneStringPointer(leaseKey),
+	})
+}
+
+func (s *ActorSession) SQLiteBegin(
+	ctx context.Context,
+	leaseKey string,
+	timeout time.Duration,
+) error {
+	_, err := s.sqlite(ctx, wire.Command{
+		Kind:      wire.CommandSQLiteBegin,
+		LeaseKey:  &leaseKey,
+		TimeoutMS: durationMillis64(timeout),
+	})
+	return err
+}
+
+func (s *ActorSession) SQLiteCommit(ctx context.Context, leaseKey string) error {
+	_, err := s.sqlite(ctx, wire.Command{
+		Kind:     wire.CommandSQLiteCommit,
+		LeaseKey: &leaseKey,
+	})
+	return err
+}
+
+func (s *ActorSession) SQLiteRollback(ctx context.Context, leaseKey string) error {
+	_, err := s.sqlite(ctx, wire.Command{
+		Kind:     wire.CommandSQLiteRollback,
+		LeaseKey: &leaseKey,
+	})
+	return err
+}
+
+func (s *ActorSession) sqlite(ctx context.Context, command wire.Command) (SQLiteResponse, error) {
+	if s == nil || s.pump == nil {
+		return SQLiteResponse{}, errors.New("actor session is unavailable")
+	}
+	if ctx == nil {
+		return SQLiteResponse{}, errors.New("SQLite context is nil")
+	}
+	if err := s.beginSQLite(); err != nil {
+		return SQLiteResponse{}, err
+	}
+	defer s.finishSQLite()
+	deadlineMS, err := sqliteDeadlineMillis(ctx)
+	if err != nil {
+		return SQLiteResponse{}, err
+	}
+	result := make(chan wire.Event, 64)
+	requestID := s.pump.addSQLiteWaiter(result)
+	command.SQLiteRequestID = requestID
+	command.AID = s.AID()
+	command.Generation = s.Generation()
+	command.DeadlineMS = deadlineMS
+	if err := s.pump.submitInternal(ctx, command); err != nil {
+		s.pump.removeSQLiteWaiter(requestID)
+		return SQLiteResponse{}, err
+	}
+
+	var response SQLiteResponse
+	var nextChunk uint32
+	for {
+		select {
+		case event := <-result:
+			if event.ChunkIndex != nextChunk {
+				return SQLiteResponse{}, fmt.Errorf(
+					"SQLite result chunk index %d follows %d",
+					event.ChunkIndex,
+					nextChunk,
+				)
+			}
+			nextChunk++
+			if event.Error != nil {
+				return SQLiteResponse{}, *event.Error
+			}
+			if event.ChunkIndex == 0 {
+				response.Columns = append([]string(nil), event.Columns...)
+			}
+			response.Values = append(response.Values, event.SQLiteValues...)
+			response.RowsAffected = event.RowsAffected
+			response.LastInsertID = cloneInt64Pointer(event.LastInsertID)
+			if event.Done {
+				if len(response.Columns) == 0 && len(response.Values) != 0 {
+					return SQLiteResponse{}, errors.New("SQLite result has values without columns")
+				}
+				if len(response.Columns) != 0 && len(response.Values)%len(response.Columns) != 0 {
+					return SQLiteResponse{}, errors.New("SQLite result is not rectangular")
+				}
+				return response, nil
+			}
+		case <-ctx.Done():
+			s.pump.abandonSQLiteWaiter(requestID)
+			return SQLiteResponse{}, ctx.Err()
+		case <-s.done:
+			s.pump.abandonSQLiteWaiter(requestID)
+			return SQLiteResponse{}, ErrShuttingDown
+		case <-s.pump.done:
+			s.pump.abandonSQLiteWaiter(requestID)
+			return SQLiteResponse{}, ErrShuttingDown
+		}
+	}
+}
+
+func sqliteDeadlineMillis(ctx context.Context) (uint32, error) {
+	timeout := defaultSQLiteTimeout
+	if deadline, ok := ctx.Deadline(); ok {
+		timeout = time.Until(deadline)
+	}
+	if timeout <= 0 {
+		return 0, context.DeadlineExceeded
+	}
+	milliseconds := timeout.Milliseconds()
+	if timeout%time.Millisecond != 0 {
+		milliseconds++
+	}
+	if milliseconds > int64(^uint32(0)) {
+		milliseconds = int64(^uint32(0))
+	}
+	return uint32(milliseconds), nil
+}
+
+func durationMillis64(duration time.Duration) uint64 {
+	if duration <= 0 {
+		return 0
+	}
+	milliseconds := duration.Milliseconds()
+	if duration%time.Millisecond != 0 {
+		milliseconds++
+	}
+	return uint64(milliseconds)
+}
+
 func (s *ActorSession) completeSave(event wire.Event) bool {
 	s.saveStateMu.Lock()
 	result := s.saveResult
@@ -774,10 +960,29 @@ func (s *ActorSession) beginSave() error {
 	return nil
 }
 
+func (s *ActorSession) beginSQLite() error {
+	s.lifecycleMu.Lock()
+	defer s.lifecycleMu.Unlock()
+	if !s.accepting {
+		return ErrShuttingDown
+	}
+	s.activeSQLite++
+	return nil
+}
+
+func (s *ActorSession) finishSQLite() {
+	s.lifecycleMu.Lock()
+	s.activeSQLite--
+	if s.activeSaves == 0 && s.activeSQLite == 0 {
+		s.lifecycleCond.Broadcast()
+	}
+	s.lifecycleMu.Unlock()
+}
+
 func (s *ActorSession) finishSave() {
 	s.lifecycleMu.Lock()
 	s.activeSaves--
-	if s.activeSaves == 0 {
+	if s.activeSaves == 0 && s.activeSQLite == 0 {
 		s.lifecycleCond.Broadcast()
 	}
 	s.lifecycleMu.Unlock()
@@ -795,7 +1000,7 @@ func (s *ActorSession) isAccepting() bool {
 func (s *ActorSession) closeGracefully() {
 	s.lifecycleMu.Lock()
 	s.accepting = false
-	for s.activeSaves != 0 {
+	for s.activeSaves != 0 || s.activeSQLite != 0 {
 		s.lifecycleCond.Wait()
 	}
 	s.closeDoneLocked()
@@ -812,7 +1017,7 @@ func (s *ActorSession) abort() {
 	s.lifecycleMu.Lock()
 	s.accepting = false
 	s.closeDoneLocked()
-	for s.activeSaves != 0 {
+	for s.activeSaves != 0 || s.activeSQLite != 0 {
 		s.lifecycleCond.Wait()
 	}
 	s.lifecycleMu.Unlock()
@@ -846,6 +1051,22 @@ func cloneBytesOrEmpty(data []byte) []byte {
 		return []byte{}
 	}
 	return cloneBytes(data)
+}
+
+func cloneStringPointer(value *string) *string {
+	if value == nil {
+		return nil
+	}
+	cloned := *value
+	return &cloned
+}
+
+func cloneInt64Pointer(value *int64) *int64 {
+	if value == nil {
+		return nil
+	}
+	cloned := *value
+	return &cloned
 }
 
 func cloneStringMap(values map[string]string) map[string]string {
@@ -966,6 +1187,7 @@ type Pump struct {
 	intentTimeout   time.Duration
 	httpSubmitLimit time.Duration
 	wsSubmitLimit   time.Duration
+	sqliteTransport string
 	handlers        map[string]ActorHandler
 
 	started      atomic.Bool
@@ -987,6 +1209,9 @@ type Pump struct {
 	nextIntentID  atomic.Uint64
 	intentMu      sync.Mutex
 	intentPending map[uint64]chan wire.Event
+	nextSQLiteID  atomic.Uint64
+	sqliteMu      sync.Mutex
+	sqlitePending map[uint64]chan wire.Event
 	lateSaves     map[actorIdentity]struct{}
 	httpMu        sync.Mutex
 	httpPending   map[uint64]*httpRequestState
@@ -1029,6 +1254,7 @@ func NewWithOptions(runner Runner, handlers map[string]ActorHandler, options Opt
 		intentTimeout:   defaultIntentTimeout,
 		httpSubmitLimit: defaultHTTPSubmitLimit,
 		wsSubmitLimit:   defaultWSSubmitLimit,
+		sqliteTransport: options.SQLiteTransport,
 		handlers:        ownedHandlers,
 		submitQueue:     make(chan submitRequest, defaultSubmitQueue),
 		submitStop:      make(chan struct{}),
@@ -1037,6 +1263,7 @@ func NewWithOptions(runner Runner, handlers map[string]ActorHandler, options Opt
 		actors:          make(map[actorIdentity]*actorWorker),
 		kvPending:       make(map[uint64]chan wire.Event),
 		intentPending:   make(map[uint64]chan wire.Event),
+		sqlitePending:   make(map[uint64]chan wire.Event),
 		lateSaves:       make(map[actorIdentity]struct{}),
 		httpPending:     make(map[uint64]*httpRequestState),
 		websockets:      make(map[string]websocketOwner),
@@ -1151,6 +1378,7 @@ func (p *Pump) pollLoop(ctx context.Context) {
 		p.submitWG.Wait()
 		p.failKVWaiters()
 		p.failActorIntentWaiters()
+		p.failSQLiteWaiters()
 		p.hooks.stop()
 		p.runner.Close()
 		p.closeSubscribers()
@@ -1285,12 +1513,14 @@ func (p *Pump) handleInternalEvent(event wire.Event) error {
 		identity := actorIdentity{aid: event.AID, generation: event.Generation}
 		workerCtx, cancel := context.WithCancel(context.Background())
 		session := &ActorSession{
-			pump:           p,
-			identity:       identity,
-			input:          cloneBytes(event.Input),
-			persistedState: cloneBytes(event.PersistedState),
-			done:           make(chan struct{}),
-			accepting:      true,
+			pump:             p,
+			identity:         identity,
+			input:            cloneBytes(event.Input),
+			persistedState:   cloneBytes(event.PersistedState),
+			done:             make(chan struct{}),
+			accepting:        true,
+			sqliteTransport:  p.sqliteTransport,
+			sqliteSocketPath: event.SQLiteSocketPath,
 		}
 		session.lifecycleCond = sync.NewCond(&session.lifecycleMu)
 		worker := &actorWorker{
@@ -1469,6 +1699,17 @@ func (p *Pump) handleInternalEvent(event wire.Event) error {
 		p.kvMu.Unlock()
 		if result == nil {
 			return nil // A caller may have canceled after the command was enqueued.
+		}
+		result <- event
+	case wire.EventSQLiteResult:
+		p.sqliteMu.Lock()
+		result, exists := p.sqlitePending[event.SQLiteRequestID]
+		if event.Done {
+			delete(p.sqlitePending, event.SQLiteRequestID)
+		}
+		p.sqliteMu.Unlock()
+		if !exists || result == nil {
+			return nil
 		}
 		result <- event
 	}
@@ -2099,6 +2340,44 @@ func (p *Pump) failActorIntentWaiters() {
 		delete(p.intentPending, operationID)
 	}
 	p.intentMu.Unlock()
+}
+
+func (p *Pump) addSQLiteWaiter(result chan wire.Event) uint64 {
+	p.sqliteMu.Lock()
+	defer p.sqliteMu.Unlock()
+	for {
+		requestID := p.nextSQLiteID.Add(1)
+		if requestID == 0 {
+			continue
+		}
+		if _, pending := p.sqlitePending[requestID]; pending {
+			continue
+		}
+		p.sqlitePending[requestID] = result
+		return requestID
+	}
+}
+
+func (p *Pump) removeSQLiteWaiter(requestID uint64) {
+	p.sqliteMu.Lock()
+	delete(p.sqlitePending, requestID)
+	p.sqliteMu.Unlock()
+}
+
+func (p *Pump) abandonSQLiteWaiter(requestID uint64) {
+	p.sqliteMu.Lock()
+	if _, pending := p.sqlitePending[requestID]; pending {
+		p.sqlitePending[requestID] = nil
+	}
+	p.sqliteMu.Unlock()
+}
+
+func (p *Pump) failSQLiteWaiters() {
+	p.sqliteMu.Lock()
+	for requestID := range p.sqlitePending {
+		delete(p.sqlitePending, requestID)
+	}
+	p.sqliteMu.Unlock()
 }
 
 func (p *Pump) stopSubmissions() {

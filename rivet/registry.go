@@ -39,6 +39,10 @@ type Config struct {
 	TotalSlots      uint32
 	LogLevel        string
 	ShutdownTimeout time.Duration
+	// SQLiteTransport selects the per-actor SQL path. Set it to "ffi" or
+	// "socket"; the empty value leaves the public SQLite API disabled so this
+	// milestone does not encode a default before the benchmark is reviewed.
+	SQLiteTransport SQLiteTransport
 	Hooks           Hooks
 	// Logger receives structured SDK lifecycle records. Nil discards Go-side
 	// logs. LogLevel separately configures the pinned native runtime.
@@ -134,6 +138,12 @@ func (r *Registry) Serve(ctx context.Context, config Config) error {
 
 	actorNames, actorActions, actorHibernateWebSockets, handlers := r.snapshotActors()
 	config = withDefaults(config)
+	if override := os.Getenv("RIVET_GO_SQLITE_TRANSPORT"); override != "" {
+		config.SQLiteTransport = SQLiteTransport(override)
+	}
+	if err := validateSQLiteTransport(config.SQLiteTransport); err != nil {
+		return err
+	}
 	encoded, err := wire.EncodeRunnerConfig(wire.RunnerConfig{
 		EngineEndpoint:           config.Endpoint,
 		Namespace:                config.Namespace,
@@ -143,6 +153,7 @@ func (r *Registry) Serve(ctx context.Context, config Config) error {
 		ActorNames:               actorNames,
 		ActorActions:             actorActions,
 		ActorHibernateWebSockets: actorHibernateWebSockets,
+		SQLiteTransport:          string(config.SQLiteTransport),
 		LogLevel:                 config.LogLevel,
 	})
 	if err != nil {
@@ -177,6 +188,7 @@ func (r *Registry) Serve(ctx context.Context, config Config) error {
 		Hooks:           config.Hooks,
 		Logger:          config.Logger,
 		ShutdownTimeout: config.ShutdownTimeout,
+		SQLiteTransport: string(config.SQLiteTransport),
 	}).Run(serveCtx)
 }
 

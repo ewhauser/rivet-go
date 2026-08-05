@@ -65,6 +65,8 @@ pub(crate) struct RunnerConfig {
     pub actor_actions: BTreeMap<String, Vec<String>>,
     #[serde(default)]
     pub actor_hibernate_websockets: BTreeMap<String, bool>,
+    #[serde(default)]
+    pub sqlite_transport: String,
     pub log_level: String,
 }
 
@@ -98,6 +100,8 @@ pub(crate) enum Event {
         input: Vec<u8>,
         #[serde(default, with = "optional_bytes")]
         persisted_state: Option<Vec<u8>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sqlite_socket_path: Option<String>,
     },
     ActorStop {
         aid: String,
@@ -185,6 +189,19 @@ pub(crate) enum Event {
         #[serde(skip_serializing_if = "Option::is_none")]
         error: Option<WireError>,
     },
+    SqliteResult {
+        request_id: u64,
+        chunk_index: u32,
+        done: bool,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        columns: Vec<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        values: Vec<SqliteValue>,
+        rows_affected: i64,
+        last_insert_id: Option<i64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<WireError>,
+    },
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -199,6 +216,10 @@ pub(crate) struct DrainReport {
 pub(crate) struct WireError {
     pub code: String,
     pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sqlite_code: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub statement_index: Option<u32>,
 }
 
 impl WireError {
@@ -206,8 +227,29 @@ impl WireError {
         Self {
             code: code.into(),
             message: message.into(),
+            sqlite_code: None,
+            statement_index: None,
         }
     }
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub(crate) enum SqliteValue {
+    Null,
+    Integer {
+        integer: i64,
+    },
+    Real {
+        bits: u64,
+    },
+    Text {
+        text: String,
+    },
+    Blob {
+        #[serde(with = "serde_bytes")]
+        blob: Vec<u8>,
+    },
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -356,6 +398,53 @@ pub(crate) enum Command {
         aid: String,
         #[serde(with = "serde_bytes")]
         key: Vec<u8>,
+    },
+    SqliteExec {
+        request_id: u64,
+        aid: String,
+        #[serde(default)]
+        r#gen: u64,
+        sql: String,
+        #[serde(default)]
+        args: Vec<SqliteValue>,
+        lease_key: Option<String>,
+        deadline_ms: u32,
+    },
+    SqliteQuery {
+        request_id: u64,
+        aid: String,
+        #[serde(default)]
+        r#gen: u64,
+        sql: String,
+        #[serde(default)]
+        args: Vec<SqliteValue>,
+        lease_key: Option<String>,
+        deadline_ms: u32,
+    },
+    SqliteBegin {
+        request_id: u64,
+        aid: String,
+        #[serde(default)]
+        r#gen: u64,
+        lease_key: String,
+        timeout_ms: u64,
+        deadline_ms: u32,
+    },
+    SqliteCommit {
+        request_id: u64,
+        aid: String,
+        #[serde(default)]
+        r#gen: u64,
+        lease_key: String,
+        deadline_ms: u32,
+    },
+    SqliteRollback {
+        request_id: u64,
+        aid: String,
+        #[serde(default)]
+        r#gen: u64,
+        lease_key: String,
+        deadline_ms: u32,
     },
     #[serde(other)]
     Unknown,
@@ -575,11 +664,120 @@ impl CommandBatch {
                         ));
                     }
                 }
+                Command::SqliteExec {
+                    request_id,
+                    aid,
+                    sql,
+                    args,
+                    lease_key,
+                    deadline_ms,
+                    ..
+                }
+                | Command::SqliteQuery {
+                    request_id,
+                    aid,
+                    sql,
+                    args,
+                    lease_key,
+                    deadline_ms,
+                    ..
+                } => {
+                    require_sqlite_request(*request_id, aid, *deadline_ms)?;
+                    require_sql(sql, args)?;
+                    require_optional_lease(lease_key.as_deref())?;
+                }
+                Command::SqliteBegin {
+                    request_id,
+                    aid,
+                    lease_key,
+                    timeout_ms,
+                    deadline_ms,
+                    ..
+                } => {
+                    require_sqlite_request(*request_id, aid, *deadline_ms)?;
+                    require_lease(lease_key)?;
+                    if *timeout_ms == 0 {
+                        return Err("sqlite_begin timeout_ms must be greater than zero".to_owned());
+                    }
+                }
+                Command::SqliteCommit {
+                    request_id,
+                    aid,
+                    lease_key,
+                    deadline_ms,
+                    ..
+                }
+                | Command::SqliteRollback {
+                    request_id,
+                    aid,
+                    lease_key,
+                    deadline_ms,
+                    ..
+                } => {
+                    require_sqlite_request(*request_id, aid, *deadline_ms)?;
+                    require_lease(lease_key)?;
+                }
                 Command::Unknown => return Err("unknown command".to_owned()),
             }
         }
         Ok(())
     }
+}
+
+fn require_sqlite_request(request_id: u64, aid: &str, deadline_ms: u32) -> Result<(), String> {
+    require_aid(aid)?;
+    require_correlation("sqlite", request_id)?;
+    if deadline_ms == 0 {
+        return Err("sqlite request deadline_ms must be greater than zero".to_owned());
+    }
+    Ok(())
+}
+
+fn require_sql(sql: &str, args: &[SqliteValue]) -> Result<(), String> {
+    if sql.trim().is_empty() {
+        return Err("sqlite SQL must not be empty".to_owned());
+    }
+    if sql.len() > MAX_BODY_CHUNK {
+        return Err(format!(
+            "sqlite SQL exceeds boundary maximum {MAX_BODY_CHUNK} bytes"
+        ));
+    }
+    if args.len() > 1_024 {
+        return Err("sqlite args exceed boundary maximum 1024".to_owned());
+    }
+    for value in args {
+        match value {
+            SqliteValue::Text { text } if text.len() > MAX_BODY_CHUNK => {
+                return Err(format!(
+                    "sqlite text value exceeds boundary maximum {MAX_BODY_CHUNK} bytes"
+                ));
+            }
+            SqliteValue::Blob { blob } if blob.len() > MAX_BODY_CHUNK => {
+                return Err(format!(
+                    "sqlite blob value exceeds boundary maximum {MAX_BODY_CHUNK} bytes"
+                ));
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+fn require_optional_lease(lease_key: Option<&str>) -> Result<(), String> {
+    if let Some(lease_key) = lease_key {
+        require_lease(lease_key)?;
+    }
+    Ok(())
+}
+
+fn require_lease(lease_key: &str) -> Result<(), String> {
+    if lease_key.is_empty() {
+        return Err("sqlite lease_key must not be empty".to_owned());
+    }
+    if lease_key.len() > 256 {
+        return Err("sqlite lease_key exceeds boundary maximum 256 bytes".to_owned());
+    }
+    Ok(())
 }
 
 fn require_aid(aid: &str) -> Result<(), String> {
@@ -689,6 +887,12 @@ mod tests {
         exclude_conn: Option<&'static str>,
         alarm_ts: Option<i64>,
         op_id: u64,
+        request_id: u64,
+        sql: &'static str,
+        args: Vec<SqliteValue>,
+        lease_key: Option<&'static str>,
+        deadline_ms: u32,
+        timeout_ms: u64,
     }
 
     #[derive(Serialize)]
@@ -731,6 +935,12 @@ mod tests {
             exclude_conn: None,
             alarm_ts: None,
             op_id: 0,
+            request_id: 0,
+            sql: "",
+            args: Vec::new(),
+            lease_key: None,
+            deadline_ms: 0,
+            timeout_ms: 0,
         }
     }
 
@@ -757,6 +967,7 @@ mod tests {
             actor_names: vec!["counter".to_owned()],
             actor_actions: BTreeMap::from([("counter".to_owned(), vec!["increment".to_owned()])]),
             actor_hibernate_websockets: BTreeMap::from([("counter".to_owned(), true)]),
+            sqlite_transport: "ffi".to_owned(),
             log_level: "info".to_owned(),
         };
         write_golden(
@@ -816,6 +1027,7 @@ mod tests {
                 create_ts: 0,
                 input: b"input".to_vec(),
                 persisted_state: Some(b"state".to_vec()),
+                sqlite_socket_path: None,
             }],
         };
         write_golden(
@@ -833,6 +1045,7 @@ mod tests {
                 create_ts: 0,
                 input: Vec::new(),
                 persisted_state: None,
+                sqlite_socket_path: None,
             }],
         };
         write_golden(
@@ -852,6 +1065,7 @@ mod tests {
                 create_ts: 0,
                 input: Vec::new(),
                 persisted_state: Some(Vec::new()),
+                sqlite_socket_path: None,
             }],
         };
         write_golden(
@@ -999,6 +1213,38 @@ mod tests {
         write_golden(
             "event_ws_close.msgpack",
             &ws_close.encode().expect("encode WebSocket close event"),
+        );
+
+        let sqlite_result = EventBatch {
+            seq: 19,
+            events: vec![Event::SqliteResult {
+                request_id: 51,
+                chunk_index: 0,
+                done: true,
+                columns: vec![
+                    "i".to_owned(),
+                    "r".to_owned(),
+                    "t".to_owned(),
+                    "b".to_owned(),
+                ],
+                values: vec![
+                    SqliteValue::Integer { integer: 7 },
+                    SqliteValue::Real {
+                        bits: 1.5f64.to_bits(),
+                    },
+                    SqliteValue::Text {
+                        text: "hello".to_owned(),
+                    },
+                    SqliteValue::Blob { blob: Vec::new() },
+                ],
+                rows_affected: 1,
+                last_insert_id: Some(9),
+                error: None,
+            }],
+        };
+        write_golden(
+            "event_sqlite_result.msgpack",
+            &sqlite_result.encode().expect("encode SQLite result event"),
         );
 
         let kv_result = EventBatch {
@@ -1154,6 +1400,45 @@ mod tests {
             .expect("Rust command decoder accepts the full Go M5 command shape");
         assert_eq!(decoded.commands.len(), 4);
         write_golden("command_m5.msgpack", &command_m5);
+
+        let mut exec = golden_command("sqlite_exec");
+        exec.request_id = 51;
+        exec.r#gen = 9;
+        exec.sql = "INSERT INTO todo(title) VALUES (?)";
+        exec.args = vec![SqliteValue::Text {
+            text: "ship".to_owned(),
+        }];
+        exec.deadline_ms = 65_000;
+        let mut query = golden_command("sqlite_query");
+        query.request_id = 52;
+        query.r#gen = 9;
+        query.sql = "SELECT ?";
+        query.args = vec![SqliteValue::Integer { integer: 7 }];
+        query.deadline_ms = 65_000;
+        let mut begin = golden_command("sqlite_begin");
+        begin.request_id = 53;
+        begin.r#gen = 9;
+        begin.lease_key = Some("lease-golden");
+        begin.deadline_ms = 65_000;
+        begin.timeout_ms = 60_000;
+        let mut commit = golden_command("sqlite_commit");
+        commit.request_id = 54;
+        commit.r#gen = 9;
+        commit.lease_key = Some("lease-golden");
+        commit.deadline_ms = 65_000;
+        let mut rollback = golden_command("sqlite_rollback");
+        rollback.request_id = 55;
+        rollback.r#gen = 9;
+        rollback.lease_key = Some("lease-other");
+        rollback.deadline_ms = 65_000;
+        let command_m7 = rmp_serde::to_vec_named(&GoldenCommandBatch {
+            commands: vec![exec, query, begin, commit, rollback],
+        })
+        .expect("encode M7 command batch");
+        let decoded = CommandBatch::decode(&command_m7)
+            .expect("Rust command decoder accepts the full Go M7 command shape");
+        assert_eq!(decoded.commands.len(), 5);
+        write_golden("command_m7.msgpack", &command_m7);
     }
 
     #[test]
