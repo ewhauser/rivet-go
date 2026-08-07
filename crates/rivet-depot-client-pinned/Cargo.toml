@@ -2,6 +2,9 @@
 name = "rivet-depot-client"
 version = "2.3.10"
 edition = "2024"
+# Vendored from rivet-dev/rivet v2.3.10 (Apache-2.0) with the zero-length
+# BLOB decoder correction documented in docs/FFI-BOUNDARY.md.
+license = "Apache-2.0"
 publish = false
 description = "Pinned Rivet Depot client with the documented zero-length BLOB correction"
 

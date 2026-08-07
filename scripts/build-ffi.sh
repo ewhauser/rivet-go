@@ -210,4 +210,13 @@ if [[ ! -f "$CHECKSUMS_PATH" ]] || ! cmp -s "$checksums_tmp" "$CHECKSUMS_PATH"; 
   mv "$checksums_tmp" "$CHECKSUMS_PATH"
 fi
 
+# Regenerate the third-party license inventory for the statically linked
+# crates whenever the shipped binaries change. cargo-about is required so the
+# committed THIRD-PARTY-NOTICES.md can never drift silently from Cargo.lock.
+if ! command -v cargo-about >/dev/null 2>&1; then
+  echo "error: cargo-about is required (cargo install cargo-about --locked --features cli)" >&2
+  exit 1
+fi
+(cd "$ROOT_DIR" && cargo about generate --features ffi-test about.hbs -o THIRD-PARTY-NOTICES.md)
+
 echo "Wrote internal/ffi/lib/$platform/$artifact_name"
