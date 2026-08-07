@@ -258,6 +258,65 @@ func gatewayAction[T any](
 	if err != nil {
 		return output, err
 	}
+	return decodeGatewayAction[T](action, status, body)
+}
+
+// gatewayActionEventually behaves like gatewayAction but keeps retrying while
+// the engine is unreachable, answers plain 503 "Actor not found", or reports
+// a transient actor transition, bounded by ctx. After abrupt engine
+// replacement, v2.3.10's
+// replacement process completes workflow-worker failover roughly 30 seconds
+// after start — beyond the 22-second generation liveness window — and until
+// then a request that must wake a sleeping actor parks in gateway route
+// dispatch. At the failover boundary it can spuriously fail with 503 "Actor
+// not found" or with actor/stopping against the mid-teardown stale
+// generation, even though the actor's persisted state is intact and it wakes
+// moments later. Any other failure is returned immediately.
+func gatewayActionEventually[T any](
+	ctx context.Context,
+	api *engineAPI,
+	actorID, action string,
+	argument any,
+) (T, error) {
+	var output T
+	var terminal error
+	if err := waitUntil(ctx, 250*time.Millisecond, func() (bool, error) {
+		status, body, err := gatewayActionResponse(ctx, api, actorID, action, argument)
+		if err != nil {
+			return false, err
+		}
+		if status == http.StatusServiceUnavailable && strings.TrimSpace(string(body)) == "Actor not found" {
+			return false, fmt.Errorf("action %s returned %d: %s", action, status, body)
+		}
+		if status != http.StatusOK {
+			var failure actionFailure
+			if json.Unmarshal(body, &failure) == nil && transientActionFailure(failure) {
+				return false, fmt.Errorf("action %s transiently failed: %s/%s: %s",
+					action, failure.Group, failure.Code, failure.Message)
+			}
+		}
+		output, terminal = decodeGatewayAction[T](action, status, body)
+		return true, nil
+	}); err != nil {
+		return output, err
+	}
+	return output, terminal
+}
+
+// transientActionFailure reports the engine failure codes observed when a
+// wake-requiring request resolves at the post-replacement failover boundary:
+// the gateway can hand the wake to a generation that is mid-teardown
+// (actor/stopping) or not yet rehydrated (actor/not_ready). Both clear once
+// failover finishes; every other code stays terminal.
+func transientActionFailure(failure actionFailure) bool {
+	if failure.Group != "actor" {
+		return false
+	}
+	return failure.Code == "stopping" || failure.Code == "not_ready"
+}
+
+func decodeGatewayAction[T any](action string, status int, body []byte) (T, error) {
+	var output T
 	if status != http.StatusOK {
 		var failure actionFailure
 		if decodeErr := json.Unmarshal(body, &failure); decodeErr != nil {

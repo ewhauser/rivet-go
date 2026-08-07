@@ -152,13 +152,33 @@ go run ./cmd/soak \
 
 Record the printed seed and complete final summary with the release evidence.
 
-A captured default-profile failure on 2026-08-05 showed that the pinned engine
-can still return plain `503 Actor not found` for the alarm actor just after the
-nominal 22-second restart settlement. The harness now retries only that exact
-response and the existing structured `actor/stopping` transition within its
-30-second rehydration budget. Earlier uncaptured 2026-08-03/04 failures cannot
-be attributed retroactively. Preserve the printed summary and failure data
-directory from any future failure.
+Resolved intermittent (observed 2026-08-03/04/05, root-caused and fixed
+2026-08-07): rare exit-1 soak failures — one `-duration=2m -intensity=4` run
+(2026-08-03) and default-profile runs (2026-08-04/05) — each passing on
+immediate rerun, roughly one in ten short runs. Captured with full output on
+the default profile (2026-08-05, and 2026-08-07 at seed
+`1785863143857976000` plus a same-seed replay): the engine-restart chaos
+cycle's demand rehydration (`resleep` on the sleeping alarm actor) failed
+spuriously — as plain `503 Actor not found` or as the structured
+`actor/stopping` transition against the mid-teardown stale generation. Root
+cause: the replacement engine process completes workflow-worker failover
+about 30 seconds after start — beyond the 22-second generation liveness
+settlement — and a wake-requiring gateway request issued in that gap parks in
+route dispatch. It usually completes once failover lands, but at the failover
+boundary it can instead resolve to one of those signatures even though the
+actor's persisted state is intact (its next-generation SQLite preload
+succeeds moments later in the same engine log). This was a harness robustness
+gap against pinned-engine recovery behavior, not an SDK defect; the SDK never
+observes the failed request. The harness now retries exactly the transient
+signatures — plain `503 Actor not found`, `actor/stopping`, and
+`actor/not_ready` — for that one rehydration probe within its 30-second
+budget (`gatewayActionEventually` in `cmd/soak/gateway.go`); a successful
+probe implies failover has completed before the workload resumes, and every
+strict oracle still runs unchanged afterward. The 2026-08-03 failure's output
+was never captured; it is attributed to the same signature because the
+restart cadence is identical at both intensities, but that attribution is
+presumed, not proven. Always redirect soak output to a file and preserve the
+printed summary and failure data directory from any failing run.
 The harness fails if any required chaos knob did not activate, if its Go truth
 model differs field-by-field from engine-persisted actor state, if any live
 client sees a missing or duplicate broadcast, if sequence values regress, or

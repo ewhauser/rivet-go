@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"log/slog"
 	"math/rand/v2"
-	"net/http"
 	"os"
 	"os/signal"
 	"runtime"
@@ -1062,30 +1061,19 @@ func (r *soakRun) restartChaos(ctx context.Context, _ int) error {
 			return fmt.Errorf("reconnect client after engine restart: %w", err)
 		}
 	}
-	var actual alarmState
+	// This demand rehydration must wake the sleeping alarm actor, which needs
+	// the replacement engine's workflow worker. Failover lands about 30 seconds
+	// after engine start on this pin — after the liveness settlement above — so
+	// the wake can transiently fail at the failover boundary: the pin returns
+	// either plain 503 "Actor not found" or a structured actor/stopping error
+	// until failover assigns a wakeable generation. Retry only those signatures
+	// within a 30-second budget; success implies failover has completed, which
+	// keeps the rest of this cycle and the resumed workload off that window.
 	rehydrateCtx, cancelRehydrate := context.WithTimeout(ctx, 30*time.Second)
 	defer cancelRehydrate()
-	retry := time.NewTicker(100 * time.Millisecond)
-	defer retry.Stop()
-	for {
-		var err error
-		actual, err = gatewayAction[alarmState](rehydrateCtx, r.api, r.alarmActor, "resleep", struct{}{})
-		if err == nil {
-			break
-		}
-		// The old generation can still be completing its loss transition after
-		// the new engine advertises the actor. The pin returns either a structured
-		// stopping error or a plain 503 until failover assigns a wakeable
-		// generation. Every other failure is final.
-		if !isActionFailure(err, "actor", "stopping") &&
-			!isActionStatus(err, http.StatusServiceUnavailable, "Actor not found") {
-			return fmt.Errorf("rehydrate alarm actor after engine restart: %w", err)
-		}
-		select {
-		case <-rehydrateCtx.Done():
-			return fmt.Errorf("rehydrate alarm actor after engine restart: %w", rehydrateCtx.Err())
-		case <-retry.C:
-		}
+	actual, err := gatewayActionEventually[alarmState](rehydrateCtx, r.api, r.alarmActor, "resleep", struct{}{})
+	if err != nil {
+		return fmt.Errorf("rehydrate alarm actor after engine restart: %w", err)
 	}
 	if err := waitUntil(ctx, 25*time.Millisecond, func() (bool, error) {
 		compareErr := compareAlarm(actual, r.alarmOracle.truth())
