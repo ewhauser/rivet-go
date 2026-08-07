@@ -81,3 +81,6 @@ func (*Error) Close() {}
 
 // SetLogger is a no-op for an unsupported-platform error.
 func (*Error) SetLogger(*slog.Logger) {}
+
+// Prefetch is unavailable on unsupported platforms.
+func Prefetch() ([]string, error) { return nil, errUnsupportedPlatform }

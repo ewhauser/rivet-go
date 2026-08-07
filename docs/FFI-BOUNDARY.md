@@ -18,7 +18,10 @@ The contract between `crates/rivetkit-go-ffi` (Rust, embeds rivetkit-core) and
 4. **The boundary is versioned.** `runner_abi_version()` returns a monotonic
    integer; Go refuses to load a dylib with an unexpected version. The msgpack
    envelope carries no per-message version — the ABI version covers the whole
-   contract, and dylib + Go code ship together in one module.
+   contract. The dylib ships as a release asset whose tag and SHA-256 are both
+   pinned in the Go source (`internal/ffi/acquire.go`,
+   `internal/ffi/checksums.txt`), so a given commit still loads exactly one
+   library even though the bytes live outside the module.
 
 ## C ABI surface
 

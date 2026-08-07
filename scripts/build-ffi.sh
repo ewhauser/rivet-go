@@ -194,29 +194,55 @@ if [[ ! -f "$ABI_GO_PATH" ]] || ! cmp -s "$abi_tmp" "$ABI_GO_PATH"; then
   mv "$abi_tmp" "$ABI_GO_PATH"
 fi
 
+# Update only this platform's line in the pinned checksum manifest; other
+# platforms' artifacts are not present locally (they ship as release assets),
+# so the manifest must never be regenerated from local directory contents.
+digest="$(
+  if command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$lib_dir/$artifact_name"
+  else
+    sha256sum "$lib_dir/$artifact_name"
+  fi | awk '{ print $1 }'
+)"
+manifest_key="lib/$platform/$artifact_name"
 checksums_tmp="$(mktemp "$ROOT_DIR/internal/ffi/.checksums.XXXXXX")"
 trap 'rm -f "$abi_tmp" "$checksums_tmp"' EXIT
-(
-  cd "$ROOT_DIR/internal/ffi"
-  find lib -type f | LC_ALL=C sort | while IFS= read -r file; do
-    if command -v shasum >/dev/null 2>&1; then
-      shasum -a 256 "$file"
-    else
-      sha256sum "$file"
-    fi
-  done
-) >"$checksums_tmp"
-if [[ ! -f "$CHECKSUMS_PATH" ]] || ! cmp -s "$checksums_tmp" "$CHECKSUMS_PATH"; then
+{
+  if [[ -f "$CHECKSUMS_PATH" ]]; then
+    grep -v " $manifest_key\$" "$CHECKSUMS_PATH" || true
+  fi
+  printf '%s  %s\n' "$digest" "$manifest_key"
+} | LC_ALL=C sort -k2 >"$checksums_tmp"
+if ! cmp -s "$checksums_tmp" "$CHECKSUMS_PATH"; then
   mv "$checksums_tmp" "$CHECKSUMS_PATH"
 fi
+
+# Seed the local acquisition cache so development and CI on this machine never
+# download the artifact they just built. Mirrors internal/ffi's cache layout.
+case "$(uname -s)" in
+  Darwin) cache_root="${HOME}/Library/Caches" ;;
+  MINGW*|MSYS*|CYGWIN*) cache_root="${LOCALAPPDATA:-$HOME/AppData/Local}" ;;
+  *) cache_root="${XDG_CACHE_HOME:-$HOME/.cache}" ;;
+esac
+cache_dir="$cache_root/rivet-go/$digest"
+mkdir -p "$cache_dir"
+chmod 700 "$cache_root/rivet-go" "$cache_dir" 2>/dev/null || true
+cache_tmp="$(mktemp "$cache_dir/$artifact_name.tmp-XXXXXX")"
+cp "$lib_dir/$artifact_name" "$cache_tmp"
+chmod 500 "$cache_tmp"
+mv -f "$cache_tmp" "$cache_dir/$artifact_name"
 
 # Regenerate the third-party license inventory for the statically linked
 # crates whenever the shipped binaries change. cargo-about is required so the
 # committed THIRD-PARTY-NOTICES.md can never drift silently from Cargo.lock.
-if ! command -v cargo-about >/dev/null 2>&1; then
-  echo "error: cargo-about is required (cargo install cargo-about --locked --features cli)" >&2
-  exit 1
+# CI's per-platform build jobs set RIVET_GO_SKIP_NOTICES=1 because the lint
+# job checks notice drift once, with cargo-about installed there.
+if [[ "${RIVET_GO_SKIP_NOTICES:-0}" != "1" ]]; then
+  if ! command -v cargo-about >/dev/null 2>&1; then
+    echo "error: cargo-about is required (cargo install cargo-about --locked --features cli)" >&2
+    exit 1
+  fi
+  (cd "$ROOT_DIR" && cargo about generate --features ffi-test about.hbs -o THIRD-PARTY-NOTICES.md)
 fi
-(cd "$ROOT_DIR" && cargo about generate --features ffi-test about.hbs -o THIRD-PARTY-NOTICES.md)
 
-echo "Wrote internal/ffi/lib/$platform/$artifact_name"
+echo "Wrote internal/ffi/lib/$platform/$artifact_name (sha256 $digest, cached at $cache_dir)"

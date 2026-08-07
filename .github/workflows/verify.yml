@@ -21,26 +21,38 @@ jobs:
             runner: macos-14
             rust_target: aarch64-apple-darwin
             libc: native
+            platform: darwin_arm64
+            artifact: librivetkit_go_ffi.dylib
           - name: linux-amd64-gnu
             runner: ubuntu-latest
             rust_target: x86_64-unknown-linux-gnu
             libc: gnu
+            platform: linux_amd64
+            artifact: librivetkit_go_ffi.so
           - name: linux-arm64-gnu
             runner: ubuntu-24.04-arm
             rust_target: aarch64-unknown-linux-gnu
             libc: gnu
+            platform: linux_arm64
+            artifact: librivetkit_go_ffi.so
           - name: linux-amd64-musl
             runner: ubuntu-latest
             rust_target: x86_64-unknown-linux-musl
             libc: musl
+            platform: linux_amd64_musl
+            artifact: librivetkit_go_ffi.so
           - name: linux-arm64-musl
             runner: ubuntu-24.04-arm
             rust_target: aarch64-unknown-linux-musl
             libc: musl
+            platform: linux_arm64_musl
+            artifact: librivetkit_go_ffi.so
           - name: windows-amd64
             runner: windows-latest
             rust_target: x86_64-pc-windows-msvc
             libc: native
+            platform: windows_amd64
+            artifact: rivetkit_go_ffi.dll
 
     steps:
       - uses: actions/checkout@v7
@@ -74,37 +86,91 @@ jobs:
       - name: Install cbindgen
         run: cargo install cbindgen --version 0.29.4 --locked
 
-      - name: Test committed native library
-        if: matrix.libc != 'musl'
-        run: go test -short -count=1 -v ./...
+      - name: Build native FFI library
+        shell: bash
+        env:
+          RIVET_GO_SKIP_NOTICES: "1"
+        run: scripts/build-ffi.sh "${{ matrix.rust_target }}"
 
-      - name: Test committed musl library
-        if: matrix.libc == 'musl'
+      - name: Verify generated boundary files are committed
         shell: bash
         run: |
           set -euo pipefail
-          docker run --rm --volume "$PWD:/src" --workdir /src golang:1.26-alpine \
-            sh -ceu 'apk add --no-cache rust >/dev/null && go test -short -count=1 -v ./...'
-
-      - name: Build native FFI library
-        shell: bash
-        run: scripts/build-ffi.sh "${{ matrix.rust_target }}"
+          git diff --exit-code internal/ffi/abi_version_generated.go internal/ffi/include
+          # The checksum manifest must match the release artifacts, which is
+          # enforced at publish time by release.yml; report any local drift.
+          git --no-pager diff internal/ffi/checksums.txt || true
 
       - name: Test Rust crate
         if: matrix.libc != 'musl'
         run: cargo test --workspace --target "${{ matrix.rust_target }}"
 
-      - name: Test rebuilt native library
+      - name: Test with built native library
         if: matrix.libc != 'musl'
+        env:
+          RIVET_GO_FFI_LIB: ${{ github.workspace }}/internal/ffi/lib/${{ matrix.platform }}/${{ matrix.artifact }}
         run: go test -short -count=1 -v ./...
 
-      - name: Test rebuilt musl library
+      - name: Test with built musl library
         if: matrix.libc == 'musl'
         shell: bash
         run: |
           set -euo pipefail
-          docker run --rm --volume "$PWD:/src" --workdir /src golang:1.26-alpine \
+          docker run --rm --volume "$PWD:/src" --workdir /src \
+            --env RIVET_GO_FFI_LIB="/src/internal/ffi/lib/${{ matrix.platform }}/${{ matrix.artifact }}" \
+            golang:1.26-alpine \
             sh -ceu 'apk add --no-cache rust >/dev/null && go test -short -count=1 -v ./...'
+
+  lint:
+    name: lint-and-licenses
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: gofmt
+        run: |
+          set -euo pipefail
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "gofmt needed on:" >&2
+            echo "$unformatted" >&2
+            exit 1
+          fi
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: Unsupported-platform stub builds and passes
+        run: go test -short -count=1 -tags rivetgo_ffi_stub ./internal/ffi/
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install 1.97.0 --profile minimal
+          rustup default 1.97.0
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+
+      - name: Install cargo-deny and cargo-about
+        run: |
+          cargo install cargo-deny --locked
+          cargo install cargo-about --locked --features cli
+
+      - name: License gate
+        run: cargo deny check licenses
+
+      - name: Third-party notices are current
+        run: |
+          set -euo pipefail
+          cargo about generate --features ffi-test about.hbs -o THIRD-PARTY-NOTICES.md
+          git diff --exit-code THIRD-PARTY-NOTICES.md
 
   engine:
     name: linux-amd64-engine
@@ -173,6 +239,23 @@ jobs:
           key: rivet-engine-v2.3.10-${{ runner.os }}-${{ runner.arch }}-957d4e482f404913ca1955d8ecc357533f6fd081-source-cwd-v1
           fail-on-cache-miss: true
 
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install 1.97.0 --profile minimal
+          rustup default 1.97.0
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+
+      - name: Build host native FFI library
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --manifest-path Cargo.toml --package rivetkit-go-ffi \
+            --features ffi-test --locked --release
+          echo "RIVET_GO_FFI_LIB=$PWD/target/release/librivetkit_go_ffi.so" >> "$GITHUB_ENV"
+
       - name: Run real-engine conformance
         shell: bash
         run: |
@@ -212,6 +295,23 @@ jobs:
             ~/.cache/rivet-go/engine-v2.3.10/build.log
           key: rivet-engine-v2.3.10-${{ runner.os }}-${{ runner.arch }}-957d4e482f404913ca1955d8ecc357533f6fd081-source-cwd-v1
           fail-on-cache-miss: true
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install 1.97.0 --profile minimal
+          rustup default 1.97.0
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+
+      - name: Build host native FFI library
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --manifest-path Cargo.toml --package rivetkit-go-ffi \
+            --features ffi-test --locked --release
+          echo "RIVET_GO_FFI_LIB=$PWD/target/release/librivetkit_go_ffi.so" >> "$GITHUB_ENV"
 
       - name: Run strict chaos smoke
         shell: bash

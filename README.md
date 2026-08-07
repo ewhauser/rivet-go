@@ -13,8 +13,20 @@ logging, and dependency-free metrics hooks. Rivet Engine is pinned to
 ## Quickstart
 
 Prerequisites are Go 1.26, Git, Python 3, and Rust 1.97. Rust is needed only when the
-development launcher must build the pinned local engine; applications consume
-the committed native adapter and do not compile Rust.
+development launcher must build the pinned local engine; applications do not
+compile Rust. The SDK's native adapter is not stored in the module: on first
+use the loader downloads this platform's library from the pinned GitHub
+release, verifies it against the SHA-256 recorded in
+`internal/ffi/checksums.txt`, and caches it under the user cache directory
+(about 13 MB, once per version). To pre-seed that cache — for CI images or
+machines that will run offline — run:
+
+```sh
+go run github.com/ewhauser/rivet-go/cmd/rivet-go-fetch
+```
+
+Alternatively download the release asset yourself and point `RIVET_GO_FFI_LIB`
+at it; `RIVET_GO_FFI_BASE_URL` overrides the asset host for mirrors.
 
 Install the repository dependencies:
 

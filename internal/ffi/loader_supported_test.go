@@ -4,14 +4,17 @@ package ffi
 
 import (
 	"crypto/sha256"
+	"errors"
 	"fmt"
 	"io/fs"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
-	"path"
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/vmihailenco/msgpack/v5"
@@ -73,7 +76,7 @@ func TestLoaderRejectsOlderABILibraries(t *testing.T) {
 	}
 }
 
-func TestEmbeddedDiskManifestAndLoadedArtifactAgree(t *testing.T) {
+func TestLoadedArtifactMatchesPinnedChecksum(t *testing.T) {
 	if err := Load(); err != nil {
 		t.Fatalf("Load: %v", err)
 	}
@@ -81,33 +84,22 @@ func TestEmbeddedDiskManifestAndLoadedArtifactAgree(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read embedded checksums: %v", err)
 	}
-	for _, library := range embeddedLibraries {
-		libraryPath := path.Join(library.dir, library.filename)
-		embedded, err := fs.ReadFile(embeddedFiles, libraryPath)
+	expected := make(map[string]string, len(nativeArtifacts))
+	for _, artifact := range nativeArtifacts {
+		digest, err := checksumFor(manifest, artifact.manifestPath())
 		if err != nil {
-			t.Fatalf("read embedded %s: %v", libraryPath, err)
+			t.Fatalf("manifest checksum for %s: %v", artifact.manifestPath(), err)
 		}
-		onDisk, err := os.ReadFile(libraryPath)
-		if err != nil {
-			t.Fatalf("read on-disk %s: %v", libraryPath, err)
-		}
-		expected, err := checksumFor(manifest, libraryPath)
-		if err != nil {
-			t.Fatalf("manifest checksum for %s: %v", libraryPath, err)
-		}
-		if got := digestHex(embedded); got != expected {
-			t.Fatalf("embedded checksum for %s = %s, want %s", libraryPath, got, expected)
-		}
-		if got := digestHex(onDisk); got != expected {
-			t.Fatalf("on-disk checksum for %s = %s, want %s", libraryPath, got, expected)
-		}
+		expected[digest] = artifact.manifestPath()
 	}
-
 	loaded, err := os.ReadFile(api.path)
 	if err != nil {
 		t.Fatalf("read loaded library %s: %v", api.path, err)
 	}
 	loadedDigest := digestHex(loaded)
+	if _, ok := expected[loadedDigest]; !ok {
+		t.Fatalf("loaded library digest %s matches no pinned platform artifact %v", loadedDigest, expected)
+	}
 	if got := filepath.Base(filepath.Dir(api.path)); got != loadedDigest {
 		t.Fatalf("loaded library cache directory = %s, want sha256 %s", got, loadedDigest)
 	}
@@ -223,53 +215,119 @@ func TestAllBindingsRejectNullRunner(t *testing.T) {
 	}
 }
 
-func TestChecksumMismatchIsARegularError(t *testing.T) {
-	root := t.TempDir()
-	libraryDir := filepath.Join(root, "lib", "test")
-	if err := os.MkdirAll(libraryDir, 0o755); err != nil {
-		t.Fatalf("MkdirAll: %v", err)
+type countingArtifactServer struct {
+	server   *httptest.Server
+	requests atomic.Int64
+}
+
+// newArtifactServer serves body for every request, standing in for the
+// pinned release asset host.
+func newArtifactServer(t *testing.T, status int, body []byte) *countingArtifactServer {
+	t.Helper()
+	counting := &countingArtifactServer{}
+	counting.server = httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		counting.requests.Add(1)
+		writer.WriteHeader(status)
+		_, _ = writer.Write(body)
+	}))
+	t.Cleanup(counting.server.Close)
+	return counting
+}
+
+func testArtifactManifest(artifact nativeArtifact, body []byte) []byte {
+	return fmt.Appendf(nil, "%x  %s\n", sha256.Sum256(body), artifact.manifestPath())
+}
+
+func TestAcquireDownloadsVerifiesAndCaches(t *testing.T) {
+	artifact := nativeArtifact{dir: "lib/test_platform", filename: "library.dylib"}
+	library := []byte("authentic native library")
+	host := newArtifactServer(t, http.StatusOK, library)
+	cacheRoot := t.TempDir()
+
+	first, err := acquireVerifiedLibrary(artifact, testArtifactManifest(artifact, library), cacheRoot, host.server.URL)
+	if err != nil {
+		t.Fatalf("first acquire: %v", err)
 	}
-	original := []byte("original native library")
-	digest := sha256.Sum256(original)
-	manifest := fmt.Sprintf("%x  lib/test/library.dylib\n", digest)
-	if err := os.WriteFile(filepath.Join(root, "checksums.txt"), []byte(manifest), 0o644); err != nil {
-		t.Fatalf("write checksums: %v", err)
+	got, err := os.ReadFile(first)
+	if err != nil {
+		t.Fatalf("read cached library: %v", err)
 	}
-	if err := os.WriteFile(filepath.Join(libraryDir, "library.dylib"), []byte("tampered"), 0o755); err != nil {
-		t.Fatalf("write tampered library: %v", err)
+	if string(got) != string(library) {
+		t.Fatalf("cached library = %q, want %q", got, library)
+	}
+	if dir := filepath.Base(filepath.Dir(first)); dir != digestHex(library) {
+		t.Fatalf("cache directory = %s, want sha256 %s", dir, digestHex(library))
+	}
+	if runtime.GOOS != "windows" {
+		assertPrivateMode(t, filepath.Dir(first), 0o077)
+		assertPrivateMode(t, first, 0o077)
 	}
 
-	_, err := extractVerifiedLibrary(
-		os.DirFS(root),
-		"lib/test",
-		"library.dylib",
-		"checksums.txt",
-		t.TempDir(),
-	)
-	if err == nil {
-		t.Fatal("expected checksum mismatch")
+	second, err := acquireVerifiedLibrary(artifact, testArtifactManifest(artifact, library), cacheRoot, host.server.URL)
+	if err != nil {
+		t.Fatalf("second acquire: %v", err)
 	}
-	if !strings.Contains(err.Error(), "checksum mismatch") {
-		t.Fatalf("unexpected checksum error: %v", err)
+	if second != first {
+		t.Fatalf("second acquire path = %s, want cached %s", second, first)
+	}
+	if requests := host.requests.Load(); requests != 1 {
+		t.Fatalf("host requests = %d, want 1 (second acquire must hit the cache)", requests)
 	}
 }
 
-func TestExtractionSecuresCachePermissions(t *testing.T) {
-	root := t.TempDir()
-	libraryDir := filepath.Join(root, "source")
-	if err := os.Mkdir(libraryDir, 0o755); err != nil {
-		t.Fatalf("Mkdir source: %v", err)
+func TestAcquireRejectsChecksumMismatch(t *testing.T) {
+	artifact := nativeArtifact{dir: "lib/test_platform", filename: "library.dylib"}
+	library := []byte("authentic native library")
+	host := newArtifactServer(t, http.StatusOK, []byte("tampered artifact"))
+	cacheRoot := t.TempDir()
+
+	_, err := acquireVerifiedLibrary(artifact, testArtifactManifest(artifact, library), cacheRoot, host.server.URL)
+	if err == nil || !strings.Contains(err.Error(), "checksum mismatch") {
+		t.Fatalf("acquire error = %v, want checksum mismatch", err)
 	}
-	library := []byte("native library")
-	digest := sha256.Sum256(library)
-	manifest := fmt.Sprintf("%x  source/library.dylib\n", digest)
-	if err := os.WriteFile(filepath.Join(root, "checksums.txt"), []byte(manifest), 0o644); err != nil {
-		t.Fatalf("write checksums: %v", err)
+	cached := filepath.Join(cacheRoot, "rivet-go", digestHex(library), artifact.filename)
+	if _, statErr := os.Stat(cached); !errors.Is(statErr, fs.ErrNotExist) {
+		t.Fatalf("rejected artifact must not be cached: %v", statErr)
 	}
-	if err := os.WriteFile(filepath.Join(libraryDir, "library.dylib"), library, 0o755); err != nil {
-		t.Fatalf("write library: %v", err)
+}
+
+func TestAcquireReplacesTamperedCacheEntry(t *testing.T) {
+	artifact := nativeArtifact{dir: "lib/test_platform", filename: "library.dylib"}
+	library := []byte("authentic native library")
+	host := newArtifactServer(t, http.StatusOK, library)
+	cacheRoot := t.TempDir()
+
+	cached, err := acquireVerifiedLibrary(artifact, testArtifactManifest(artifact, library), cacheRoot, host.server.URL)
+	if err != nil {
+		t.Fatalf("first acquire: %v", err)
+	}
+	if err := os.Chmod(cached, 0o700); err != nil {
+		t.Fatalf("make cached library writable: %v", err)
+	}
+	if err := os.WriteFile(cached, []byte("tampered"), 0o700); err != nil {
+		t.Fatalf("tamper cached library: %v", err)
 	}
 
+	replaced, err := acquireVerifiedLibrary(artifact, testArtifactManifest(artifact, library), cacheRoot, host.server.URL)
+	if err != nil {
+		t.Fatalf("replace tampered cache entry: %v", err)
+	}
+	got, err := os.ReadFile(replaced)
+	if err != nil {
+		t.Fatalf("read replaced library: %v", err)
+	}
+	if string(got) != string(library) {
+		t.Fatalf("replaced library = %q, want %q", got, library)
+	}
+	if requests := host.requests.Load(); requests != 2 {
+		t.Fatalf("host requests = %d, want 2 (tampered entry must be re-downloaded)", requests)
+	}
+}
+
+func TestAcquireSecuresCachePermissions(t *testing.T) {
+	artifact := nativeArtifact{dir: "lib/test_platform", filename: "library.dylib"}
+	library := []byte("native library")
+	host := newArtifactServer(t, http.StatusOK, library)
 	cacheRoot := t.TempDir()
 	cacheBase := filepath.Join(cacheRoot, "rivet-go")
 	if err := os.Mkdir(cacheBase, 0o777); err != nil {
@@ -278,64 +336,32 @@ func TestExtractionSecuresCachePermissions(t *testing.T) {
 	if err := os.Chmod(cacheBase, 0o777); err != nil {
 		t.Fatalf("make cache base unsafe: %v", err)
 	}
-	extracted, err := extractVerifiedLibrary(
-		os.DirFS(root),
-		"source",
-		"library.dylib",
-		"checksums.txt",
-		cacheRoot,
-	)
+
+	acquired, err := acquireVerifiedLibrary(artifact, testArtifactManifest(artifact, library), cacheRoot, host.server.URL)
 	if err != nil {
-		t.Fatalf("extract verified library: %v", err)
+		t.Fatalf("acquire verified library: %v", err)
 	}
 	if runtime.GOOS != "windows" {
 		assertPrivateMode(t, cacheBase, 0o077)
-		assertPrivateMode(t, filepath.Dir(extracted), 0o077)
-		assertPrivateMode(t, extracted, 0o077)
+		assertPrivateMode(t, filepath.Dir(acquired), 0o077)
+		assertPrivateMode(t, acquired, 0o077)
 	}
 }
 
-func TestExtractionReplacesTamperedCacheEntry(t *testing.T) {
-	root := t.TempDir()
-	if err := os.Mkdir(filepath.Join(root, "source"), 0o755); err != nil {
-		t.Fatalf("Mkdir source: %v", err)
-	}
-	library := []byte("authentic native library")
-	digest := sha256.Sum256(library)
-	manifest := fmt.Sprintf("%x  source/library.dylib\n", digest)
-	if err := os.WriteFile(filepath.Join(root, "checksums.txt"), []byte(manifest), 0o644); err != nil {
-		t.Fatalf("write checksums: %v", err)
-	}
-	if err := os.WriteFile(filepath.Join(root, "source", "library.dylib"), library, 0o755); err != nil {
-		t.Fatalf("write library: %v", err)
-	}
-
+func TestAcquireReportsDownloadFailureWithPreSeedHint(t *testing.T) {
+	artifact := nativeArtifact{dir: "lib/test_platform", filename: "library.dylib"}
+	library := []byte("unavailable library")
+	host := newArtifactServer(t, http.StatusNotFound, nil)
 	cacheRoot := t.TempDir()
-	extracted, err := extractVerifiedLibrary(
-		os.DirFS(root), "source", "library.dylib", "checksums.txt", cacheRoot,
-	)
-	if err != nil {
-		t.Fatalf("first extraction: %v", err)
-	}
-	if err := os.Chmod(extracted, 0o700); err != nil {
-		t.Fatalf("make cached library writable: %v", err)
-	}
-	if err := os.WriteFile(extracted, []byte("tampered"), 0o700); err != nil {
-		t.Fatalf("tamper cached library: %v", err)
-	}
 
-	replaced, err := extractVerifiedLibrary(
-		os.DirFS(root), "source", "library.dylib", "checksums.txt", cacheRoot,
-	)
-	if err != nil {
-		t.Fatalf("replace tampered extraction: %v", err)
+	_, err := acquireVerifiedLibrary(artifact, testArtifactManifest(artifact, library), cacheRoot, host.server.URL)
+	if err == nil {
+		t.Fatal("expected download failure")
 	}
-	got, err := os.ReadFile(replaced)
-	if err != nil {
-		t.Fatalf("read replaced library: %v", err)
-	}
-	if string(got) != string(library) {
-		t.Fatalf("replaced library = %q, want %q", got, library)
+	for _, want := range []string{"404", artifact.assetName(), "pre-seed", envLibraryOverride} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("download error %q does not mention %q", err, want)
+		}
 	}
 }
 

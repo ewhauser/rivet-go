@@ -227,7 +227,7 @@ download dependency.
 2. Read upstream core, envoy, gateway, storage, alarm, and WebSocket changes.
    Update `docs/FFI-BOUNDARY.md` before changing the boundary. Bump the ABI for
    any event, command, or configuration shape change.
-3. Build all committed targets with Rust 1.97, cbindgen 0.29.4, Zig 0.16,
+3. Build all six release targets with Rust 1.97, cbindgen 0.29.4, Zig 0.16,
    cargo-zigbuild 0.23, and cargo-xwin 0.23 where applicable:
 
    ```sh
@@ -239,6 +239,10 @@ download dependency.
    scripts/build-ffi.sh x86_64-pc-windows-msvc
    ```
 
+   The artifacts themselves are not committed; each build updates that
+   platform's SHA-256 line in `internal/ffi/checksums.txt` (committed),
+   regenerates `THIRD-PARTY-NOTICES.md`, and seeds the local acquisition
+   cache so this machine never downloads what it just built.
 4. Run `scripts/build-ffi.sh` for the same six targets again and require a
    clean diff. This is the idempotence check.
 5. Run `cargo test --workspace`, Clippy with warnings denied, `go vet ./...`,
@@ -246,8 +250,11 @@ download dependency.
    24-hour soak. Preserve the existing corpus for the separately owned fuzz
    handoff; the upgrade itself does not add malformed-input cases.
 6. Compare behavior against the prior pin, update every deviation below, and
-   do not publish until all platform artifacts and checksums agree with the
-   reviewed source.
+   set `artifactReleaseTag` in `internal/ffi/acquire.go` to the next release
+   tag. Pushing that tag runs `.github/workflows/release.yml`, which rebuilds
+   every artifact, refuses to publish unless each one hash-matches its
+   `checksums.txt` entry and the tag matches `artifactReleaseTag`, and then
+   uploads the assets the loader will download and verify.
 
 ## Platform support
 

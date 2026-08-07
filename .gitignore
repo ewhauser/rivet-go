@@ -5,3 +5,4 @@
 /bench/runner-rust/target/
 /bench/runner-ts/dist/
 /bench/runner-ts/node_modules/
+/internal/ffi/lib/

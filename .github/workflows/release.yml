@@ -1,0 +1,169 @@
+name: release
+
+# Builds the six native FFI artifacts for a pushed v* tag, requires each to
+# hash-match its pinned entry in internal/ffi/checksums.txt and the tag to
+# match internal/ffi/acquire.go's artifactReleaseTag, then publishes them as
+# release assets. The loader downloads by tag + checksum, so a release that
+# passes this workflow is exactly what source at the tag pins.
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: build-${{ matrix.name }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - name: darwin-arm64
+            runner: macos-14
+            rust_target: aarch64-apple-darwin
+            libc: native
+            platform: darwin_arm64
+            artifact: librivetkit_go_ffi.dylib
+          - name: linux-amd64-gnu
+            runner: ubuntu-latest
+            rust_target: x86_64-unknown-linux-gnu
+            libc: gnu
+            platform: linux_amd64
+            artifact: librivetkit_go_ffi.so
+          - name: linux-arm64-gnu
+            runner: ubuntu-24.04-arm
+            rust_target: aarch64-unknown-linux-gnu
+            libc: gnu
+            platform: linux_arm64
+            artifact: librivetkit_go_ffi.so
+          - name: linux-amd64-musl
+            runner: ubuntu-latest
+            rust_target: x86_64-unknown-linux-musl
+            libc: musl
+            platform: linux_amd64_musl
+            artifact: librivetkit_go_ffi.so
+          - name: linux-arm64-musl
+            runner: ubuntu-24.04-arm
+            rust_target: aarch64-unknown-linux-musl
+            libc: musl
+            platform: linux_arm64_musl
+            artifact: librivetkit_go_ffi.so
+          - name: windows-amd64
+            runner: windows-latest
+            rust_target: x86_64-pc-windows-msvc
+            libc: native
+            platform: windows_amd64
+            artifact: rivetkit_go_ffi.dll
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Verify tag matches the pinned artifact release tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          pinned="$(sed -n 's/.*artifactReleaseTag = "\([^"]*\)".*/\1/p' internal/ffi/acquire.go)"
+          if [ "$pinned" != "${GITHUB_REF_NAME}" ]; then
+            echo "tag ${GITHUB_REF_NAME} does not match artifactReleaseTag ${pinned}" >&2
+            exit 1
+          fi
+
+      - name: Install Rust toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install 1.97.0 --profile minimal --target "${{ matrix.rust_target }}"
+          rustup default 1.97.0
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+
+      - name: Install Zig
+        if: matrix.libc == 'gnu' || matrix.libc == 'musl'
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29
+        with:
+          version: 0.16.0
+
+      - name: Install cargo-zigbuild
+        if: matrix.libc == 'gnu' || matrix.libc == 'musl'
+        run: cargo install cargo-zigbuild --version 0.23.0 --locked
+
+      - name: Install cbindgen
+        run: cargo install cbindgen --version 0.29.4 --locked
+
+      - name: Build native FFI library
+        shell: bash
+        env:
+          RIVET_GO_SKIP_NOTICES: "1"
+        run: scripts/build-ffi.sh "${{ matrix.rust_target }}"
+
+      - name: Require built artifact to match the pinned checksum
+        shell: bash
+        run: |
+          set -euo pipefail
+          git diff --exit-code internal/ffi/checksums.txt \
+            internal/ffi/abi_version_generated.go internal/ffi/include
+
+      - name: Stage release asset
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp "internal/ffi/lib/${{ matrix.platform }}/${{ matrix.artifact }}" \
+            "dist/${{ matrix.platform }}-${{ matrix.artifact }}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.platform }}
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    name: publish-release
+    runs-on: ubuntu-latest
+    needs: build
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Final checksum audit of staged assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          status=0
+          while IFS= read -r line; do
+            digest="${line%% *}"
+            key="${line##* }"
+            platform_dir="$(dirname "$key")"
+            asset="${platform_dir#lib/}-$(basename "$key")"
+            actual="$(sha256sum "dist/$asset" | awk '{ print $1 }')"
+            if [ "$actual" != "$digest" ]; then
+              echo "asset $asset sha256 $actual != pinned $digest" >&2
+              status=1
+            fi
+          done < internal/ffi/checksums.txt
+          exit "$status"
+
+      - name: Create release with assets
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release create "${GITHUB_REF_NAME}" \
+            --verify-tag \
+            --title "rivet-go ${GITHUB_REF_NAME}" \
+            --notes "Native FFI artifacts for rivet-go ${GITHUB_REF_NAME}. Each asset's SHA-256 is pinned in internal/ffi/checksums.txt at this tag; the Go loader downloads and verifies them automatically. Pre-seed offline machines with cmd/rivet-go-fetch." \
+            dist/*

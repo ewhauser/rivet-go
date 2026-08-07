@@ -12,8 +12,6 @@ import (
 	"io/fs"
 	"log/slog"
 	"os"
-	"path"
-	"path/filepath"
 	"runtime"
 	"strings"
 	"sync"
@@ -86,11 +84,6 @@ func ActiveHandleCounts() HandleCounts {
 	}
 }
 
-type embeddedLibrary struct {
-	dir      string
-	filename string
-}
-
 // Runner is an owned native runner handle.
 type Runner struct {
 	mu     sync.RWMutex
@@ -128,7 +121,8 @@ func (e ErrorPayload) Error() string {
 
 func (e ErrorPayload) ErrorCode() string { return e.Code }
 
-// Load extracts, verifies, opens, and binds the embedded native library.
+// Load acquires (cache or checksummed release download), verifies, opens,
+// and binds the native library for this platform.
 func Load() error {
 	api.once.Do(func() {
 		api.loadErr = api.load()
@@ -137,18 +131,29 @@ func Load() error {
 }
 
 func (a *nativeAPI) load() error {
-	if len(embeddedLibraries) == 0 {
-		return errors.New("no native libraries are embedded for this platform")
+	if len(nativeArtifacts) == 0 {
+		return errors.New("no native artifacts are pinned for this platform")
+	}
+	if override := os.Getenv(envLibraryOverride); override != "" {
+		handle, err := openLibrary(override)
+		if err != nil {
+			return fmt.Errorf("load native library from %s=%s: %w", envLibraryOverride, override, err)
+		}
+		if err := a.bindAndValidate(handle); err != nil {
+			_ = closeLibrary(handle)
+			return err
+		}
+		a.handle = handle
+		a.path = override
+		return nil
+	}
+	manifest, err := fs.ReadFile(embeddedFiles, "checksums.txt")
+	if err != nil {
+		return fmt.Errorf("read embedded checksum manifest: %w", err)
 	}
 	var loadErrors []error
-	for _, library := range embeddedLibraries {
-		libraryPath, err := extractVerifiedLibrary(
-			embeddedFiles,
-			library.dir,
-			library.filename,
-			"checksums.txt",
-			libraryCacheRoot(),
-		)
+	for _, artifact := range nativeArtifacts {
+		libraryPath, err := acquireVerifiedLibrary(artifact, manifest, libraryCacheRoot(), artifactBaseURL())
 		if err != nil {
 			return err
 		}
@@ -442,87 +447,6 @@ func newError(ptr *cError) *Error {
 	activeErrors.Add(1)
 	runtime.SetFinalizer(nativeError, finalizeError)
 	return nativeError
-}
-
-func extractVerifiedLibrary(
-	files fs.FS,
-	dir string,
-	filename string,
-	checksumsPath string,
-	cacheRoot string,
-) (string, error) {
-	libraryPath := path.Join(dir, filename)
-	manifest, err := fs.ReadFile(files, checksumsPath)
-	if err != nil {
-		return "", fmt.Errorf("read embedded checksum manifest %s: %w", checksumsPath, err)
-	}
-	expected, err := checksumFor(manifest, libraryPath)
-	if err != nil {
-		return "", err
-	}
-	libraryBytes, err := fs.ReadFile(files, libraryPath)
-	if err != nil {
-		return "", fmt.Errorf("read embedded native library %s: %w", libraryPath, err)
-	}
-	actual := digestHex(libraryBytes)
-	if actual != expected {
-		return "", fmt.Errorf(
-			"embedded native library checksum mismatch for %s: got %s, want %s",
-			libraryPath,
-			actual,
-			expected,
-		)
-	}
-
-	cacheBase := filepath.Join(cacheRoot, "rivet-go")
-	if err := ensurePrivateDirectory(cacheBase); err != nil {
-		return "", err
-	}
-	cacheDir := filepath.Join(cacheBase, actual)
-	if err := ensurePrivateDirectory(cacheDir); err != nil {
-		return "", err
-	}
-	targetPath := filepath.Join(cacheDir, filename)
-	if info, err := os.Lstat(targetPath); err == nil {
-		if info.Mode().IsRegular() {
-			existing, readErr := os.ReadFile(targetPath)
-			if readErr == nil && digestHex(existing) == actual {
-				if err := os.Chmod(targetPath, 0o500); err != nil {
-					return "", fmt.Errorf("secure cached native library %s: %w", targetPath, err)
-				}
-				return targetPath, nil
-			}
-		}
-		if err := os.Remove(targetPath); err != nil {
-			return "", fmt.Errorf("remove invalid cached native library %s: %w", targetPath, err)
-		}
-	} else if !errors.Is(err, fs.ErrNotExist) {
-		return "", fmt.Errorf("inspect cached native library %s: %w", targetPath, err)
-	}
-
-	temporary, err := os.CreateTemp(cacheDir, filename+".tmp-*")
-	if err != nil {
-		return "", fmt.Errorf("create temporary native library: %w", err)
-	}
-	temporaryPath := temporary.Name()
-	defer os.Remove(temporaryPath)
-	if _, err := temporary.Write(libraryBytes); err != nil {
-		temporary.Close()
-		return "", fmt.Errorf("write temporary native library: %w", err)
-	}
-	if err := temporary.Close(); err != nil {
-		return "", fmt.Errorf("close temporary native library: %w", err)
-	}
-	if err := os.Chmod(temporaryPath, 0o500); err != nil {
-		return "", fmt.Errorf("make temporary native library executable: %w", err)
-	}
-	if err := os.Rename(temporaryPath, targetPath); err != nil {
-		if existing, readErr := os.ReadFile(targetPath); readErr == nil && digestHex(existing) == actual {
-			return targetPath, nil
-		}
-		return "", fmt.Errorf("move verified native library into cache: %w", err)
-	}
-	return targetPath, nil
 }
 
 func ensurePrivateDirectory(directory string) error {
