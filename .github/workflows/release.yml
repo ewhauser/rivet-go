@@ -19,7 +19,9 @@ jobs:
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
     strategy:
-      fail-fast: true
+      # Let every platform report its built hash even when one mismatches, so
+      # a checksum-sync commit can fix all six lines in one iteration.
+      fail-fast: false
       matrix:
         include:
           - name: darwin-arm64
@@ -106,6 +108,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          echo "built checksum line:"
+          grep " lib/${{ matrix.platform }}/" internal/ffi/checksums.txt
           git diff --exit-code internal/ffi/checksums.txt \
             internal/ffi/abi_version_generated.go internal/ffi/include
 
