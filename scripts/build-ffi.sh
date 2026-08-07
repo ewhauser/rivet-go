@@ -242,7 +242,7 @@ if [[ "${RIVET_GO_SKIP_NOTICES:-0}" != "1" ]]; then
     echo "error: cargo-about is required (cargo install cargo-about --locked --features cli)" >&2
     exit 1
   fi
-  (cd "$ROOT_DIR" && cargo about generate --features ffi-test about.hbs -o THIRD-PARTY-NOTICES.md)
+  (cd "$ROOT_DIR" && cargo about generate --features ffi-test about.hbs | tr -d '\r' > THIRD-PARTY-NOTICES.md)
 fi
 
 echo "Wrote internal/ffi/lib/$platform/$artifact_name (sha256 $digest, cached at $cache_dir)"

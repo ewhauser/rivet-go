@@ -160,8 +160,8 @@ jobs:
 
       - name: Install cargo-deny and cargo-about
         run: |
-          cargo install cargo-deny --locked
-          cargo install cargo-about --locked --features cli
+          cargo install cargo-deny --version 0.20.2 --locked
+          cargo install cargo-about --version 0.9.1 --locked --features cli
 
       - name: License gate
         run: cargo deny check licenses
@@ -169,7 +169,7 @@ jobs:
       - name: Third-party notices are current
         run: |
           set -euo pipefail
-          cargo about generate --features ffi-test about.hbs -o THIRD-PARTY-NOTICES.md
+          cargo about generate --features ffi-test about.hbs | tr -d '\r' > THIRD-PARTY-NOTICES.md
           git diff --exit-code THIRD-PARTY-NOTICES.md
 
   engine:

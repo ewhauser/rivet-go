@@ -77,6 +77,9 @@ func TestLoaderRejectsOlderABILibraries(t *testing.T) {
 }
 
 func TestLoadedArtifactMatchesPinnedChecksum(t *testing.T) {
+	if os.Getenv(envLibraryOverride) != "" {
+		t.Skipf("%s overrides the pinned-acquisition path", envLibraryOverride)
+	}
 	if err := Load(); err != nil {
 		t.Fatalf("Load: %v", err)
 	}
