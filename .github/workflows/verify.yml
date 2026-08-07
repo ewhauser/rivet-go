@@ -5,13 +5,16 @@ on:
   push:
     branches: [main, ci-green]
 
-permissions:
-  contents: read
+# Astral-style default deny: workflows start with no permissions and each job
+# grants exactly what it needs.
+permissions: {}
 
 jobs:
   native:
     name: ${{ matrix.name }}
     runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read # checkout only
     timeout-minutes: 45
     strategy:
       fail-fast: false
@@ -55,9 +58,11 @@ jobs:
             artifact: rivetkit_go_ffi.dll
 
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
 
-      - uses: actions/setup-go@v6
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
         with:
           go-version-file: go.mod
           cache: true
@@ -69,13 +74,13 @@ jobs:
           rustup toolchain install 1.97.0 --profile minimal --target "${{ matrix.rust_target }}"
           rustup default 1.97.0
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           cache-on-failure: true
 
       - name: Install Zig
         if: matrix.libc == 'gnu' || matrix.libc == 'musl'
-        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.0.5
         with:
           version: 0.16.0
 
@@ -124,14 +129,26 @@ jobs:
   lint:
     name: lint-and-licenses
     runs-on: ubuntu-latest
+    permissions:
+      contents: read # checkout only
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
 
-      - uses: actions/setup-go@v6
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
         with:
           go-version-file: go.mod
           cache: true
+
+      - name: Audit workflows with zizmor
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          pipx install zizmor==1.29.0
+          zizmor --persona=regular .github/workflows/
 
       - name: gofmt
         run: |
@@ -154,7 +171,7 @@ jobs:
           rustup toolchain install 1.97.0 --profile minimal
           rustup default 1.97.0
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           cache-on-failure: true
 
@@ -175,18 +192,22 @@ jobs:
   engine:
     name: linux-amd64-engine
     runs-on: ubuntu-latest
+    permissions:
+      contents: read # checkout only
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
 
-      - uses: actions/setup-go@v6
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
         with:
           go-version-file: go.mod
           cache: true
 
       - name: Restore pinned engine
         id: engine-cache
-        uses: actions/cache@v5
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
         with:
           path: |
             ~/.cache/rivet-go/engine-v2.3.10/rivet-engine
@@ -208,7 +229,7 @@ jobs:
 
       - name: Upload engine build failure logs
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: linux-amd64-engine-logs
           path: |
@@ -221,17 +242,21 @@ jobs:
     name: linux-amd64-conformance
     runs-on: ubuntu-latest
     needs: engine
+    permissions:
+      contents: read # checkout only
     timeout-minutes: 35
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
 
-      - uses: actions/setup-go@v6
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
         with:
           go-version-file: go.mod
           cache: true
 
       - name: Restore pinned engine
-        uses: actions/cache@v5
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
         with:
           path: |
             ~/.cache/rivet-go/engine-v2.3.10/rivet-engine
@@ -244,7 +269,7 @@ jobs:
           rustup toolchain install 1.97.0 --profile minimal
           rustup default 1.97.0
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           cache-on-failure: true
 
@@ -265,7 +290,7 @@ jobs:
 
       - name: Upload conformance failure logs
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: linux-amd64-conformance-logs
           path: |
@@ -278,17 +303,21 @@ jobs:
     name: linux-amd64-soak-smoke
     runs-on: ubuntu-latest
     needs: engine
+    permissions:
+      contents: read # checkout only
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
 
-      - uses: actions/setup-go@v6
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
         with:
           go-version-file: go.mod
           cache: true
 
       - name: Restore pinned engine
-        uses: actions/cache@v5
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
         with:
           path: |
             ~/.cache/rivet-go/engine-v2.3.10/rivet-engine
@@ -301,7 +330,7 @@ jobs:
           rustup toolchain install 1.97.0 --profile minimal
           rustup default 1.97.0
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           cache-on-failure: true
 
@@ -322,7 +351,7 @@ jobs:
 
       - name: Upload soak failure logs
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: linux-amd64-soak-smoke-logs
           path: |

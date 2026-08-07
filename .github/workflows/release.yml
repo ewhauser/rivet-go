@@ -10,14 +10,17 @@ on:
   push:
     tags: ["v*"]
 
-permissions:
-  contents: read
+# Astral-style default deny: workflows start with no permissions and each job
+# grants exactly what it needs.
+permissions: {}
 
 jobs:
   build:
     name: build-${{ matrix.name }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
+    permissions:
+      contents: read # checkout only
     strategy:
       # Let every platform report its built hash even when one mismatches, so
       # a checksum-sync commit can fix all six lines in one iteration.
@@ -62,7 +65,9 @@ jobs:
             artifact: rivetkit_go_ffi.dll
 
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
 
       - name: Verify tag matches the pinned artifact release tag
         shell: bash
@@ -81,15 +86,15 @@ jobs:
           rustup toolchain install 1.97.0 --profile minimal --target "${{ matrix.rust_target }}"
           rustup default 1.97.0
 
-      - uses: Swatinem/rust-cache@v2
-        with:
-          cache-on-failure: true
-
       - name: Install Zig
         if: matrix.libc == 'gnu' || matrix.libc == 'musl'
-        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.0.5
         with:
           version: 0.16.0
+          # No caches feed release builds (cache-poisoning defense); the
+          # checksum gate would catch tampering, but defense in depth is
+          # cheaper than forensics.
+          use-cache: false
 
       - name: Install cargo-zigbuild
         if: matrix.libc == 'gnu' || matrix.libc == 'musl'
@@ -121,7 +126,7 @@ jobs:
           cp "internal/ffi/lib/${{ matrix.platform }}/${{ matrix.artifact }}" \
             "dist/${{ matrix.platform }}-${{ matrix.artifact }}"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: ${{ matrix.platform }}
           path: dist/*
@@ -133,11 +138,15 @@ jobs:
     needs: build
     timeout-minutes: 15
     permissions:
-      contents: write
+      contents: write # create the release and upload assets
+      id-token: write # Sigstore OIDC for build-provenance attestation
+      attestations: write # persist the attestation
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           path: dist
           merge-multiple: true
@@ -159,6 +168,11 @@ jobs:
             fi
           done < internal/ffi/checksums.txt
           exit "$status"
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3
+        with:
+          subject-path: dist/*
 
       - name: Create release with assets
         shell: bash
