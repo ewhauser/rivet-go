@@ -27,7 +27,6 @@ const (
 	defaultSQLiteTimeout   = 65 * time.Second
 	defaultSubmitQueue     = 1_024
 	maxSubmitBatch         = 1_024
-	actorEventQueue        = 64
 	maxHTTPChunk           = 1 << 20
 	maxWSMessage           = 1 << 20
 	maxSQLiteResponseBytes = 32 * 1024 * 1024
@@ -1220,7 +1219,62 @@ type actorWorker struct {
 	session *ActorSession
 	ctx     context.Context
 	cancel  context.CancelFunc
-	events  chan wire.Event
+	mailbox *actorMailbox
+}
+
+// actorMailbox is the unbounded FIFO between the poll goroutine and one actor
+// worker. Delivery must never block the poller: a worker can be inside a user
+// handler that is itself waiting on a completion (KV, save, intent, SQLite)
+// that only the poller can deliver, so any bounded hand-off from the poller to
+// a worker can deadlock the whole runner. Boundedness here also provided no
+// per-actor backpressure — a full queue stalled event delivery for every actor
+// on the runner. Inflow stays bounded by the native side: per-connection
+// admission queues, action deadlines, and hibernation acknowledgements all
+// limit how many events the engine hands the pump ahead of handler progress.
+type actorMailbox struct {
+	mu     sync.Mutex
+	queue  []wire.Event
+	signal chan struct{}
+}
+
+func newActorMailbox() *actorMailbox {
+	return &actorMailbox{signal: make(chan struct{}, 1)}
+}
+
+// put appends the event and never blocks. Delivery to a worker that has
+// already exited is harmless: the mailbox is dropped with the worker.
+func (m *actorMailbox) put(event wire.Event) {
+	m.mu.Lock()
+	m.queue = append(m.queue, event)
+	m.mu.Unlock()
+	select {
+	case m.signal <- struct{}{}:
+	default:
+	}
+}
+
+// take returns the next event in FIFO order, blocking until one arrives or
+// ctx is canceled.
+func (m *actorMailbox) take(ctx context.Context) (wire.Event, bool) {
+	for {
+		m.mu.Lock()
+		if len(m.queue) != 0 {
+			event := m.queue[0]
+			m.queue[0] = wire.Event{}
+			m.queue = m.queue[1:]
+			if len(m.queue) == 0 {
+				m.queue = nil
+			}
+			m.mu.Unlock()
+			return event, true
+		}
+		m.mu.Unlock()
+		select {
+		case <-m.signal:
+		case <-ctx.Done():
+			return wire.Event{}, false
+		}
+	}
 }
 
 type websocketOwner struct {
@@ -1579,7 +1633,7 @@ func (p *Pump) handleInternalEvent(event wire.Event) error {
 			session: session,
 			ctx:     workerCtx,
 			cancel:  cancel,
-			events:  make(chan wire.Event, actorEventQueue),
+			mailbox: newActorMailbox(),
 		}
 		p.actorsMu.Lock()
 		if _, exists := p.actors[identity]; exists {
@@ -1623,7 +1677,7 @@ func (p *Pump) handleInternalEvent(event wire.Event) error {
 			}
 		}
 		for _, closeEvent := range closeEvents {
-			worker.events <- closeEvent
+			worker.mailbox.put(closeEvent)
 		}
 		p.counter(metricActorStops, 1)
 		p.log(slog.LevelDebug, "actor stopping",
@@ -1631,13 +1685,13 @@ func (p *Pump) handleInternalEvent(event wire.Event) error {
 			slog.Uint64("generation", event.Generation),
 			slog.String("reason", event.Reason),
 		)
-		worker.events <- event
+		worker.mailbox.put(event)
 	case wire.EventActorAlarm:
 		worker := p.actor(event.AID, event.Generation)
 		if worker == nil {
 			return fmt.Errorf("ActorAlarm for unknown actor %s generation %d", event.AID, event.Generation)
 		}
-		worker.events <- event
+		worker.mailbox.put(event)
 	case wire.EventActorIntentResult:
 		p.intentMu.Lock()
 		result := p.intentPending[event.OperationID]
@@ -1651,7 +1705,7 @@ func (p *Pump) handleInternalEvent(event wire.Event) error {
 		if worker == nil {
 			return fmt.Errorf("ActionCall for unknown actor %s generation %d", event.AID, event.Generation)
 		}
-		worker.events <- event
+		worker.mailbox.put(event)
 	case wire.EventHTTPRequest:
 		worker := p.actor(event.AID, event.Generation)
 		if worker == nil {
@@ -1680,7 +1734,7 @@ func (p *Pump) handleInternalEvent(event wire.Event) error {
 		}
 		p.httpPending[event.RequestID] = state
 		p.httpMu.Unlock()
-		worker.events <- event
+		worker.mailbox.put(event)
 	case wire.EventHTTPRequestChunk:
 		state := p.httpRequest(event.RequestID)
 		if state == nil {
@@ -1712,19 +1766,19 @@ func (p *Pump) handleInternalEvent(event wire.Event) error {
 		liveConnections := len(p.websockets)
 		p.gauge(metricLiveConnections, int64(liveConnections))
 		p.wsMu.Unlock()
-		worker.events <- event
+		worker.mailbox.put(event)
 	case wire.EventWSMessage:
 		worker := p.websocketActor(event.WSID)
 		if worker == nil {
 			return nil
 		}
-		worker.events <- event
+		worker.mailbox.put(event)
 	case wire.EventWSClose:
 		worker := p.removeWebSocket(event.WSID)
 		if worker == nil {
 			return nil
 		}
-		worker.events <- event
+		worker.mailbox.put(event)
 	case wire.EventStatePersisted:
 		worker := p.actor(event.AID, event.Generation)
 		if worker == nil {
@@ -1795,11 +1849,9 @@ func (w *actorWorker) run(start wire.Event) {
 	}()
 
 	for {
-		var event wire.Event
-		select {
-		case <-w.ctx.Done():
+		event, ok := w.mailbox.take(w.ctx)
+		if !ok {
 			return
-		case event = <-w.events:
 		}
 		switch event.Kind {
 		case wire.EventActionCall:

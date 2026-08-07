@@ -2257,3 +2257,78 @@ func decodeCommandBatch(data []byte, batch *wire.CommandBatch) error {
 func decodeEventBatch(data []byte, batch *wire.EventBatch) error {
 	return msgpack.Unmarshal(data, batch)
 }
+
+// Regression for the poller deadlock class: the poll goroutine must never
+// block delivering events to a busy actor. Here the actor's first message
+// handler parks inside KVGet — a wait only the poll goroutine can complete —
+// while the engine delivers far more events for the same actor than the old
+// bounded poller→worker queue (64) would hold. With a bounded hand-off this
+// deadlocked: the poller blocked on delivery, so the KVResult that would
+// unpark the handler could never be polled.
+func TestPollerNeverBlocksOnBusyActorMailbox(t *testing.T) {
+	defer goleak.VerifyNone(t)
+	runner := newFakeRunner()
+	const messages = 200
+	processed := make(chan string, messages)
+	kvDone := make(chan error, 1)
+	handler := dispatchHandler{
+		wsMessage: func(_ context.Context, session *ActorSession, event wire.Event, _ any) error {
+			if string(event.Data) == "message-000" {
+				_, _, err := session.KVGet(context.Background(), []byte("parked"))
+				kvDone <- err
+			}
+			processed <- string(event.Data)
+			return nil
+		},
+	}
+	p := NewWithHandlers(runner, map[string]ActorHandler{"socket": handler})
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() { result <- p.Run(ctx) }()
+	waitPumpStarted(t, p)
+
+	runner.emit(wire.Event{Kind: wire.EventActorStart, AID: "busy-aid", Generation: 1, Name: "socket"})
+	if command := nextCommand(t, runner); command.Kind != wire.CommandActorStartResult {
+		t.Fatalf("start command = %#v", command)
+	}
+	runner.emit(wire.Event{Kind: wire.EventWSOpen, AID: "busy-aid", WSID: "ws-busy", Path: "/chat"})
+	if command := nextCommand(t, runner); command.Kind != wire.CommandWSOpenResult || !command.Accept {
+		t.Fatalf("open result = %#v", command)
+	}
+	// One batch delivers every message: the first parks the handler in KVGet
+	// and the rest accumulate behind it in the actor's mailbox.
+	events := make([]wire.Event, 0, messages)
+	for index := range messages {
+		events = append(events, wire.Event{
+			Kind: wire.EventWSMessage, WSID: "ws-busy",
+			Data: []byte(fmt.Sprintf("message-%03d", index)),
+		})
+	}
+	runner.emit(events...)
+	// The KVGet command must reach the runner while the actor's mailbox holds
+	// the backlog — proof the poller is still live — and its completion must
+	// unpark the handler.
+	command := nextCommand(t, runner)
+	if command.Kind != wire.CommandKVGet || command.KVID == 0 {
+		t.Fatalf("kv command = %#v", command)
+	}
+	runner.emit(wire.Event{Kind: wire.EventKVResult, KVID: command.KVID, Value: []byte("value")})
+	if err := <-kvDone; err != nil {
+		t.Fatalf("KVGet: %v", err)
+	}
+	for index := range messages {
+		want := fmt.Sprintf("message-%03d", index)
+		select {
+		case got := <-processed:
+			if got != want {
+				t.Fatalf("message order: got %q want %q", got, want)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatalf("message %q was never processed", want)
+		}
+	}
+	cancel()
+	if err := <-result; err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+}
