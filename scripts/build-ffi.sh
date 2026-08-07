@@ -126,7 +126,10 @@ unset RUSTFLAGS CARGO_ENCODED_RUSTFLAGS
 if [[ "$target" == *-unknown-linux-musl ]]; then
   export RUSTFLAGS="-C target-feature=-crt-static"
 elif [[ "$target" == *-pc-windows-msvc ]]; then
-  export RUSTFLAGS="-C target-feature=+crt-static -C link-arg=/ignore:4099"
+  # /Brepro makes MSVC linking deterministic (PE timestamp and GUID derive
+  # from content); without it every relink produces a new DLL hash and the
+  # release checksum gate can never pass.
+  export RUSTFLAGS="-C target-feature=+crt-static -C link-arg=/ignore:4099 -C link-arg=/Brepro"
 fi
 
 "${build_command[@]}" \
