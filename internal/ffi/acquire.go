@@ -137,6 +137,12 @@ func cachedVerifiedLibrary(cacheRoot, digest, filename string) (string, bool, er
 // storeVerifiedLibrary writes already-verified library bytes into the cache
 // layout via a same-directory temporary file and atomic rename.
 func storeVerifiedLibrary(libraryBytes []byte, digest, cacheRoot, filename string) (string, error) {
+	// A fresh container may not have the user cache directory itself yet
+	// (~/.cache, ~/Library/Caches); it is a shared system path, not ours to
+	// make private.
+	if err := os.MkdirAll(cacheRoot, 0o755); err != nil {
+		return "", fmt.Errorf("create user cache directory %s: %w", cacheRoot, err)
+	}
 	cacheBase := filepath.Join(cacheRoot, "rivet-go")
 	if err := ensurePrivateDirectory(cacheBase); err != nil {
 		return "", err
