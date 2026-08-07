@@ -71,7 +71,10 @@ Run the complete, sequential evaluation with:
 `run.sh` uses Node without runtime flags and sets `NODE_ENV=production`.
 All runners use error-level logging. Raw JSON is written below the ignored
 `bench/results/`; a dated provenance copy and Go S1/S3 CPU profiles are kept
-under `bench/results-archive/`.
+under `bench/results-archive/` (gitignored). Historical archives cited by
+RESULTS.md and OPTIMIZATION.md were moved out of the repository to keep the
+module small; they are preserved as the `rivet-go-bench-archive-*.tar.gz`
+release asset, which unpacks to the same `results-archive/<date>` layout.
 
 Engine `v2.3.10` hard-codes a 10,000 request/minute limit per client IP. The
 load generator assigns one stable loopback `X-Forwarded-For` identity to each
