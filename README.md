@@ -134,7 +134,16 @@ The response is:
 {"output":3}
 ```
 
-The repository also includes a [WebSocket chat example](examples/chat).
+## More examples
+
+- [WebSocket chat](examples/chat): raw WebSockets, durable message sequencing,
+  hibernation, and graceful drain
+- [SQLite todo list](examples/todo-sqlite): migrations, CRUD, result decoding,
+  and transactions
+- [Durable reminder](examples/reminder): alarms, cancellation, actor sleep, and
+  alarm-driven wake
+- [Raw HTTP counter](examples/http-counter): a `net/http` actor API with
+  explicit state persistence
 
 ## Configuration
 

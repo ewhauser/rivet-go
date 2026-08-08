@@ -3,6 +3,7 @@ package conformance
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -210,6 +211,254 @@ func TestRunnableExamplesAndSIGTERMDrain(t *testing.T) {
 		t.Fatal("forced-deadline HTTP client did not resolve")
 	}
 	waitForRunner(t, engine.endpoint, forcedRunner, false)
+}
+
+func TestPortedRunnableExamples(t *testing.T) {
+	if testing.Short() {
+		t.Skip("real-engine example conformance is disabled by -short")
+	}
+	engineBinary, err := acquireEngine(context.Background())
+	if err != nil {
+		t.Fatalf("obtain Rivet engine %s: %v\n%s", engineTag, err, engineRemediation())
+	}
+	engine := startEngine(t, engineBinary)
+
+	t.Run("todo-sqlite", func(t *testing.T) {
+		runnerName := fmt.Sprintf("todo-sqlite-example-%d", time.Now().UnixNano())
+		process := startExample(t, buildExample(t, "todo-sqlite"),
+			"-endpoint", engine.endpoint,
+			"-runner-name", runnerName,
+		)
+		waitForRunner(t, engine.endpoint, runnerName, true)
+		actor := createActor(t, engine.endpoint, "todo-list", runnerName, "destroy", nil, nil)
+		waitForActor(t, engine.endpoint, actor.ActorID, false, func(actor actorRecord) bool {
+			return actor.ConnectableTS != nil && actor.DestroyTS == nil
+		})
+
+		type todoOutput struct {
+			ID        int64  `json:"id"`
+			Title     string `json:"title"`
+			Completed bool   `json:"completed"`
+			CreatedAt int64  `json:"createdAt"`
+		}
+		added := decodeActionOutput[todoOutput](t, gatewayAction(
+			t,
+			engine.endpoint,
+			actor.ActorID,
+			"add",
+			[]any{map[string]any{"title": "port the SQLite example"}},
+			10*time.Second,
+		), http.StatusOK)
+		if added.ID == 0 || added.Title != "port the SQLite example" || added.Completed || added.CreatedAt == 0 {
+			t.Fatalf("added todo = %#v", added)
+		}
+
+		listed := decodeActionOutput[[]todoOutput](t, gatewayAction(
+			t,
+			engine.endpoint,
+			actor.ActorID,
+			"list",
+			[]any{struct{}{}},
+			10*time.Second,
+		), http.StatusOK)
+		if len(listed) != 1 || listed[0] != added {
+			t.Fatalf("listed todos = %#v, want %#v", listed, []todoOutput{added})
+		}
+
+		toggled := decodeActionOutput[todoOutput](t, gatewayAction(
+			t,
+			engine.endpoint,
+			actor.ActorID,
+			"toggle",
+			[]any{map[string]any{"id": added.ID}},
+			10*time.Second,
+		), http.StatusOK)
+		if !toggled.Completed || toggled.ID != added.ID {
+			t.Fatalf("toggled todo = %#v", toggled)
+		}
+
+		deleted := decodeActionOutput[bool](t, gatewayAction(
+			t,
+			engine.endpoint,
+			actor.ActorID,
+			"delete",
+			[]any{map[string]any{"id": added.ID}},
+			10*time.Second,
+		), http.StatusOK)
+		if !deleted {
+			t.Fatal("delete action returned false")
+		}
+
+		stopExampleCleanly(t, engine.endpoint, runnerName, process)
+	})
+
+	t.Run("http-counter", func(t *testing.T) {
+		runnerName := fmt.Sprintf("http-counter-example-%d", time.Now().UnixNano())
+		process := startExample(t, buildExample(t, "http-counter"),
+			"-endpoint", engine.endpoint,
+			"-runner-name", runnerName,
+		)
+		waitForRunner(t, engine.endpoint, runnerName, true)
+		actor := createActor(t, engine.endpoint, "http-counter", runnerName, "destroy", nil, nil)
+		waitForActor(t, engine.endpoint, actor.ActorID, false, func(actor actorRecord) bool {
+			return actor.ConnectableTS != nil && actor.DestroyTS == nil
+		})
+
+		headers := make(http.Header)
+		headers.Set("Content-Type", "application/json")
+		response, body, err := gatewayHTTPRequest(
+			engine.endpoint,
+			actor.ActorID,
+			"/request/increment",
+			http.MethodPost,
+			[]byte(`{"amount":3}`),
+			headers,
+			10*time.Second,
+		)
+		assertHTTPCounter(t, response, body, err, http.StatusOK, 3)
+
+		response, body, err = gatewayHTTPRequest(
+			engine.endpoint,
+			actor.ActorID,
+			"/request/count",
+			http.MethodGet,
+			nil,
+			nil,
+			10*time.Second,
+		)
+		assertHTTPCounter(t, response, body, err, http.StatusOK, 3)
+
+		response, body, err = gatewayHTTPRequest(
+			engine.endpoint,
+			actor.ActorID,
+			"/request/increment",
+			http.MethodPost,
+			[]byte(`{"amount":1,"unknown":true}`),
+			headers,
+			10*time.Second,
+		)
+		if err != nil || response.StatusCode != http.StatusBadRequest {
+			t.Fatalf("invalid HTTP counter request: status=%s body=%q err=%v", responseStatus(response), body, err)
+		}
+
+		stopExampleCleanly(t, engine.endpoint, runnerName, process)
+	})
+
+	t.Run("reminder", func(t *testing.T) {
+		runnerName := fmt.Sprintf("reminder-example-%d", time.Now().UnixNano())
+		process := startExample(t, buildExample(t, "reminder"),
+			"-endpoint", engine.endpoint,
+			"-runner-name", runnerName,
+		)
+		waitForRunner(t, engine.endpoint, runnerName, true)
+		actor := createActor(t, engine.endpoint, "reminder", runnerName, "restart", nil, nil)
+		waitForActor(t, engine.endpoint, actor.ActorID, false, func(actor actorRecord) bool {
+			return actor.ConnectableTS != nil && actor.DestroyTS == nil
+		})
+
+		type reminderOutput struct {
+			Message       string `json:"message"`
+			Pending       bool   `json:"pending"`
+			DueAtMS       int64  `json:"dueAtMs"`
+			TriggeredAtMS int64  `json:"triggeredAtMs"`
+		}
+		scheduled := decodeActionOutput[reminderOutput](t, gatewayAction(
+			t,
+			engine.endpoint,
+			actor.ActorID,
+			"schedule",
+			[]any{map[string]any{
+				"message":           "wake from the example alarm",
+				"delayMilliseconds": 6_000,
+			}},
+			10*time.Second,
+		), http.StatusOK)
+		if !scheduled.Pending || scheduled.Message != "wake from the example alarm" || scheduled.DueAtMS == 0 {
+			t.Fatalf("scheduled reminder = %#v", scheduled)
+		}
+		decodeActionOutput[bool](t, gatewayAction(
+			t,
+			engine.endpoint,
+			actor.ActorID,
+			"sleep",
+			[]any{struct{}{}},
+			10*time.Second,
+		), http.StatusOK)
+		waitForActor(t, engine.endpoint, actor.ActorID, false, func(actor actorRecord) bool {
+			return actor.ConnectableTS == nil && actor.SleepTS != nil && actor.DestroyTS == nil
+		})
+		eventually(t, 45*time.Second, func() (bool, error) {
+			observed, err := getActor(engine.endpoint, actor.ActorID, false)
+			if err != nil {
+				return false, err
+			}
+			return observed.ConnectableTS != nil && observed.DestroyTS == nil, nil
+		})
+
+		triggered := decodeActionOutput[reminderOutput](t, gatewayAction(
+			t,
+			engine.endpoint,
+			actor.ActorID,
+			"status",
+			[]any{struct{}{}},
+			10*time.Second,
+		), http.StatusOK)
+		if triggered.Pending || triggered.TriggeredAtMS < triggered.DueAtMS || triggered.Message != scheduled.Message {
+			t.Fatalf("triggered reminder = %#v, scheduled = %#v", triggered, scheduled)
+		}
+
+		stopExampleCleanly(t, engine.endpoint, runnerName, process)
+	})
+}
+
+func decodeActionOutput[T any](t *testing.T, result gatewayResponse, status int) T {
+	t.Helper()
+	var zero T
+	if result.err != nil {
+		t.Fatalf("action request: %v", result.err)
+	}
+	if result.response == nil || result.response.StatusCode != status {
+		t.Fatalf("action status = %s, want %d; body=%s", responseStatus(result.response), status, result.body)
+	}
+	var response struct {
+		Output T `json:"output"`
+	}
+	if err := json.Unmarshal(result.body, &response); err != nil {
+		t.Fatalf("decode action response: %v; body=%s", err, result.body)
+		return zero
+	}
+	return response.Output
+}
+
+func assertHTTPCounter(
+	t *testing.T,
+	response *http.Response,
+	body []byte,
+	err error,
+	status, count int,
+) {
+	t.Helper()
+	if err != nil || response == nil || response.StatusCode != status {
+		t.Fatalf("HTTP counter: status=%s body=%q err=%v", responseStatus(response), body, err)
+	}
+	var output struct {
+		Count int `json:"count"`
+	}
+	if err := json.Unmarshal(body, &output); err != nil {
+		t.Fatalf("decode HTTP counter response: %v; body=%q", err, body)
+	}
+	if output.Count != count {
+		t.Fatalf("HTTP counter count = %d, want %d", output.Count, count)
+	}
+}
+
+func stopExampleCleanly(t *testing.T, endpoint, runnerName string, process *exampleProcess) {
+	t.Helper()
+	process.signal(t, syscall.SIGTERM)
+	if err := process.wait(15 * time.Second); err != nil {
+		t.Fatalf("example SIGTERM exit: %v\n%s", err, process.logTail())
+	}
+	waitForRunner(t, endpoint, runnerName, false)
 }
 
 type gatewayHTTPResponse struct {
