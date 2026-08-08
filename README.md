@@ -145,6 +145,12 @@ The response is:
   alarm-driven wake
 - [Raw HTTP counter](examples/http-counter): a `net/http` actor API with
   explicit state persistence
+- [Per-tenant company database](examples/per-tenant-database): keyed actors,
+  isolated durable state, identity metadata, and events
+- [Actor KV](examples/actor-kv): text and binary values, prefix listing,
+  reverse scans, limits, and deletion
+- [Connection admin](examples/connection-admin): enumerate, message, and
+  disconnect live raw gateway WebSockets
 
 ## RivetKit feature compatibility
 
