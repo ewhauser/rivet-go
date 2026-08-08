@@ -75,12 +75,13 @@ func main() {
 Each actor has typed state and processes work serially. State changed by a
 successful action is persisted automatically.
 
-Actor definitions can also provide:
+The SDK also supports:
 
 - lifecycle hooks and durable alarms
 - raw HTTP handlers
 - raw WebSocket handlers and broadcast
 - actor sleep and wake
+- actor identity and low-level actor KV
 - per-actor SQLite databases
 
 State changed from an HTTP or WebSocket handler must be persisted explicitly
@@ -149,25 +150,25 @@ The response is:
 
 This table compares the public Go API with the RivetKit actor surface at the
 [pinned Rivet Engine version](docs/PINNED-VERSION.md). "Supported" means the
-feature has a public Go API and real-engine conformance coverage. "Internal
-only" means the native boundary has plumbing for the feature, but package
-`rivet` does not expose it yet.
+feature has a public Go API and real-engine conformance coverage. "Partial"
+means the available portion is public and covered, but some upstream behavior
+is still missing.
 
 | RivetKit feature | Status | Go behavior |
 |---|---|---|
 | Typed actor state and actions | Supported | Actions are typed, serialized per actor, and persist the complete state after success. HTTP and WebSocket handlers call `Save` explicitly. |
 | Lifecycle hooks | Partial | `OnStart`, `OnStop`, and `OnAlarm` are available. There are no distinct create, wake, sleep, destroy, state-change, or background-run hooks. |
-| Actor input and identity | Partial | Context exposes raw creation input, actor ID, and generation. Actor name, key segments, creation time, and region are not public. |
+| Actor input and identity | Partial | Context exposes raw creation input, actor ID, generation, actor name, and the engine-formatted key. Individual key segments, creation time, and region are not public. |
 | Actor-to-actor and external Go clients | Not implemented | There is no Go equivalent of `client()`, `get`, `getOrCreate`, `create`, regional creation, or typed action/WebSocket clients. |
 | Actions and structured errors | Supported | Typed and raw CBOR actions, cooperative deadlines, panic isolation, and stable error codes are covered. |
 | Events and broadcast | Supported | Actors can broadcast named CBOR events to actor-connect and raw WebSocket clients, including exclusion of one raw connection. |
 | Raw HTTP handlers | Partial | Standard `net/http` request and response handling works, but the pinned core buffers complete responses, has no `http.Flusher`, and cannot represent repeated response-header values. |
 | Raw WebSocket handlers | Supported | Text and binary messages, connect/disconnect hooks, targeted sends, close frames, broadcast, and bounded backpressure are available. |
-| Connection state and enumeration | Not implemented | Connections have IDs, request paths, headers, and hibernation metadata, but no public per-connection state or actor connection map. |
+| Connection state and enumeration | Partial | `Connections` returns a sorted snapshot of live raw WebSocket connections. Connections expose IDs, request paths, headers, and hibernation metadata, but have no user-defined per-connection state. |
 | Actor sleep and WebSocket hibernation | Supported | Actors can request sleep; opted-in raw WebSockets remain connected and can wake the actor with a message. |
 | Durable scheduling | Partial | Each actor has one replaceable durable alarm with clear support. Multiple named schedules, action payloads, schedule IDs, and independent cancellation are not available. |
 | Cron schedules | Not implemented | Recurring cron expressions must be modeled manually by rescheduling the single alarm. |
-| Actor KV | Internal only | The pump implements get, list, put, and delete, but these operations are not part of the public typed context. Prefer state or SQLite. |
+| Actor KV | Supported | The byte-oriented `KV` handle supports get, list, put, and delete. It is retained for RivetKit compatibility; prefer typed state or SQLite for new actors. |
 | Per-actor SQLite | Supported | Opt-in raw SQL, typed values, queries, transactions, isolation, sleep/wake, and durability are covered. Result limits are documented in [Operations](docs/OPERATIONS.md). |
 | Durable queues | Not implemented | Queue sends, consumers, completion, retries, and priority patterns are outside the current Go boundary. |
 | Durable workflows | Not implemented | Workflow definitions, replay, steps, rollback, and history are not exposed. |

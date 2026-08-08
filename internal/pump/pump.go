@@ -159,6 +159,8 @@ func (s *Subscription) Cancel() {
 type ActorSession struct {
 	pump           *Pump
 	identity       actorIdentity
+	name           string
+	key            string
 	input          []byte
 	persistedState []byte
 	done           chan struct{}
@@ -231,6 +233,20 @@ func (s *ActorSession) Generation() uint64 {
 		return 0
 	}
 	return s.identity.generation
+}
+
+func (s *ActorSession) Name() string {
+	if s == nil {
+		return ""
+	}
+	return s.name
+}
+
+func (s *ActorSession) Key() string {
+	if s == nil {
+		return ""
+	}
+	return s.key
 }
 
 func (s *ActorSession) Input() []byte {
@@ -656,8 +672,8 @@ func (s *ActorSession) Save(ctx context.Context, state []byte) error {
 	}
 }
 
-// KVGet performs an actor-scoped core KV lookup. KV is retained at the M2
-// boundary for compatibility even though the public typed SDK uses state.
+// KVGet performs an actor-scoped core KV lookup. The public package wraps
+// these byte-oriented operations without exposing wire types.
 func (s *ActorSession) KVGet(ctx context.Context, key []byte) ([]byte, bool, error) {
 	result, err := s.kv(ctx, wire.Command{
 		Kind: wire.CommandKVGet,
@@ -1619,6 +1635,8 @@ func (p *Pump) handleInternalEvent(event wire.Event) error {
 		session := &ActorSession{
 			pump:             p,
 			identity:         identity,
+			name:             event.Name,
+			key:              event.Key,
 			input:            cloneBytes(event.Input),
 			persistedState:   cloneBytes(event.PersistedState),
 			done:             make(chan struct{}),

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -89,6 +90,14 @@ func TestWebSocketsAndActorEvents(t *testing.T) {
 		Actions: rivet.Actions[websocketState]{
 			"broadcast": rivet.Action(func(ctx *rivet.Context[websocketState], input websocketActionArgument) (bool, error) {
 				return true, ctx.Broadcast(input.Event, input.Payload)
+			}),
+			"connectionIDs": rivet.Action(func(ctx *rivet.Context[websocketState], _ struct{}) ([]string, error) {
+				connections := ctx.Connections()
+				ids := make([]string, len(connections))
+				for index, connection := range connections {
+					ids[index] = connection.ID()
+				}
+				return ids, nil
 			}),
 			"sendBurstTo": rivet.Action(func(_ *rivet.Context[websocketState], input websocketActionArgument) (int, error) {
 				stored, ok := connections.Load(input.Payload)
@@ -262,6 +271,14 @@ func TestWebSocketsAndActorEvents(t *testing.T) {
 	if openA.connectionID == "" || openB.connectionID == "" || openA.connectionID == openB.connectionID {
 		t.Fatalf("connection IDs = %q and %q, want distinct non-empty values", openA.connectionID, openB.connectionID)
 	}
+	wantIDs := []string{openA.connectionID, openB.connectionID}
+	slices.Sort(wantIDs)
+	connectionIDs := decodeActionOutput[[]string](t, gatewayAction(
+		t, engine.endpoint, actor.ActorID, "connectionIDs", []any{struct{}{}}, websocketTestTimeout,
+	), http.StatusOK)
+	if !slices.Equal(connectionIDs, wantIDs) {
+		t.Fatalf("public connection snapshot = %#v, want %#v", connectionIDs, wantIDs)
+	}
 	if !strings.Contains(openA.path, "/websocket/chat") || headerValue(openA.headers, "x-client-label") != "a" {
 		t.Fatalf("OnConnect metadata = path %q headers %#v", openA.path, openA.headers)
 	}
@@ -319,6 +336,12 @@ func TestWebSocketsAndActorEvents(t *testing.T) {
 	clientA.closeWithCode(t, websocket.CloseNormalClosure, "client closed")
 	disconnectA := waitWebSocketHook(t, disconnected, "a")
 	assertCloseObservation(t, disconnectA, websocket.CloseNormalClosure, "client closed")
+	connectionIDs = decodeActionOutput[[]string](t, gatewayAction(
+		t, engine.endpoint, actor.ActorID, "connectionIDs", []any{struct{}{}}, websocketTestTimeout,
+	), http.StatusOK)
+	if !slices.Equal(connectionIDs, []string{openB.connectionID}) {
+		t.Fatalf("connection snapshot after close = %#v, want %q", connectionIDs, openB.connectionID)
+	}
 	clientB.write(t, websocket.TextMessage, []byte("echo:b-survived-client-close"))
 	waitHandled(t, handled, "b")
 	waitTextFrame(t, clientB, "b-survived-client-close")

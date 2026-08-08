@@ -525,6 +525,12 @@ func TestActorStopWaitsForCleanupAndPreservesActorOrder(t *testing.T) {
 	cleanupRelease := make(chan struct{})
 	handler := lifecycleHandler{
 		start: func(_ context.Context, session *ActorSession, _ wire.Event) (any, error) {
+			if session.Name() != "counter" || session.Key() != "tenant/player" {
+				return nil, HandlerError{
+					Code:    "identity_mismatch",
+					Message: fmt.Sprintf("name=%q key=%q", session.Name(), session.Key()),
+				}
+			}
 			return session.AID(), nil
 		},
 		stop: func(_ context.Context, session *ActorSession, _ wire.Event, state any) error {
@@ -547,6 +553,7 @@ func TestActorStopWaitsForCleanupAndPreservesActorOrder(t *testing.T) {
 		AID:        "actor-1",
 		Generation: 3,
 		Name:       "counter",
+		Key:        "tenant/player",
 	})
 	startResult := nextCommand(t, runner)
 	if startResult.Kind != wire.CommandActorStartResult || !startResult.OK || startResult.Error != nil {

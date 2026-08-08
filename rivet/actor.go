@@ -51,6 +51,7 @@ type Actor[T any] struct {
 type Context[T any] struct {
 	session       *pump.ActorSession
 	db            *DB
+	kv            *KV
 	state         T
 	saveMu        sync.Mutex
 	connectionsMu sync.Mutex
@@ -78,6 +79,24 @@ func (c *Context[T]) ActorID() string {
 	return c.session.AID()
 }
 
+// Name returns the registered name of this actor type.
+func (c *Context[T]) Name() string {
+	if c == nil || c.session == nil {
+		return ""
+	}
+	return c.session.Name()
+}
+
+// Key returns the engine-formatted actor key, or an empty string for an
+// unkeyed actor. Rivet Engine v2.3.10 does not preserve individual key
+// segments at the Go boundary.
+func (c *Context[T]) Key() string {
+	if c == nil || c.session == nil {
+		return ""
+	}
+	return c.session.Key()
+}
+
 func (c *Context[T]) Generation() uint64 {
 	if c == nil || c.session == nil {
 		return 0
@@ -94,6 +113,16 @@ func (c *Context[T]) DB() *DB {
 		return nil
 	}
 	return c.db
+}
+
+// KV returns this actor generation's low-level key-value store.
+//
+// Deprecated: Prefer typed actor state or DB for new actors.
+func (c *Context[T]) KV() *KV {
+	if c == nil {
+		return nil
+	}
+	return c.kv
 }
 
 // Schedule replaces this actor's one durable alarm. The engine wakes a
@@ -195,6 +224,7 @@ func (a *actorAdapter[T]) Start(
 	actorContext := &Context[T]{
 		session:     session,
 		db:          db,
+		kv:          newKV(session),
 		state:       state,
 		connections: make(map[string]*Connection),
 	}
