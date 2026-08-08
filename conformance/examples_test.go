@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"sync"
 	"syscall"
 	"testing"
@@ -406,6 +407,277 @@ func TestPortedRunnableExamples(t *testing.T) {
 		if triggered.Pending || triggered.TriggeredAtMS < triggered.DueAtMS || triggered.Message != scheduled.Message {
 			t.Fatalf("triggered reminder = %#v, scheduled = %#v", triggered, scheduled)
 		}
+
+		stopExampleCleanly(t, engine.endpoint, runnerName, process)
+	})
+
+	t.Run("per-tenant-database", func(t *testing.T) {
+		runnerName := fmt.Sprintf("per-tenant-database-example-%d", time.Now().UnixNano())
+		process := startExample(t, buildExample(t, "per-tenant-database"),
+			"-endpoint", engine.endpoint,
+			"-runner-name", runnerName,
+		)
+		waitForRunner(t, engine.endpoint, runnerName, true)
+		acmeKey := "acme"
+		acme := createActor(t, engine.endpoint, "company-database", runnerName, "destroy", &acmeKey, nil)
+		waitForActor(t, engine.endpoint, acme.ActorID, false, func(actor actorRecord) bool {
+			return actor.ConnectableTS != nil && actor.DestroyTS == nil
+		})
+
+		type companyInfo struct {
+			ActorID     string `json:"actorId"`
+			ActorName   string `json:"actorName"`
+			ActorKey    string `json:"actorKey"`
+			CompanyName string `json:"companyName"`
+		}
+		info := decodeActionOutput[companyInfo](t, gatewayAction(
+			t, engine.endpoint, acme.ActorID, "getCompany", []any{struct{}{}}, 10*time.Second,
+		), http.StatusOK)
+		if info.ActorID != acme.ActorID || info.ActorName != "company-database" ||
+			info.ActorKey != acmeKey || info.CompanyName != acmeKey {
+			t.Fatalf("company identity = %#v", info)
+		}
+
+		type employeeOutput struct {
+			ID   string `json:"id"`
+			Name string `json:"name"`
+			Role string `json:"role"`
+		}
+		employee := decodeActionOutput[employeeOutput](t, gatewayAction(
+			t,
+			engine.endpoint,
+			acme.ActorID,
+			"addEmployee",
+			[]any{map[string]string{"name": "Ada", "role": "Engineer"}},
+			10*time.Second,
+		), http.StatusOK)
+		if employee.ID == "" || employee.Name != "Ada" || employee.Role != "Engineer" {
+			t.Fatalf("added employee = %#v", employee)
+		}
+
+		type projectOutput struct {
+			ID     string `json:"id"`
+			Name   string `json:"name"`
+			Status string `json:"status"`
+		}
+		project := decodeActionOutput[projectOutput](t, gatewayAction(
+			t,
+			engine.endpoint,
+			acme.ActorID,
+			"addProject",
+			[]any{map[string]string{"name": "Compiler", "status": "active"}},
+			10*time.Second,
+		), http.StatusOK)
+		if project.ID == "" || project.Name != "Compiler" || project.Status != "active" {
+			t.Fatalf("added project = %#v", project)
+		}
+
+		type companyStats struct {
+			EmployeeCount int   `json:"employeeCount"`
+			ProjectCount  int   `json:"projectCount"`
+			CreatedAt     int64 `json:"createdAt"`
+			UpdatedAt     int64 `json:"updatedAt"`
+		}
+		stats := decodeActionOutput[companyStats](t, gatewayAction(
+			t, engine.endpoint, acme.ActorID, "getStats", []any{struct{}{}}, 10*time.Second,
+		), http.StatusOK)
+		if stats.EmployeeCount != 1 || stats.ProjectCount != 1 || stats.CreatedAt == 0 || stats.UpdatedAt < stats.CreatedAt {
+			t.Fatalf("company stats = %#v", stats)
+		}
+
+		globexKey := "globex"
+		globex := createActor(t, engine.endpoint, "company-database", runnerName, "destroy", &globexKey, nil)
+		waitForActor(t, engine.endpoint, globex.ActorID, false, func(actor actorRecord) bool {
+			return actor.ConnectableTS != nil && actor.DestroyTS == nil
+		})
+		globexEmployees := decodeActionOutput[[]employeeOutput](t, gatewayAction(
+			t, engine.endpoint, globex.ActorID, "listEmployees", []any{struct{}{}}, 10*time.Second,
+		), http.StatusOK)
+		if len(globexEmployees) != 0 {
+			t.Fatalf("second tenant employees = %#v, want empty", globexEmployees)
+		}
+		globexInfo := decodeActionOutput[companyInfo](t, gatewayAction(
+			t, engine.endpoint, globex.ActorID, "getCompany", []any{struct{}{}}, 10*time.Second,
+		), http.StatusOK)
+		if globexInfo.CompanyName != globexKey || globexInfo.ActorKey != globexKey {
+			t.Fatalf("second tenant identity = %#v", globexInfo)
+		}
+
+		stopExampleCleanly(t, engine.endpoint, runnerName, process)
+	})
+
+	t.Run("actor-kv", func(t *testing.T) {
+		runnerName := fmt.Sprintf("actor-kv-example-%d", time.Now().UnixNano())
+		process := startExample(t, buildExample(t, "actor-kv"),
+			"-endpoint", engine.endpoint,
+			"-runner-name", runnerName,
+		)
+		waitForRunner(t, engine.endpoint, runnerName, true)
+		actor := createActor(t, engine.endpoint, "kv-store", runnerName, "destroy", nil, nil)
+		waitForActor(t, engine.endpoint, actor.ActorID, false, func(actor actorRecord) bool {
+			return actor.ConnectableTS != nil && actor.DestroyTS == nil
+		})
+
+		for key, value := range map[string]string{
+			"greeting:ada":   "hello",
+			"greeting:grace": "ahoy",
+			"other":          "ignored",
+		} {
+			stored := decodeActionOutput[bool](t, gatewayAction(
+				t,
+				engine.endpoint,
+				actor.ActorID,
+				"putText",
+				[]any{map[string]string{"key": key, "value": value}},
+				10*time.Second,
+			), http.StatusOK)
+			if !stored {
+				t.Fatalf("putText %q returned false", key)
+			}
+		}
+
+		type textValue struct {
+			Key   string `json:"key"`
+			Value string `json:"value"`
+			Found bool   `json:"found"`
+		}
+		got := decodeActionOutput[textValue](t, gatewayAction(
+			t,
+			engine.endpoint,
+			actor.ActorID,
+			"getText",
+			[]any{map[string]string{"key": "greeting:ada"}},
+			10*time.Second,
+		), http.StatusOK)
+		if !got.Found || got.Key != "greeting:ada" || got.Value != "hello" {
+			t.Fatalf("getText = %#v", got)
+		}
+
+		type textEntry struct {
+			Key   string `json:"key"`
+			Value string `json:"value"`
+		}
+		listed := decodeActionOutput[[]textEntry](t, gatewayAction(
+			t,
+			engine.endpoint,
+			actor.ActorID,
+			"listText",
+			[]any{map[string]any{"prefix": "greeting:", "reverse": true, "limit": 2}},
+			10*time.Second,
+		), http.StatusOK)
+		if len(listed) != 2 || listed[0].Key != "greeting:grace" || listed[1].Key != "greeting:ada" {
+			t.Fatalf("listText = %#v", listed)
+		}
+
+		bytesOutput := decodeActionOutput[[]int](t, gatewayAction(
+			t,
+			engine.endpoint,
+			actor.ActorID,
+			"roundtripBytes",
+			[]any{map[string]any{"key": "avatar", "values": []int{0, 127, 255}}},
+			10*time.Second,
+		), http.StatusOK)
+		if len(bytesOutput) != 3 || bytesOutput[0] != 0 || bytesOutput[1] != 127 || bytesOutput[2] != 255 {
+			t.Fatalf("roundtripBytes = %#v", bytesOutput)
+		}
+
+		deleted := decodeActionOutput[bool](t, gatewayAction(
+			t,
+			engine.endpoint,
+			actor.ActorID,
+			"delete",
+			[]any{map[string]string{"key": "greeting:ada"}},
+			10*time.Second,
+		), http.StatusOK)
+		if !deleted {
+			t.Fatal("delete returned false for an existing key")
+		}
+		missing := decodeActionOutput[textValue](t, gatewayAction(
+			t,
+			engine.endpoint,
+			actor.ActorID,
+			"getText",
+			[]any{map[string]string{"key": "greeting:ada"}},
+			10*time.Second,
+		), http.StatusOK)
+		if missing.Found || missing.Value != "" {
+			t.Fatalf("deleted value = %#v", missing)
+		}
+
+		stopExampleCleanly(t, engine.endpoint, runnerName, process)
+	})
+
+	t.Run("connection-admin", func(t *testing.T) {
+		runnerName := fmt.Sprintf("connection-admin-example-%d", time.Now().UnixNano())
+		process := startExample(t, buildExample(t, "connection-admin"),
+			"-endpoint", engine.endpoint,
+			"-runner-name", runnerName,
+		)
+		waitForRunner(t, engine.endpoint, runnerName, true)
+		actor := createActor(t, engine.endpoint, "connection-admin", runnerName, "destroy", nil, nil)
+		waitForActor(t, engine.endpoint, actor.ActorID, false, func(actor actorRecord) bool {
+			return actor.ConnectableTS != nil && actor.DestroyTS == nil
+		})
+
+		alpha := openGatewayWebSocket(t, engine.endpoint, actor.ActorID, "alpha", true)
+		waitTextFrame(t, alpha, "connected")
+		beta := openGatewayWebSocket(t, engine.endpoint, actor.ActorID, "beta", true)
+		waitTextFrame(t, beta, "connected")
+
+		type connectionSummary struct {
+			ID    string `json:"id"`
+			Label string `json:"label"`
+			Path  string `json:"path"`
+		}
+		connections := decodeActionOutput[[]connectionSummary](t, gatewayAction(
+			t, engine.endpoint, actor.ActorID, "listConnections", []any{struct{}{}}, 10*time.Second,
+		), http.StatusOK)
+		if len(connections) != 2 {
+			t.Fatalf("connection list = %#v, want two", connections)
+		}
+		ids := make(map[string]string, 2)
+		for _, connection := range connections {
+			if connection.ID == "" || !strings.Contains(connection.Path, "/websocket/chat") {
+				t.Fatalf("connection summary = %#v", connection)
+			}
+			ids[connection.Label] = connection.ID
+		}
+		if ids["alpha"] == "" || ids["beta"] == "" || ids["alpha"] == ids["beta"] {
+			t.Fatalf("connection IDs by label = %#v", ids)
+		}
+
+		sent := decodeActionOutput[bool](t, gatewayAction(
+			t,
+			engine.endpoint,
+			actor.ActorID,
+			"send",
+			[]any{map[string]string{"connectionId": ids["beta"], "message": "private-message"}},
+			10*time.Second,
+		), http.StatusOK)
+		if !sent {
+			t.Fatal("targeted send returned false")
+		}
+		waitTextFrame(t, beta, "private-message")
+		assertNoWebSocketFrame(t, alpha, 300*time.Millisecond)
+
+		disconnected := decodeActionOutput[bool](t, gatewayAction(
+			t,
+			engine.endpoint,
+			actor.ActorID,
+			"disconnect",
+			[]any{map[string]any{"connectionId": ids["alpha"], "code": 4001, "reason": "removed"}},
+			10*time.Second,
+		), http.StatusOK)
+		if !disconnected {
+			t.Fatal("disconnect returned false")
+		}
+		assertGatewayWebSocketClose(t, alpha, 4001, "removed")
+		eventually(t, 5*time.Second, func() (bool, error) {
+			connections = decodeActionOutput[[]connectionSummary](t, gatewayAction(
+				t, engine.endpoint, actor.ActorID, "listConnections", []any{struct{}{}}, 10*time.Second,
+			), http.StatusOK)
+			return len(connections) == 1 && connections[0].ID == ids["beta"], nil
+		})
 
 		stopExampleCleanly(t, engine.endpoint, runnerName, process)
 	})
