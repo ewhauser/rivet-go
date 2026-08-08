@@ -114,12 +114,14 @@ the socket still receives 1001, the runner disappears, and the process exits
 with code 1.
 
 `TestPortedRunnableExamples` compiles and runs the SQLite todo, durable
-reminder, raw HTTP counter, keyed per-tenant database, actor KV, and raw
-WebSocket connection-admin examples. It exercises SQLite migration, CRUD, and
-transactions; explicit HTTP state persistence; an alarm waking a sleeping
-actor; keyed state isolation; text and binary KV operations; and live
-connection listing, targeted sends, and actor-side disconnects. Every runner
-must also leave the engine cleanly after `SIGTERM`.
+reminder, raw HTTP counter, keyed per-tenant database, actor KV, raw WebSocket
+connection-admin, actor-actions, and cross-actor-actions examples. It exercises
+SQLite migration, CRUD, and transactions; explicit HTTP state persistence; an
+alarm waking a sleeping actor; keyed state isolation; text and binary KV
+operations; live connection administration; external Go actor creation and
+resolution; typed and raw action calls; and company-to-employee plus
+checkout-to-inventory calls through actor-scoped clients. Every runner must
+also leave the engine cleanly after `SIGTERM`.
 
 The soak is intentionally separate from `go test`: `cmd/soak` owns its engine,
 runner, gateway clients, chaos schedule, strict truth models, and final leak

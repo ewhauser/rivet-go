@@ -28,6 +28,39 @@ raw WebSockets have already received 1001, `Registry.Serve` returns an error,
 and the runnable examples exit with code 1. Treat that forced path as a
 production incident even when the process must continue exiting.
 
+## Actor clients and cross-actor calls
+
+`rivet.NewClient` creates an immutable external HTTP client. `Context.Client`
+returns the same client boundary scoped to the current actor generation. The
+scoped client inherits `Config.Endpoint`, `Namespace`, `RunnerName`, `Token`,
+`Headers`, and `HTTPClient`; headers are cloned during construction. Set the
+token explicitly in production. The local development launcher uses `dev`.
+
+Creation input is opaque bytes: `CreateOptions.Input` is base64-wrapped for the
+Engine management API and delivered unchanged by `Context.Input`. Key segments
+use Rivet's stable escaping format. A nil `CreateOptions.Key` creates an
+unkeyed actor, while a non-nil empty key is a keyed actor with zero segments.
+`GetOrCreate` always uses a key and atomically resolves or creates it in the
+Engine.
+
+Every request honors its `context.Context`. A custom `Config.HTTPClient` or
+`ClientConfig.HTTPClient` can enforce transport-wide timeouts and connection
+pool policy. Non-success Engine responses become `*rivet.ClientError` with
+HTTP status, group, code, message, metadata, actor generation details, and ray
+ID when present. `errors.Is(err, rivet.ErrActorNotFound)` handles both an empty
+resolution and a structured `actor/not_found` response.
+
+An actor keeps its serial action slot while waiting for an actor-to-actor call.
+The SDK rejects a direct call to the same actor with `rivet.ErrSelfCall`, but it
+cannot detect a longer cycle such as A calling B while B calls A. Design call
+graphs without cycles and propagate the action context so deadlines cancel the
+whole chain. Each action call is one HTTP request and is not silently replayed
+across lifecycle transitions.
+
+Multi-actor work is not transactional. A remote action may commit before the
+calling actor saves its own state. Store an idempotency key or durable workflow
+state when partial failure must be recovered rather than merely reported.
+
 ## Per-actor SQLite
 
 SQLite is an actor capability. Declare it only on actor types that use

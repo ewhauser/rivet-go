@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"os"
 	"os/signal"
 	"sort"
@@ -32,9 +33,14 @@ const (
 // version. TotalSlots remains a stable boundary field but v2.3.10 does not
 // expose a CoreRegistry setter for it.
 type Config struct {
-	Endpoint        string
-	Namespace       string
-	RunnerName      string
+	Endpoint   string
+	Namespace  string
+	RunnerName string
+	// Token, Headers, and HTTPClient configure clients obtained from an actor's
+	// Context. They do not alter the native runner registration transport.
+	Token           string
+	Headers         http.Header
+	HTTPClient      *http.Client
 	Version         uint32
 	TotalSlots      uint32
 	LogLevel        string
@@ -139,6 +145,22 @@ func (r *Registry) Serve(ctx context.Context, config Config) error {
 
 	actorNames, actorActions, actorHibernateWebSockets, actorDatabases, handlers := r.snapshotActors()
 	config = withDefaults(config)
+	actorClient, err := NewClient(ClientConfig{
+		Endpoint:   config.Endpoint,
+		Namespace:  config.Namespace,
+		RunnerName: config.RunnerName,
+		Token:      config.Token,
+		Headers:    config.Headers,
+		HTTPClient: config.HTTPClient,
+	})
+	if err != nil {
+		return fmt.Errorf("configure actor client: %w", err)
+	}
+	for _, handler := range handlers {
+		if configurable, ok := handler.(interface{ setClient(*Client) }); ok {
+			configurable.setClient(actorClient)
+		}
+	}
 	config.SQLiteTransport = resolveSQLiteTransport(
 		config.SQLiteTransport,
 		os.Getenv("RIVET_GO_SQLITE_TRANSPORT"),

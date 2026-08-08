@@ -17,6 +17,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/ewhauser/rivet-go/rivet"
 	"github.com/fxamacker/cbor/v2"
 	"github.com/gorilla/websocket"
 )
@@ -678,6 +679,157 @@ func TestPortedRunnableExamples(t *testing.T) {
 			), http.StatusOK)
 			return len(connections) == 1 && connections[0].ID == ids["beta"], nil
 		})
+
+		stopExampleCleanly(t, engine.endpoint, runnerName, process)
+	})
+
+	t.Run("actor-actions", func(t *testing.T) {
+		runnerName := fmt.Sprintf("actor-actions-example-%d", time.Now().UnixNano())
+		process := startExample(t, buildExample(t, "actor-actions"),
+			"-endpoint", engine.endpoint,
+			"-runner-name", runnerName,
+			"-token", "dev",
+		)
+		waitForRunner(t, engine.endpoint, runnerName, true)
+		client, err := rivet.NewClient(rivet.ClientConfig{
+			Endpoint: engine.endpoint, RunnerName: runnerName, Token: "dev",
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		companyInput, err := json.Marshal(map[string]string{
+			"name": "Growing Corp", "industry": "Technology",
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		company, err := client.Create(context.Background(), "company", rivet.CreateOptions{
+			Key: []string{"34-5678901"}, Input: companyInput, CrashPolicy: rivet.CrashPolicyDestroy,
+		})
+		if err != nil {
+			t.Fatalf("create company: %v", err)
+		}
+		type companyProfile struct {
+			ID       string `json:"id"`
+			Name     string `json:"name"`
+			Industry string `json:"industry"`
+		}
+		profile, err := rivet.Call[companyProfile](context.Background(), company, "getProfile", struct{}{})
+		if err != nil || profile.ID == "" || profile.Name != "Growing Corp" || profile.Industry != "Technology" {
+			t.Fatalf("company profile = %#v, %v", profile, err)
+		}
+		resolved, err := client.Get(context.Background(), company.ID())
+		if err != nil || resolved.ID() != company.ID() {
+			t.Fatalf("resolve company by ID = %q, %v", resolved.ID(), err)
+		}
+		sameCompany, created, err := client.GetOrCreate(
+			context.Background(), "company", []string{"34-5678901"}, rivet.CreateOptions{Input: companyInput},
+		)
+		if err != nil || created || sameCompany.ID() != company.ID() {
+			t.Fatalf("get-or-create company = %q, created=%v, err=%v", sameCompany.ID(), created, err)
+		}
+
+		type employeeProfile struct {
+			EmployeeID string `json:"employeeId"`
+			Name       string `json:"name"`
+			Email      string `json:"email"`
+			Position   string `json:"position"`
+			CompanyID  string `json:"companyId"`
+			HiredAt    int64  `json:"hiredAt"`
+		}
+		employee, err := rivet.Call[employeeProfile](context.Background(), company, "createEmployee", map[string]string{
+			"name": "Jane Smith", "email": "jane@growingcorp.com", "position": "Software Engineer",
+		})
+		if err != nil || employee.EmployeeID == "" || employee.CompanyID != profile.ID || employee.HiredAt == 0 {
+			t.Fatalf("created employee = %#v, %v", employee, err)
+		}
+		employeeActor, err := client.GetByKey(context.Background(), "employee", []string{"jane@growingcorp.com"})
+		if err != nil {
+			t.Fatalf("resolve employee by key: %v", err)
+		}
+		employee, err = rivet.Call[employeeProfile](context.Background(), employeeActor, "updateProfile", map[string]string{
+			"position": "Senior Engineer",
+		})
+		if err != nil || employee.Position != "Senior Engineer" || employee.Email != "jane@growingcorp.com" {
+			t.Fatalf("updated employee = %#v, %v", employee, err)
+		}
+		employeesJSON, err := company.CallRaw(context.Background(), "getEmployees", json.RawMessage(`[{}]`))
+		if err != nil || string(employeesJSON) != `["jane@growingcorp.com"]` {
+			t.Fatalf("raw getEmployees = %s, %v", employeesJSON, err)
+		}
+
+		stopExampleCleanly(t, engine.endpoint, runnerName, process)
+	})
+
+	t.Run("cross-actor-actions", func(t *testing.T) {
+		runnerName := fmt.Sprintf("cross-actor-actions-example-%d", time.Now().UnixNano())
+		process := startExample(t, buildExample(t, "cross-actor-actions"),
+			"-endpoint", engine.endpoint,
+			"-runner-name", runnerName,
+			"-token", "dev",
+		)
+		waitForRunner(t, engine.endpoint, runnerName, true)
+		client, err := rivet.NewClient(rivet.ClientConfig{
+			Endpoint: engine.endpoint, RunnerName: runnerName, Token: "dev",
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		inventoryInput, err := json.Marshal(map[string]any{"itemName": "Laptop", "initialStock": 10})
+		if err != nil {
+			t.Fatal(err)
+		}
+		inventory, err := client.Create(context.Background(), "inventory", rivet.CreateOptions{
+			Key: []string{"laptop"}, Input: inventoryInput, CrashPolicy: rivet.CrashPolicyDestroy,
+		})
+		if err != nil {
+			t.Fatalf("create inventory: %v", err)
+		}
+		checkoutInput, err := json.Marshal(map[string]string{"customerName": "Alice"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		checkout, err := client.Create(context.Background(), "checkout", rivet.CreateOptions{
+			Key: []string{"checkout-1"}, Input: checkoutInput, CrashPolicy: rivet.CrashPolicyDestroy,
+		})
+		if err != nil {
+			t.Fatalf("create checkout: %v", err)
+		}
+		type checkoutResult struct {
+			Success        bool   `json:"success"`
+			Message        string `json:"message"`
+			RemainingStock int    `json:"remainingStock"`
+		}
+		added, err := rivet.Call[checkoutResult](context.Background(), checkout, "addItem", map[string]any{
+			"itemId": "laptop", "quantity": 3,
+		})
+		if err != nil || !added.Success || added.RemainingStock != 7 || !strings.Contains(added.Message, "Laptop") {
+			t.Fatalf("add item = %#v, %v", added, err)
+		}
+		type stockResult struct {
+			ItemName string `json:"itemName"`
+			Stock    int    `json:"stock"`
+		}
+		stock, err := rivet.Call[stockResult](context.Background(), inventory, "getStock", struct{}{})
+		if err != nil || stock.ItemName != "Laptop" || stock.Stock != 7 {
+			t.Fatalf("reserved stock = %#v, %v", stock, err)
+		}
+		type checkoutSummary struct {
+			Items      []map[string]any `json:"items"`
+			TotalItems int              `json:"totalItems"`
+		}
+		summary, err := rivet.Call[checkoutSummary](context.Background(), checkout, "getSummary", struct{}{})
+		if err != nil || summary.TotalItems != 3 || len(summary.Items) != 1 {
+			t.Fatalf("checkout summary = %#v, %v", summary, err)
+		}
+		canceled, err := rivet.Call[checkoutResult](context.Background(), checkout, "cancelCheckout", struct{}{})
+		if err != nil || !canceled.Success {
+			t.Fatalf("cancel checkout = %#v, %v", canceled, err)
+		}
+		stock, err = rivet.Call[stockResult](context.Background(), inventory, "getStock", struct{}{})
+		if err != nil || stock.Stock != 10 {
+			t.Fatalf("released stock = %#v, %v", stock, err)
+		}
 
 		stopExampleCleanly(t, engine.endpoint, runnerName, process)
 	})

@@ -78,6 +78,7 @@ successful action is persisted automatically.
 The SDK also supports:
 
 - lifecycle hooks and durable alarms
+- external and actor-scoped clients for actor creation, resolution, and actions
 - raw HTTP handlers
 - raw WebSocket handlers and broadcast
 - actor sleep and wake
@@ -86,6 +87,54 @@ The SDK also supports:
 
 State changed from an HTTP or WebSocket handler must be persisted explicitly
 with `ctx.Save`.
+
+## Call actors from Go
+
+Create one client and share it across goroutines:
+
+```go
+client, err := rivet.NewClient(rivet.ClientConfig{
+	Endpoint:   "http://127.0.0.1:6420",
+	Namespace:  "default",
+	RunnerName: "counter-example",
+	Token:      "dev",
+})
+if err != nil {
+	log.Fatal(err)
+}
+
+counter, _, err := client.GetOrCreate(
+	context.Background(),
+	"counter",
+	[]string{"account-123"},
+	rivet.CreateOptions{},
+)
+if err != nil {
+	log.Fatal(err)
+}
+
+count, err := rivet.Call[int](
+	context.Background(),
+	counter,
+	"increment",
+	IncrementArgs{Amount: 3},
+)
+if err != nil {
+	log.Fatal(err)
+}
+fmt.Println(count)
+```
+
+`Create`, `Get`, `GetByKey`, and `GetOrCreate` return immutable actor handles.
+`rivet.Call[T]` decodes typed action results; `ActorHandle.Call` and `CallRaw`
+provide raw JSON output and exact JSON argument-array control. Creation input
+is an opaque byte slice delivered unchanged by `Context.Input`.
+
+Actors use `ctx.Client()` for the same operations. The actor-scoped client
+inherits endpoint, namespace, runner name, token, headers, and HTTP transport
+from `rivet.Config`. A direct call back to the current actor returns
+`rivet.ErrSelfCall`, because waiting for work queued behind the current action
+would deadlock.
 
 ## Run the counter example
 
@@ -151,6 +200,10 @@ The response is:
   reverse scans, limits, and deletion
 - [Connection admin](examples/connection-admin): enumerate, message, and
   disconnect live raw gateway WebSockets
+- [Actor actions](examples/actor-actions): typed action calls, creation input,
+  actor resolution, and company-created employee actors
+- [Cross-actor actions](examples/cross-actor-actions): checkout and inventory
+  actors coordinating through actor-scoped clients
 
 ## RivetKit feature compatibility
 
@@ -165,7 +218,8 @@ is still missing.
 | Typed actor state and actions | Supported | Actions are typed, serialized per actor, and persist the complete state after success. HTTP and WebSocket handlers call `Save` explicitly. |
 | Lifecycle hooks | Partial | `OnStart`, `OnStop`, and `OnAlarm` are available. There are no distinct create, wake, sleep, destroy, state-change, or background-run hooks. |
 | Actor input and identity | Partial | Context exposes raw creation input, actor ID, generation, actor name, and the engine-formatted key. Individual key segments, creation time, and region are not public. |
-| Actor-to-actor and external Go clients | Not implemented | There is no Go equivalent of `client()`, `get`, `getOrCreate`, `create`, regional creation, or typed action/WebSocket clients. |
+| Actor-to-actor and external action clients | Supported | Concurrency-safe clients expose `Get`, `GetByKey`, `GetOrCreate`, `Create`, regional creation, exact creation input, typed/raw action calls, structured errors, cancellation, and actor-scoped clients with direct self-call rejection. |
+| ActorConnect and WebSocket clients | Not implemented | The Go client does not yet expose subscriptions, client events, reconnect, connection parameters, or the ActorConnect WebSocket protocol. Raw gateway WebSocket handlers remain supported on the actor side. |
 | Actions and structured errors | Supported | Typed and raw CBOR actions, cooperative deadlines, panic isolation, and stable error codes are covered. |
 | Events and broadcast | Supported | Actors can broadcast named CBOR events to actor-connect and raw WebSocket clients, including exclusion of one raw connection. |
 | Raw HTTP handlers | Partial | Standard `net/http` request and response handling works, but the pinned core buffers complete responses, has no `http.Flusher`, and cannot represent repeated response-header values. |
@@ -188,16 +242,21 @@ is still missing.
 ## Configuration
 
 Pass a `rivet.Config` to `Serve` to configure the engine endpoint, namespace,
-runner identity, logging, metrics hooks, SQLite transport, and graceful
-shutdown deadline:
+runner identity, actor-client authentication and transport, logging, metrics
+hooks, SQLite transport, and graceful shutdown deadline:
 
 ```go
 err := rivet.Serve(registry, rivet.Config{
 	Endpoint:   "http://127.0.0.1:6420",
 	Namespace:  "default",
 	RunnerName: "my-runner",
+	Token:      os.Getenv("RIVET_TOKEN"),
 })
 ```
+
+`Config.Headers` and `Config.HTTPClient` are also inherited by every
+actor-scoped client. `NewClient` accepts the same fields independently for
+clients outside a runner.
 
 `Serve` listens for `SIGINT` and `SIGTERM` and drains admitted work before
 returning. Services that already manage process signals can use
