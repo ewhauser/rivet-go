@@ -50,6 +50,14 @@ func TestWebSocketHooksPreserveConnectionAndFrameMetadata(t *testing.T) {
 	if opened.ID() != "ws-1" || opened.Path() != "/chat?room=one" || opened.CanHibernate() {
 		t.Fatalf("opened connection = %#v", opened)
 	}
+	connections := actorContext.Connections()
+	if len(connections) != 1 || connections[0] != opened {
+		t.Fatalf("Connections after open = %#v", connections)
+	}
+	connections[0] = nil
+	if current := actorContext.Connections(); len(current) != 1 || current[0] != opened {
+		t.Fatalf("mutating connection snapshot changed actor state: %#v", current)
+	}
 	headers := opened.Headers()
 	headers["x-test"] = "changed"
 	if opened.Headers()["x-test"] != "one" {
@@ -76,12 +84,29 @@ func TestWebSocketHooksPreserveConnectionAndFrameMetadata(t *testing.T) {
 	if !opened.Closed() {
 		t.Fatal("connection was not marked closed")
 	}
+	if connections := actorContext.Connections(); len(connections) != 0 {
+		t.Fatalf("Connections after close = %#v, want empty", connections)
+	}
 	gotCode, gotReason := opened.CloseInfo()
 	if gotCode == nil || *gotCode != 1000 || gotReason != "done" {
 		t.Fatalf("close info = %v %q", gotCode, gotReason)
 	}
 	if !reflect.DeepEqual(seen, []string{"open", "message", "close"}) {
 		t.Fatalf("hook order = %#v", seen)
+	}
+}
+
+func TestConnectionsReturnsSortedSnapshot(t *testing.T) {
+	actorContext := &Context[struct{}]{connections: map[string]*Connection{
+		"ws-z": {id: "ws-z"},
+		"ws-a": {id: "ws-a"},
+	}}
+	connections := actorContext.Connections()
+	if len(connections) != 2 || connections[0].ID() != "ws-a" || connections[1].ID() != "ws-z" {
+		t.Fatalf("Connections = %#v, want ID order ws-a, ws-z", connections)
+	}
+	if connections := (*Context[struct{}])(nil).Connections(); connections != nil {
+		t.Fatalf("nil Context Connections = %#v, want nil", connections)
 	}
 }
 

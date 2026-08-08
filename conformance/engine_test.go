@@ -433,6 +433,124 @@ func TestNativeKVListCrossesPollBatchBoundaryAndReportsErrors(t *testing.T) {
 	waitForNativeEvent(t, runner, wire.EventRunnerStopped, 5*time.Second)
 }
 
+func TestPublicActorIdentityAndKV(t *testing.T) {
+	if testing.Short() {
+		t.Skip("real-engine conformance is disabled by -short")
+	}
+	engineBinary, err := acquireEngine(context.Background())
+	if err != nil {
+		t.Fatalf("obtain Rivet engine %s: %v\n%s", engineTag, err, engineRemediation())
+	}
+	engine := startEngine(t, engineBinary)
+
+	type identity struct {
+		ActorID string
+		Name    string
+		Key     string
+	}
+	type entry struct {
+		Key   string `json:"key"`
+		Value string `json:"value"`
+	}
+	started := make(chan identity, 1)
+	registry := rivet.NewRegistry()
+	if err := rivet.Register(registry, "public-kv", rivet.Actor[struct{}]{
+		OnStart: func(ctx *rivet.Context[struct{}]) error {
+			started <- identity{ActorID: ctx.ActorID(), Name: ctx.Name(), Key: ctx.Key()}
+			return nil
+		},
+		Actions: rivet.Actions[struct{}]{
+			"put": rivet.Action(func(ctx *rivet.Context[struct{}], input entry) (bool, error) {
+				return true, ctx.KV().Put(context.Background(), []byte(input.Key), []byte(input.Value))
+			}),
+			"get": rivet.Action(func(ctx *rivet.Context[struct{}], key string) (entry, error) {
+				value, found, err := ctx.KV().Get(context.Background(), []byte(key))
+				if err != nil || !found {
+					return entry{}, err
+				}
+				return entry{Key: key, Value: string(value)}, nil
+			}),
+			"list": rivet.Action(func(ctx *rivet.Context[struct{}], prefix string) ([]entry, error) {
+				entries, err := ctx.KV().List(context.Background(), rivet.KVListOptions{
+					Prefix:  []byte(prefix),
+					Reverse: true,
+					Limit:   2,
+				})
+				if err != nil {
+					return nil, err
+				}
+				result := make([]entry, len(entries))
+				for index, item := range entries {
+					result[index] = entry{Key: string(item.Key), Value: string(item.Value)}
+				}
+				return result, nil
+			}),
+			"delete": rivet.Action(func(ctx *rivet.Context[struct{}], key string) (bool, error) {
+				return true, ctx.KV().Delete(context.Background(), []byte(key))
+			}),
+		},
+	}); err != nil {
+		t.Fatalf("register public KV actor: %v", err)
+	}
+	runnerName := fmt.Sprintf("rivet-go-public-kv-%d", time.Now().UnixNano())
+	served := startRegistry(t, engine, runnerName, registry)
+	key := "tenant/player"
+	actor := createActor(t, engine.endpoint, "public-kv", runnerName, "destroy", &key, nil)
+	waitForActor(t, engine.endpoint, actor.ActorID, false, func(actor actorRecord) bool {
+		return actor.ConnectableTS != nil && actor.DestroyTS == nil
+	})
+
+	select {
+	case observed := <-started:
+		if observed.ActorID != actor.ActorID || observed.Name != "public-kv" || observed.Key != key {
+			t.Fatalf("public actor identity = %#v, actor = %#v", observed, actor)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("public KV actor OnStart did not run")
+	}
+
+	for _, item := range []entry{
+		{Key: "items/a", Value: "one"},
+		{Key: "items/b", Value: "two"},
+		{Key: "items/c", Value: "three"},
+	} {
+		stored := decodeActionOutput[bool](t, gatewayAction(
+			t, engine.endpoint, actor.ActorID, "put", []any{item}, 10*time.Second,
+		), http.StatusOK)
+		if !stored {
+			t.Fatalf("put %q returned false", item.Key)
+		}
+	}
+	got := decodeActionOutput[entry](t, gatewayAction(
+		t, engine.endpoint, actor.ActorID, "get", []any{"items/b"}, 10*time.Second,
+	), http.StatusOK)
+	if got != (entry{Key: "items/b", Value: "two"}) {
+		t.Fatalf("public KV get = %#v", got)
+	}
+	listed := decodeActionOutput[[]entry](t, gatewayAction(
+		t, engine.endpoint, actor.ActorID, "list", []any{"items/"}, 10*time.Second,
+	), http.StatusOK)
+	if len(listed) != 2 || listed[0].Key != "items/c" || listed[1].Key != "items/b" {
+		t.Fatalf("public KV reverse limited list = %#v", listed)
+	}
+	deleted := decodeActionOutput[bool](t, gatewayAction(
+		t, engine.endpoint, actor.ActorID, "delete", []any{"items/b"}, 10*time.Second,
+	), http.StatusOK)
+	if !deleted {
+		t.Fatal("delete returned false")
+	}
+	listed = decodeActionOutput[[]entry](t, gatewayAction(
+		t, engine.endpoint, actor.ActorID, "list", []any{"items/"}, 10*time.Second,
+	), http.StatusOK)
+	if len(listed) != 2 || listed[0].Key != "items/c" || listed[1].Key != "items/a" {
+		t.Fatalf("public KV list after delete = %#v", listed)
+	}
+
+	deleteActor(t, engine.endpoint, actor.ActorID)
+	served.stop(t)
+	engine.stop()
+}
+
 func TestCounterStatePersistsAcrossEngineRestart(t *testing.T) {
 	if testing.Short() {
 		t.Skip("real-engine conformance is disabled by -short")

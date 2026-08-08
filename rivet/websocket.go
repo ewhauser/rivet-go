@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -183,6 +184,25 @@ func (c *Connection) setClose(code *uint16, reason string) {
 	}
 	c.closeReason = reason
 	c.closeMu.Unlock()
+}
+
+// Connections returns a snapshot of this actor generation's live raw
+// WebSocket connections, sorted by connection ID. The returned slice can be
+// modified by the caller; a connection in the snapshot may close afterward.
+func (c *Context[T]) Connections() []*Connection {
+	if c == nil {
+		return nil
+	}
+	c.connectionsMu.Lock()
+	connections := make([]*Connection, 0, len(c.connections))
+	for _, connection := range c.connections {
+		connections = append(connections, connection)
+	}
+	c.connectionsMu.Unlock()
+	slices.SortFunc(connections, func(left, right *Connection) int {
+		return strings.Compare(left.ID(), right.ID())
+	})
+	return connections
 }
 
 // Broadcast emits a named event with one typed payload to every live actor
