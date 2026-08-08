@@ -50,6 +50,7 @@ type Actor[T any] struct {
 // typed value loaded from core's persisted snapshot.
 type Context[T any] struct {
 	session       *pump.ActorSession
+	client        *Client
 	db            *DB
 	kv            *KV
 	state         T
@@ -77,6 +78,17 @@ func (c *Context[T]) ActorID() string {
 		return ""
 	}
 	return c.session.AID()
+}
+
+// Client returns an actor-scoped Engine client. The client inherits endpoint,
+// namespace, runner name, authentication, headers, and HTTP transport from the
+// serving Config. Calls to this actor generation fail with ErrSelfCall instead
+// of waiting forever on the actor's serialized action queue.
+func (c *Context[T]) Client() *Client {
+	if c == nil {
+		return nil
+	}
+	return c.client
 }
 
 // Name returns the registered name of this actor type.
@@ -190,6 +202,21 @@ func (c *Context[T]) Save(ctx context.Context) error {
 
 type actorAdapter[T any] struct {
 	definition Actor[T]
+	clientMu   sync.RWMutex
+	client     *Client
+}
+
+func (a *actorAdapter[T]) setClient(client *Client) {
+	a.clientMu.Lock()
+	a.client = client
+	a.clientMu.Unlock()
+}
+
+func (a *actorAdapter[T]) clientForActor(actorID string) *Client {
+	a.clientMu.RLock()
+	client := a.client
+	a.clientMu.RUnlock()
+	return client.withSourceActor(actorID)
 }
 
 func (a *actorAdapter[T]) actionNames() []string {
@@ -223,6 +250,7 @@ func (a *actorAdapter[T]) Start(
 	}
 	actorContext := &Context[T]{
 		session:     session,
+		client:      a.clientForActor(session.AID()),
 		db:          db,
 		kv:          newKV(session),
 		state:       state,
