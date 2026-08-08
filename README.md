@@ -145,6 +145,39 @@ The response is:
 - [Raw HTTP counter](examples/http-counter): a `net/http` actor API with
   explicit state persistence
 
+## RivetKit feature compatibility
+
+This table compares the public Go API with the RivetKit actor surface at the
+[pinned Rivet Engine version](docs/PINNED-VERSION.md). "Supported" means the
+feature has a public Go API and real-engine conformance coverage. "Internal
+only" means the native boundary has plumbing for the feature, but package
+`rivet` does not expose it yet.
+
+| RivetKit feature | Status | Go behavior |
+|---|---|---|
+| Typed actor state and actions | Supported | Actions are typed, serialized per actor, and persist the complete state after success. HTTP and WebSocket handlers call `Save` explicitly. |
+| Lifecycle hooks | Partial | `OnStart`, `OnStop`, and `OnAlarm` are available. There are no distinct create, wake, sleep, destroy, state-change, or background-run hooks. |
+| Actor input and identity | Partial | Context exposes raw creation input, actor ID, and generation. Actor name, key segments, creation time, and region are not public. |
+| Actor-to-actor and external Go clients | Not implemented | There is no Go equivalent of `client()`, `get`, `getOrCreate`, `create`, regional creation, or typed action/WebSocket clients. |
+| Actions and structured errors | Supported | Typed and raw CBOR actions, cooperative deadlines, panic isolation, and stable error codes are covered. |
+| Events and broadcast | Supported | Actors can broadcast named CBOR events to actor-connect and raw WebSocket clients, including exclusion of one raw connection. |
+| Raw HTTP handlers | Partial | Standard `net/http` request and response handling works, but the pinned core buffers complete responses, has no `http.Flusher`, and cannot represent repeated response-header values. |
+| Raw WebSocket handlers | Supported | Text and binary messages, connect/disconnect hooks, targeted sends, close frames, broadcast, and bounded backpressure are available. |
+| Connection state and enumeration | Not implemented | Connections have IDs, request paths, headers, and hibernation metadata, but no public per-connection state or actor connection map. |
+| Actor sleep and WebSocket hibernation | Supported | Actors can request sleep; opted-in raw WebSockets remain connected and can wake the actor with a message. |
+| Durable scheduling | Partial | Each actor has one replaceable durable alarm with clear support. Multiple named schedules, action payloads, schedule IDs, and independent cancellation are not available. |
+| Cron schedules | Not implemented | Recurring cron expressions must be modeled manually by rescheduling the single alarm. |
+| Actor KV | Internal only | The pump implements get, list, put, and delete, but these operations are not part of the public typed context. Prefer state or SQLite. |
+| Per-actor SQLite | Supported | Opt-in raw SQL, typed values, queries, transactions, isolation, sleep/wake, and durability are covered. Result limits are documented in [Operations](docs/OPERATIONS.md). |
+| Durable queues | Not implemented | Queue sends, consumers, completion, retries, and priority patterns are outside the current Go boundary. |
+| Durable workflows | Not implemented | Workflow definitions, replay, steps, rollback, and history are not exposed. |
+| Actor-scoped background work | Not implemented | Go has no lifecycle-integrated equivalent of `run`, `keepAwake`, or `waitUntil`; unmanaged goroutines cannot extend actor lifetime safely. |
+| Actor destruction | Not implemented | Actors can sleep but cannot request their own destruction through the Go context. |
+| Dynamic actors | Not implemented | Loading actor definitions from generated or user-provided source is not supported. |
+| Custom inspector tabs | Not implemented | The inspector/devtools extension protocol and actor-supplied tab assets are not exposed. |
+| Serverless and WebAssembly runners | Not implemented | The SDK hosts long-running native runner processes; Cloudflare Workers, Supabase Functions, and custom serverless runtimes are outside the current target. |
+| Process drain, logging, and metrics | Supported | Signal-aware graceful drain, structured `slog` output, stable metrics hooks, and strict soak coverage are included. |
+
 ## Configuration
 
 Pass a `rivet.Config` to `Serve` to configure the engine endpoint, namespace,
