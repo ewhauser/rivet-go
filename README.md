@@ -1,62 +1,112 @@
 # rivet-go
 
-`rivet-go` hosts typed Go actors on Rivet Engine. It embeds a pinned
-`rivetkit-core` adapter and loads it with
-[purego](https://github.com/ebitengine/purego), so applications need neither
-cgo nor a C toolchain at build time.
+A Go SDK for running actors on [Rivet Engine](https://github.com/rivet-dev/rivet).
 
-The SDK includes typed state and actions, raw HTTP and WebSocket handlers,
-durable alarms, actor sleep and wake, graceful process drain, structured
-logging, and dependency-free metrics hooks. Rivet Engine is pinned to
-`v2.3.10` (`957d4e482f404913ca1955d8ecc357533f6fd081`).
+Define actor state, actions, HTTP handlers, and WebSocket handlers in Go.
+`rivet-go` handles registration, persistence, scheduling, and graceful
+shutdown. It uses a prebuilt native adapter, so applications do not need cgo or
+a C toolchain.
 
-## Quickstart
+The current release is `v0.1.0` and targets Rivet Engine `v2.3.10`.
 
-Prerequisites are Go 1.26, Git, Python 3, and Rust 1.97. Rust is needed only when the
-development launcher must build the pinned local engine; applications do not
-compile Rust. The SDK's native adapter is not stored in the module: on first
-use the loader downloads this platform's library from the pinned GitHub
-release, verifies it against the SHA-256 recorded in
-`internal/ffi/checksums.txt`, and caches it under the user cache directory
-(about 13 MB, once per version). To pre-seed that cache — for CI images or
-machines that will run offline — run:
+## Install
 
 ```sh
-go run github.com/ewhauser/rivet-go/cmd/rivet-go-fetch
+go get github.com/ewhauser/rivet-go/rivet@v0.1.0
 ```
 
-Alternatively download the release asset yourself and point `RIVET_GO_FFI_LIB`
-at it; `RIVET_GO_FFI_BASE_URL` overrides the asset host for mirrors.
+The first call to `rivet.Serve` downloads the native adapter for the current
+platform, verifies its checksum, and stores it in the user cache directory.
 
-Install the repository dependencies:
+Prebuilt adapters are available for:
+
+- macOS arm64
+- Linux amd64 and arm64
+- Windows amd64
+
+For offline environments, populate the cache ahead of time:
+
+```sh
+go run github.com/ewhauser/rivet-go/cmd/rivet-go-fetch@v0.1.0
+```
+
+## Define an actor
+
+```go
+package main
+
+import (
+	"log"
+
+	"github.com/ewhauser/rivet-go/rivet"
+)
+
+type Counter struct {
+	Value int `json:"value"`
+}
+
+type IncrementArgs struct {
+	Amount int `json:"amount"`
+}
+
+func main() {
+	registry := rivet.NewRegistry()
+
+	err := rivet.Register(registry, "counter", rivet.Actor[Counter]{
+		Actions: rivet.Actions[Counter]{
+			"increment": rivet.Action(
+				func(ctx *rivet.Context[Counter], args IncrementArgs) (int, error) {
+					ctx.State().Value += args.Amount
+					return ctx.State().Value, nil
+				},
+			),
+		},
+	})
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	if err := rivet.Serve(registry); err != nil {
+		log.Fatal(err)
+	}
+}
+```
+
+Each actor has typed state and processes work serially. State changed by a
+successful action is persisted automatically.
+
+Actor definitions can also provide:
+
+- lifecycle hooks and durable alarms
+- raw HTTP handlers
+- raw WebSocket handlers and broadcast
+- actor sleep and wake
+- per-actor SQLite databases
+
+State changed from an HTTP or WebSocket handler must be persisted explicitly
+with `ctx.Save`.
+
+## Run the counter example
+
+Local development requires Go 1.26. The commands below use Python 3 to read the
+created actor ID. The development launcher also needs Git and Rust 1.97 the
+first time it builds the pinned engine.
+
+Clone the repository and start Rivet Engine:
 
 ```sh
 git clone https://github.com/ewhauser/rivet-go.git
 cd rivet-go
-go mod download
-```
-
-In terminal 1, acquire and run the exact engine used by conformance:
-
-```sh
 go run ./cmd/rivet-go-dev
 ```
 
-The first run may build Engine `v2.3.10` from its exact tag and cache the
-verified binary under `~/.cache/rivet-go/engine-v2.3.10`. The launcher stores
-local actor data in `.rivet-go/` and prints this readiness line:
-
-```text
-Rivet Engine 2.3.10 is ready at http://127.0.0.1:6420
-```
-
-In terminal 2, start the counter runner:
+In another terminal, start the example runner:
 
 ```sh
 go run ./examples/counter
 ```
 
-In terminal 3, create one counter actor and call it through the real gateway:
+Create a counter actor:
 
 ```sh
 ACTOR_ID="$(
@@ -66,95 +116,71 @@ ACTOR_ID="$(
     -d '{"name":"counter","runner_name_selector":"counter-example","crash_policy":"destroy"}' |
   python3 -c 'import json,sys; print(json.load(sys.stdin)["actor"]["actor_id"])'
 )"
+```
 
-curl -fsS -X POST "http://127.0.0.1:6420/gateway/$ACTOR_ID/action/increment" \
+Call its `increment` action:
+
+```sh
+curl -fsS -X POST \
+  "http://127.0.0.1:6420/gateway/$ACTOR_ID/action/increment" \
   -H 'Authorization: Bearer dev' \
   -H 'Content-Type: application/json' \
   -d '{"args":[{"amount":3}]}'
-printf '\n'
-
-curl -fsS "http://127.0.0.1:6420/gateway/$ACTOR_ID/request/current" \
-  -H 'Authorization: Bearer dev'
 ```
 
-The transcript is:
+The response is:
 
-```text
+```json
 {"output":3}
-3
 ```
 
-Stop a runner with Ctrl-C during development, or send `SIGTERM` to its built
-executable. Admitted actor work drains, WebSockets receive code 1001, and the
-engine observes the runner leave. A built runner exits successfully after a
-clean drain; the `go run` wrapper may still report its own interrupt status
-after Ctrl-C even when the runner log records a completed drain.
+The repository also includes a [WebSocket chat example](examples/chat).
 
-## SDK shape
+## Configuration
 
-The counter example is built from the public API:
+Pass a `rivet.Config` to `Serve` to configure the engine endpoint, namespace,
+runner identity, logging, metrics hooks, SQLite transport, and graceful
+shutdown deadline:
 
 ```go
-type Counter struct {
-    Count int `json:"count"`
-}
-
-type Increment struct {
-    Amount int `json:"amount"`
-}
-
-registry := rivet.NewRegistry()
-err := rivet.Register(registry, "counter", rivet.Actor[Counter]{
-    Actions: rivet.Actions[Counter]{
-        "increment": rivet.Action(func(ctx *rivet.Context[Counter], in Increment) (int, error) {
-            ctx.State().Count += in.Amount
-            return ctx.State().Count, ctx.Broadcast("countChanged", ctx.State().Count)
-        }),
-    },
+err := rivet.Serve(registry, rivet.Config{
+	Endpoint:   "http://127.0.0.1:6420",
+	Namespace:  "default",
+	RunnerName: "my-runner",
 })
-if err != nil {
-    log.Fatal(err)
-}
-if err := rivet.Serve(registry); err != nil {
-    log.Fatal(err)
-}
 ```
 
-[`examples/chat`](examples/chat) is a runnable raw-WebSocket actor with durable
-message sequencing and broadcast. Raw WebSocket hibernation is opt-in with
-`Actor.HibernateWebSockets`: it preserves connections across actor sleep but
-adds a per-message engine acknowledgement. The default is false and closes
-connections when the actor sleeps, matching rivetkit v2.3.10. See
-[WebSocket hibernation](docs/WEBSOCKET-HIBERNATION.md) for the tradeoff.
-[`examples/counter`](examples/counter) can also expose SDK metrics through
-`expvar`:
+`Serve` listens for `SIGINT` and `SIGTERM` and drains admitted work before
+returning. Services that already manage process signals can use
+`Registry.Serve` with their own context.
 
-```sh
-go run ./examples/counter -metrics-address 127.0.0.1:6060
-curl -fsS http://127.0.0.1:6060/debug/vars
-```
+## Documentation
 
-Go-side structured logging uses a configurable `*slog.Logger`; nil discards
-SDK logs. `Config.LogLevel` independently controls native logging. The
-`rivet.Hooks` interface reports counters, gauges, and poll durations without a
-Prometheus or telemetry dependency.
+- [Operations](docs/OPERATIONS.md): deployment, shutdown, SQLite, logging,
+  metrics, and soak testing
+- [WebSocket hibernation](docs/WEBSOCKET-HIBERNATION.md): keeping connections
+  open while actors sleep
+- [FFI boundary](docs/FFI-BOUNDARY.md): native-library ownership and threading
+- [Pinned Rivet version](docs/PINNED-VERSION.md): upstream version and build
+  details
+- [Conformance tests](conformance/README.md): behavior tested against the real
+  engine
 
 ## Development
 
-Fast tests do not start the engine:
+Run unit tests without starting Rivet Engine:
 
 ```sh
 go test -short ./...
 cargo test --workspace
 ```
 
-The real-engine suite uses the same acquisition path as `rivet-go-dev`:
+Run the complete race-enabled conformance suite:
 
 ```sh
 go test -race -count=1 ./...
 ```
 
-See [Operations](docs/OPERATIONS.md) for soak, drain, metrics, platform, and
-engine-upgrade procedures; [FFI boundary](docs/FFI-BOUNDARY.md) for ownership
-and threading; and [Pinned version](docs/PINNED-VERSION.md) for the exact
-upstream dependency.
+## License
+
+[MIT](LICENSE)
