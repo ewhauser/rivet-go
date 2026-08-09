@@ -142,7 +142,7 @@ struct ActiveActor {
     operations: ActorOperations,
     alarm_updates: ActorAlarmUpdates,
     run_active: Arc<AtomicBool>,
-    lifecycle_stopping: Arc<AtomicBool>,
+    managed_work_admission: ManagedWorkAdmission,
 }
 
 #[derive(Clone, Default)]
@@ -165,6 +165,11 @@ struct ActorOperations {
 
 struct ActorOperationGuard {
     operations: ActorOperations,
+}
+
+#[derive(Clone, Default)]
+struct ManagedWorkAdmission {
+    stopping: Arc<Mutex<bool>>,
 }
 
 impl ActorOperations {
@@ -200,6 +205,35 @@ impl ActorOperations {
             }
             changed.await;
         }
+    }
+}
+
+impl ManagedWorkAdmission {
+    fn begin(&self) -> Option<std::sync::MutexGuard<'_, bool>> {
+        let state = self
+            .stopping
+            .lock()
+            .expect("managed work admission poisoned");
+        if *state { None } else { Some(state) }
+    }
+
+    fn begin_stop(&self) {
+        *self
+            .stopping
+            .lock()
+            .expect("managed work admission poisoned") = true;
+    }
+
+    fn stop_on_success<T, E>(&self, operation: impl FnOnce() -> Result<T, E>) -> Result<T, E> {
+        let mut stopping = self
+            .stopping
+            .lock()
+            .expect("managed work admission poisoned");
+        let result = operation();
+        if result.is_ok() {
+            *stopping = true;
+        }
+        result
     }
 }
 
@@ -601,6 +635,7 @@ impl ActorProxy {
                     kind: LifecycleKind::Stop,
                 };
                 if let Some(actor) = self.actor_exact(&key.actor) {
+                    actor.managed_work_admission.begin_stop();
                     actor.operations.begin_stop();
                     let pending = self.pending.clone();
                     let correlations = self.correlations.clone();
@@ -1026,7 +1061,7 @@ impl ActorProxy {
                     operations: ActorOperations::default(),
                     alarm_updates: ActorAlarmUpdates::default(),
                     run_active: Arc::new(AtomicBool::new(false)),
-                    lifecycle_stopping: Arc::new(AtomicBool::new(false)),
+                    managed_work_admission: ManagedWorkAdmission::default(),
                 },
             );
         let actor_connect_ids = self
@@ -1214,7 +1249,7 @@ impl ActorProxy {
                 }
                 ActorEvent::RunGracefulCleanup { reason, reply } => {
                     if let Some(actor) = self.actor_exact(identity) {
-                        actor.lifecycle_stopping.store(true, Ordering::Release);
+                        actor.managed_work_admission.begin_stop();
                     }
                     let stop_reason = self.actor_stop_reason(identity, reason);
                     slept = matches!(reason, ShutdownKind::Sleep);
@@ -2122,12 +2157,14 @@ impl ActorProxy {
             );
             return;
         };
-        match actor.ctx.destroy() {
+        match actor
+            .managed_work_admission
+            .stop_on_success(|| actor.ctx.destroy())
+        {
             Ok(()) => {
                 // Core has atomically accepted the terminal request. Fence
                 // every proxy operation admitted after it; already admitted
                 // work is drained by ActorStopResult before cleanup.
-                actor.lifecycle_stopping.store(true, Ordering::Release);
                 actor.operations.begin_stop();
                 self.emit_actor_intent_result(op_id, Ok(()));
             }
@@ -2531,6 +2568,19 @@ impl ActorProxy {
                     "actor_generation_stale",
                     format!(
                         "actor {} generation {} is not active",
+                        identity.aid, identity.generation
+                    ),
+                )),
+            );
+            return;
+        };
+        let Some(_admission) = actor.managed_work_admission.begin() else {
+            self.emit_actor_intent_result(
+                op_id,
+                Err(WireError::new(
+                    "actor_stopping",
+                    format!(
+                        "actor {} generation {} is stopping",
                         identity.aid, identity.generation
                     ),
                 )),
@@ -4212,6 +4262,48 @@ mod tests {
             .await
             .expect("stop waiter timed out")
             .expect("stop waiter task failed");
+    }
+
+    #[test]
+    fn managed_work_stop_on_success_only_fences_accepted_transitions() {
+        let retryable = ManagedWorkAdmission::default();
+        let rejected = retryable.stop_on_success(|| Err::<(), _>("not accepted"));
+        assert_eq!(rejected, Err("not accepted"));
+        let admitted = retryable.begin().expect("work after rejected stop");
+        drop(admitted);
+
+        retryable
+            .stop_on_success(|| Ok::<_, ()>(()))
+            .expect("accepted stop");
+        assert!(retryable.begin().is_none());
+    }
+
+    #[test]
+    fn managed_work_stop_waits_for_registration_critical_section() {
+        let admission = ManagedWorkAdmission::default();
+        let registration = admission.begin().expect("managed work registration");
+        let stopping = admission.clone();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (stopped_tx, stopped_rx) = std::sync::mpsc::channel();
+        let stopper = std::thread::spawn(move || {
+            started_tx.send(()).expect("report stop attempt");
+            stopping.begin_stop();
+            stopped_tx.send(()).expect("report stopped admission");
+        });
+
+        started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("stopper did not start");
+        assert!(
+            stopped_rx.recv_timeout(Duration::from_millis(20)).is_err(),
+            "stop overtook an admitted registration"
+        );
+        drop(registration);
+        stopped_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("stop did not acquire admission after registration");
+        stopper.join().expect("stopper thread failed");
+        assert!(admission.begin().is_none());
     }
 
     #[tokio::test]

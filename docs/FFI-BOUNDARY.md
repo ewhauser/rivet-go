@@ -879,7 +879,9 @@ oneshot; `ManagedWorkBegin(keep_awake)` retains a core keep-awake region. Go
 always sends `ManagedWorkEnd` after accepted work and retries transient native
 backpressure until the command is accepted or the session stops. Generation
 cleanup releases every remaining token, completable message, and managed-work
-handle. Public
+handle. A per-generation admission fence rejects `ManagedWorkBegin` once
+graceful stop starts or core accepts destruction; a begin already admitted
+before that fence remains tracked and drains normally. Public
 `WaitUntil` callbacks receive only a generation-scoped context and may not
 capture actor state or storage; serialized background actor work belongs in
 `Run`.

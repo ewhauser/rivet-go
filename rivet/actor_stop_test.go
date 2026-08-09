@@ -6,6 +6,7 @@ import (
 	"reflect"
 	"testing"
 
+	"github.com/ewhauser/rivet-go/internal/pump"
 	"github.com/ewhauser/rivet-go/internal/wire"
 )
 
@@ -62,5 +63,45 @@ func TestActorAdapterStopClosesDatabaseWhenOnStopFails(t *testing.T) {
 	case <-managedCtx.Done():
 	default:
 		t.Fatal("managed context was not cancelled")
+	}
+}
+
+func TestActorAdapterStopFencesManagedWorkBeforeOnStop(t *testing.T) {
+	backend := &lifecycleSQLiteBackend{closed: make(chan struct{})}
+	managedCtx, managedCancel := context.WithCancel(context.Background())
+	actorContext := &Context[struct{}]{
+		session:       &pump.ActorSession{},
+		db:            makeDB(backend),
+		managedCtx:    managedCtx,
+		managedCancel: managedCancel,
+	}
+	var waitErr error
+	var keepErr error
+	workRan := false
+	adapter := &actorAdapter[struct{}]{definition: Actor[struct{}]{
+		OnStop: func(ctx *Context[struct{}]) error {
+			waitErr = ctx.WaitUntil(context.Background(), func(context.Context) error {
+				workRan = true
+				return nil
+			})
+			keepErr = ctx.KeepAwake(context.Background(), func(context.Context) error {
+				workRan = true
+				return nil
+			})
+			return nil
+		},
+	}}
+
+	if err := adapter.Stop(context.Background(), nil, wire.Event{}, actorContext); err != nil {
+		t.Fatal(err)
+	}
+	if !errors.Is(waitErr, ErrActorStopping) {
+		t.Fatalf("OnStop WaitUntil error = %v, want ErrActorStopping", waitErr)
+	}
+	if !errors.Is(keepErr, ErrActorStopping) {
+		t.Fatalf("OnStop KeepAwake error = %v, want ErrActorStopping", keepErr)
+	}
+	if workRan {
+		t.Fatal("managed work ran after lifecycle stop began")
 	}
 }
