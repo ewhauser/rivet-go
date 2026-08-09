@@ -40,6 +40,10 @@ type promptResult struct {
 	Content   string `json:"content"`
 }
 
+type promptFailure struct {
+	Error string `json:"error"`
+}
+
 // Provider deliberately contains no Rivet types. Production applications can
 // adapt any model SDK here and unit test the actor with a deterministic fake.
 type Provider interface {
@@ -148,7 +152,11 @@ func runPrompts(
 		}
 		var request promptRequest
 		if err := queued.DecodeBody(&request); err != nil {
-			return err
+			logger.Warn("discarding malformed prompt", slog.Any("error", err))
+			if completeErr := queued.Complete(ctx, promptFailure{Error: "invalid prompt request"}); completeErr != nil {
+				return completeErr
+			}
+			continue
 		}
 		if reply, exists := actor.State().Replies[request.ID]; exists {
 			if err := queued.Complete(ctx, reply); err != nil {

@@ -940,6 +940,9 @@ func TestPortedRunnableExamples(t *testing.T) {
 			RequestID string `json:"requestId"`
 			Content   string `json:"content"`
 		}
+		type promptFailure struct {
+			Error string `json:"error"`
+		}
 		created, err := rivet.Call[promptRequest](context.Background(), actor, "sendMessage", promptRequest{
 			Content: "hello from the action",
 		})
@@ -964,6 +967,24 @@ func TestPortedRunnableExamples(t *testing.T) {
 		if err := waited.DecodeResponse(&reply); err != nil || reply.RequestID != "conformance-direct" ||
 			reply.Content != "Echo: hello from the queue" {
 			t.Fatalf("direct agent reply = %#v, %v", reply, err)
+		}
+		malformed, err := actor.Queue().SendAndWait(context.Background(), "prompts", "not a prompt request", 10*time.Second)
+		if err != nil || malformed.Status != rivet.ActorQueueCompleted {
+			t.Fatalf("malformed agent queue item = %#v, %v", malformed, err)
+		}
+		var failure promptFailure
+		if err := malformed.DecodeResponse(&failure); err != nil || failure.Error != "invalid prompt request" {
+			t.Fatalf("malformed agent reply = %#v, %v", failure, err)
+		}
+		waited, err = actor.Queue().SendAndWait(context.Background(), "prompts", promptRequest{
+			ID: "after-malformed", Content: "the actor is still running",
+		}, 10*time.Second)
+		if err != nil || waited.Status != rivet.ActorQueueCompleted {
+			t.Fatalf("agent queue after malformed item = %#v, %v", waited, err)
+		}
+		if err := waited.DecodeResponse(&reply); err != nil || reply.RequestID != "after-malformed" ||
+			reply.Content != "Echo: the actor is still running" {
+			t.Fatalf("agent reply after malformed item = %#v, %v", reply, err)
 		}
 
 		stopExampleCleanly(t, engine.endpoint, runnerName, process)
