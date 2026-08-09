@@ -293,12 +293,33 @@ func TestActorConnectConnectionContextPersistsAcrossSleep(t *testing.T) {
 		Resumed      bool     `json:"resumed"`
 		Connections  []string `json:"connections"`
 	}
+	type yieldObservation struct {
+		RunConnectionID    string `json:"runConnectionId"`
+		ActionConnectionID string `json:"actionConnectionId"`
+	}
 	connected := make(chan string, 4)
 	disconnected := make(chan string, 4)
 	scheduledCurrent := make(chan bool, 1)
 	registry := rivet.NewRegistry()
 	err = rivet.Register(registry, "actor-connect-state", rivet.Actor[struct{}]{
 		HibernateWebSockets: true,
+		Run: func(ctx context.Context, actor *rivet.RunContext[struct{}]) error {
+			for {
+				message, runErr := actor.Queue().Next(ctx, rivet.QueueNextOptions{
+					Names: []string{"current-connection-probe"}, Completable: true,
+				})
+				if runErr != nil {
+					return runErr
+				}
+				connectionID := ""
+				if connection := actor.CurrentConnection(); connection != nil {
+					connectionID = connection.ID()
+				}
+				if completeErr := message.Complete(ctx, connectionID); completeErr != nil {
+					return completeErr
+				}
+			}
+		},
 		ConnectionState: rivet.NewConnectionState(func(
 			_ *rivet.Context[struct{}], connection *rivet.Connection,
 		) (connectionState, error) {
@@ -320,6 +341,30 @@ func TestActorConnectConnectionContextPersistsAcrossSleep(t *testing.T) {
 			}
 		},
 		Actions: rivet.Actions[struct{}]{
+			"yieldCurrent": rivet.ActionWithContext(func(
+				ctx context.Context,
+				actor *rivet.Context[struct{}],
+				_ struct{},
+			) (yieldObservation, error) {
+				response, queueErr := actor.Queue().SendAndWait(
+					ctx, "current-connection-probe", struct{}{},
+					rivet.QueueWaitOptions{Timeout: websocketTestTimeout},
+				)
+				if queueErr != nil {
+					return yieldObservation{}, queueErr
+				}
+				var runConnectionID string
+				if decodeErr := response.Decode(&runConnectionID); decodeErr != nil {
+					return yieldObservation{}, decodeErr
+				}
+				actionConnectionID := ""
+				if connection := actor.CurrentConnection(); connection != nil {
+					actionConnectionID = connection.ID()
+				}
+				return yieldObservation{
+					RunConnectionID: runConnectionID, ActionConnectionID: actionConnectionID,
+				}, nil
+			}),
 			"observe": rivet.Action(func(ctx *rivet.Context[struct{}], _ struct{}) (observation, error) {
 				connection := ctx.CurrentConnection()
 				if connection == nil {
@@ -405,6 +450,13 @@ func TestActorConnectConnectionContextPersistsAcrossSleep(t *testing.T) {
 	if first.ConnectionID != client.connectionID || first.Label != "Ada" || first.Calls != 1 ||
 		first.Resumed || len(first.Connections) != 1 || first.Connections[0] != client.connectionID {
 		t.Fatalf("first ActorConnect observation = %#v", first)
+	}
+	yielded := actorConnectCall[yieldObservation](t, client, "yieldCurrent", struct{}{})
+	if yielded.RunConnectionID != "" {
+		t.Fatalf("Actor.Run observed connected action caller %q", yielded.RunConnectionID)
+	}
+	if yielded.ActionConnectionID != client.connectionID {
+		t.Fatalf("resumed action connection = %q, want %q", yielded.ActionConnectionID, client.connectionID)
 	}
 	if !actorConnectCall[bool](t, client, "sleep", struct{}{}) {
 		t.Fatal("sleep action returned false")

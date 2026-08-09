@@ -40,9 +40,8 @@ type QueueWaitOptions struct {
 
 // Queue exposes the actor's durable core queue.
 type Queue struct {
-	session    *pump.ActorSession
-	beforeWait func()
-	afterWait  func()
+	session   *pump.ActorSession
+	yieldTurn func() func()
 }
 
 // QueueMessage is one durable record. Body is CBOR encoded. Completable
@@ -71,11 +70,11 @@ func newQueue(session *pump.ActorSession) *Queue {
 	return &Queue{session: session}
 }
 
-func (q *Queue) forRun(beforeWait, afterWait func()) *Queue {
+func (q *Queue) withTurnYield(yieldTurn func() func()) *Queue {
 	if q == nil {
 		return nil
 	}
-	return &Queue{session: q.session, beforeWait: beforeWait, afterWait: afterWait}
+	return &Queue{session: q.session, yieldTurn: yieldTurn}
 }
 
 // Send appends a typed CBOR value and waits for core to durably accept it.
@@ -136,9 +135,9 @@ func (q *Queue) SendAndWait(
 	if options.Timeout != 0 {
 		timeout = &options.Timeout
 	}
-	q.yieldBeforeWait()
+	resumeTurn := q.yieldBeforeWait()
+	defer resumeTurn()
 	response, present, err := q.session.QueueEnqueueWait(ctx, name, encoded, timeout)
-	q.resumeAfterWait()
 	if err != nil {
 		return QueueResponse{}, queueError(err)
 	}
@@ -177,9 +176,9 @@ func (q *Queue) next(ctx context.Context, options QueueNextOptions, immediate bo
 	} else if options.Timeout != 0 {
 		timeout = &options.Timeout
 	}
-	q.yieldBeforeWait()
+	resumeTurn := q.yieldBeforeWait()
+	defer resumeTurn()
 	message, err := q.session.QueueNext(ctx, names, timeout, options.Completable)
-	q.resumeAfterWait()
 	if err != nil {
 		return nil, queueError(err)
 	}
@@ -196,16 +195,11 @@ func (q *Queue) message(message pump.QueueMessage) *QueueMessage {
 	}
 }
 
-func (q *Queue) yieldBeforeWait() {
-	if q != nil && q.beforeWait != nil {
-		q.beforeWait()
+func (q *Queue) yieldBeforeWait() func() {
+	if q != nil && q.yieldTurn != nil {
+		return q.yieldTurn()
 	}
-}
-
-func (q *Queue) resumeAfterWait() {
-	if q != nil && q.afterWait != nil {
-		q.afterWait()
-	}
+	return func() {}
 }
 
 // Completable reports whether Complete is valid for this message.
