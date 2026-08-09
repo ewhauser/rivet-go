@@ -23,6 +23,11 @@ passes. The loader's ABI-compatibility tests compile small fixture libraries,
 so the compiler is a test dependency even when the committed FFI library is
 already present.
 
+Every native job also rebuilds its release artifact and requires the generated
+ABI files and that platform's SHA-256 entry to remain unchanged. This prevents
+source changes from silently leaving the loader pinned to older native code;
+the release workflow repeats the same checksum gate before publishing assets.
+
 ## Pinned engine cache
 
 `linux-amd64-engine` is the only job allowed to build Rivet Engine from source.

@@ -101,10 +101,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          git diff --exit-code internal/ffi/abi_version_generated.go internal/ffi/include
-          # The checksum manifest must match the release artifacts, which is
-          # enforced at publish time by release.yml; report any local drift.
-          git --no-pager diff internal/ffi/checksums.txt || true
+          git diff --exit-code internal/ffi/abi_version_generated.go \
+            internal/ffi/include internal/ffi/checksums.txt
 
       - name: Test Rust crate
         if: matrix.libc != 'musl'
