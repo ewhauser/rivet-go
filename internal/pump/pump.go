@@ -148,9 +148,11 @@ type submitRequest struct {
 }
 
 type subscriber struct {
-	mu     sync.Mutex
-	closed bool
-	events chan wire.Event
+	mu        sync.RWMutex
+	closed    bool
+	events    chan wire.Event
+	cancelled chan struct{}
+	closeOnce sync.Once
 }
 
 // Subscription receives every event after it is created. Cancel is safe from
@@ -1753,7 +1755,10 @@ func (p *Pump) Subscribe(buffer int) *Subscription {
 	if buffer < 0 {
 		buffer = 0
 	}
-	sub := &subscriber{events: make(chan wire.Event, buffer)}
+	sub := &subscriber{
+		events:    make(chan wire.Event, buffer),
+		cancelled: make(chan struct{}),
+	}
 	p.subsMu.Lock()
 	id := p.nextSubID
 	p.nextSubID++
@@ -3079,13 +3084,15 @@ func (p *Pump) dispatch(event wire.Event) bool {
 }
 
 func (s *subscriber) send(event wire.Event, done <-chan struct{}) bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	if s.closed {
 		return true
 	}
 	select {
 	case s.events <- event:
+		return true
+	case <-s.cancelled:
 		return true
 	case <-done:
 		return false
@@ -3093,12 +3100,13 @@ func (s *subscriber) send(event wire.Event, done <-chan struct{}) bool {
 }
 
 func (s *subscriber) close() {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if !s.closed {
+	s.closeOnce.Do(func() {
+		close(s.cancelled)
+		s.mu.Lock()
 		s.closed = true
 		close(s.events)
-	}
+		s.mu.Unlock()
+	})
 }
 
 func (p *Pump) closeSubscribers() {
