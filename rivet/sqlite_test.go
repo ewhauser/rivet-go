@@ -17,6 +17,7 @@ type lifecycleSQLiteBackend struct {
 	rollbackCalled chan string
 	closed         chan struct{}
 	closeOnce      sync.Once
+	closeErr       error
 }
 
 func (b *lifecycleSQLiteBackend) exec(context.Context, string, []wire.SQLiteValue, *string) (Result, error) {
@@ -37,7 +38,7 @@ func (b *lifecycleSQLiteBackend) rollback(_ context.Context, leaseKey string) er
 }
 func (b *lifecycleSQLiteBackend) close() error {
 	b.closeOnce.Do(func() { close(b.closed) })
-	return nil
+	return b.closeErr
 }
 
 func TestSQLiteValueMappingPreservesAllPublicTypes(t *testing.T) {

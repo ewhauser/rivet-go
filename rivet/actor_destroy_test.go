@@ -37,6 +37,48 @@ func TestDestroyLifecycleErrorsAreStable(t *testing.T) {
 	}
 }
 
+func TestDestroyIntentCanRetryAfterSQLiteCleanupFails(t *testing.T) {
+	cleanupFailure := errors.New("close transport")
+	coreFailure := errors.New("submit destroy intent")
+	backend := &lifecycleSQLiteBackend{
+		closed:   make(chan struct{}),
+		closeErr: cleanupFailure,
+	}
+	database := makeDB(backend)
+	attempts := 0
+	requestDestroy := func() error {
+		attempts++
+		if attempts == 1 {
+			return coreFailure
+		}
+		return nil
+	}
+
+	accepted, err := closeSQLiteAndRequestDestroy(database, requestDestroy)
+	if accepted {
+		t.Fatal("failed destroy intent reported accepted")
+	}
+	if !errors.Is(err, cleanupFailure) || !errors.Is(err, coreFailure) {
+		t.Fatalf("first destroy error = %v, want cleanup and core failures", err)
+	}
+
+	accepted, err = closeSQLiteAndRequestDestroy(database, requestDestroy)
+	if !accepted {
+		t.Fatal("successful destroy retry was not accepted")
+	}
+	if !errors.Is(err, cleanupFailure) {
+		t.Fatalf("successful destroy retry error = %v, want cleanup failure", err)
+	}
+	if attempts != 2 {
+		t.Fatalf("destroy intent attempts = %d, want 2", attempts)
+	}
+	select {
+	case <-backend.closed:
+	default:
+		t.Fatal("SQLite transport was not fenced")
+	}
+}
+
 func TestDestroyMapsCoreLifecycleErrors(t *testing.T) {
 	tests := []struct {
 		code string

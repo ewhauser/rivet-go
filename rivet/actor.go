@@ -262,7 +262,8 @@ func (c *Context[T]) Sleep() error {
 // Destroy permanently destroys this actor after the current callback response
 // is sent and already accepted actor work completes. Unlike Sleep, a destroyed
 // actor cannot be woken again. All generation-scoped SQLite and WebSocket
-// handles are closed during teardown.
+// handles are closed during teardown. A local SQLite cleanup failure is
+// returned after the destroy intent is still submitted to core.
 func (c *Context[T]) Destroy() error {
 	if c == nil || c.session == nil {
 		return ErrActorUnavailable
@@ -275,19 +276,29 @@ func (c *Context[T]) Destroy() error {
 	if c.lifecycleStopping || c.destroyRequested {
 		return ErrActorStopping
 	}
+	accepted, err := closeSQLiteAndRequestDestroy(c.db, c.session.Destroy)
+	if accepted {
+		c.destroyRequested = true
+	}
+	return err
+}
+
+func closeSQLiteAndRequestDestroy(database *DB, requestDestroy func() error) (bool, error) {
 	// Fence SQLite before core accepts destruction. This drains admitted calls
 	// and rolls back an open transaction lease instead of letting it hold the
-	// generation alive until its deadline.
-	if c.db != nil {
-		if err := c.db.closeForDestroy(); err != nil {
-			return fmt.Errorf("close actor SQLite transport for destroy: %w", err)
+	// generation alive until its deadline. The terminal intent must still be
+	// attempted if local cleanup fails because the one-shot fence cannot be
+	// reopened for this generation.
+	var cleanupErr error
+	if database != nil {
+		if err := database.closeForDestroy(); err != nil {
+			cleanupErr = fmt.Errorf("close actor SQLite transport for destroy: %w", err)
 		}
 	}
-	if err := c.session.Destroy(); err != nil {
-		return actorDestroyError(err)
+	if err := requestDestroy(); err != nil {
+		return false, errors.Join(cleanupErr, actorDestroyError(err))
 	}
-	c.destroyRequested = true
-	return nil
+	return true, cleanupErr
 }
 
 func (c *Context[T]) destructionRequested() bool {
