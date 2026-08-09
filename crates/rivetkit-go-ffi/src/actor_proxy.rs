@@ -1703,23 +1703,36 @@ impl ActorProxy {
                 r#gen: _,
                 state: _,
             } => {}
-            Command::KvGet { kv_id, aid, key } => self.kv_get(kv_id, aid, key).await,
+            Command::KvGet {
+                kv_id,
+                aid,
+                r#gen: generation,
+                key,
+            } => self.kv_get(kv_id, aid, generation, key).await,
             Command::KvList {
                 kv_id,
                 aid,
+                r#gen: generation,
                 prefix,
                 reverse,
                 limit,
             } => {
-                self.kv_list(kv_id, aid, prefix, reverse, limit).await;
+                self.kv_list(kv_id, aid, generation, prefix, reverse, limit)
+                    .await;
             }
             Command::KvPut {
                 kv_id,
                 aid,
+                r#gen: generation,
                 key,
                 value,
-            } => self.kv_put(kv_id, aid, key, value).await,
-            Command::KvDelete { kv_id, aid, key } => self.kv_delete(kv_id, aid, key).await,
+            } => self.kv_put(kv_id, aid, generation, key, value).await,
+            Command::KvDelete {
+                kv_id,
+                aid,
+                r#gen: generation,
+                key,
+            } => self.kv_delete(kv_id, aid, generation, key).await,
             Command::ActorStartResult { .. }
             | Command::ActorStopResult { .. }
             | Command::ActorRunResult { .. }
@@ -3713,14 +3726,11 @@ impl ActorProxy {
     }
 
     #[allow(deprecated)] // The M2 boundary intentionally mirrors the pinned core KV surface.
-    async fn kv_get(&self, kv_id: u64, aid: String, key: Vec<u8>) {
-        let result = match self.actor_current(&aid) {
-            Some(actor) => actor.ctx.kv().get(&key).await,
-            None => {
-                self.send_kv_actor_not_found(kv_id, &aid);
-                return;
-            }
+    async fn kv_get(&self, kv_id: u64, aid: String, generation: u64, key: Vec<u8>) {
+        let Some((actor, _operation)) = self.begin_kv_operation(kv_id, &aid, generation) else {
+            return;
         };
+        let result = actor.ctx.kv().get(&key).await;
         let (value, error) = match result {
             Ok(value) => (value, None),
             Err(error) => (
@@ -3741,12 +3751,12 @@ impl ActorProxy {
         &self,
         kv_id: u64,
         aid: String,
+        generation: u64,
         prefix: Vec<u8>,
         reverse: bool,
         limit: Option<u32>,
     ) {
-        let Some(actor) = self.actor_current(&aid) else {
-            self.send_kv_actor_not_found(kv_id, &aid);
+        let Some((actor, _operation)) = self.begin_kv_operation(kv_id, &aid, generation) else {
             return;
         };
         let opts = ListOpts {
@@ -3775,27 +3785,51 @@ impl ActorProxy {
     }
 
     #[allow(deprecated)] // The M2 boundary intentionally mirrors the pinned core KV surface.
-    async fn kv_put(&self, kv_id: u64, aid: String, key: Vec<u8>, value: Vec<u8>) {
-        let result = match self.actor_current(&aid) {
-            Some(actor) => actor.ctx.kv().put(&key, &value).await,
-            None => {
-                self.send_kv_actor_not_found(kv_id, &aid);
-                return;
-            }
+    async fn kv_put(&self, kv_id: u64, aid: String, generation: u64, key: Vec<u8>, value: Vec<u8>) {
+        let Some((actor, _operation)) = self.begin_kv_operation(kv_id, &aid, generation) else {
+            return;
         };
+        let result = actor.ctx.kv().put(&key, &value).await;
         self.send_empty_kv_result(kv_id, "kv_put_failed", result);
     }
 
     #[allow(deprecated)] // The M2 boundary intentionally mirrors the pinned core KV surface.
-    async fn kv_delete(&self, kv_id: u64, aid: String, key: Vec<u8>) {
-        let result = match self.actor_current(&aid) {
-            Some(actor) => actor.ctx.kv().delete(&key).await,
-            None => {
-                self.send_kv_actor_not_found(kv_id, &aid);
-                return;
-            }
+    async fn kv_delete(&self, kv_id: u64, aid: String, generation: u64, key: Vec<u8>) {
+        let Some((actor, _operation)) = self.begin_kv_operation(kv_id, &aid, generation) else {
+            return;
         };
+        let result = actor.ctx.kv().delete(&key).await;
         self.send_empty_kv_result(kv_id, "kv_delete_failed", result);
+    }
+
+    fn begin_kv_operation(
+        &self,
+        kv_id: u64,
+        aid: &str,
+        generation: u64,
+    ) -> Option<(ActiveActor, ActorOperationGuard)> {
+        let identity = ActorIdentity::new(aid, generation);
+        let Some(actor) = self.actor_exact(&identity) else {
+            self.send_kv_error(
+                kv_id,
+                WireError::new(
+                    "actor_generation_stale",
+                    format!("actor {aid} generation {generation} is not active"),
+                ),
+            );
+            return None;
+        };
+        let Some(operation) = actor.operations.begin() else {
+            self.send_kv_error(
+                kv_id,
+                WireError::new(
+                    "actor_stopping",
+                    format!("actor {aid} generation {generation} is stopping"),
+                ),
+            );
+            return None;
+        };
+        Some((actor, operation))
     }
 
     fn send_empty_kv_result(&self, kv_id: u64, code: &str, result: Result<()>) {
@@ -3810,15 +3844,12 @@ impl ActorProxy {
         });
     }
 
-    fn send_kv_actor_not_found(&self, kv_id: u64, aid: &str) {
+    fn send_kv_error(&self, kv_id: u64, error: WireError) {
         let _ = self.events.send(Event::KvResult {
             kv_id,
             value: None,
             entries: Vec::new(),
-            error: Some(WireError::new(
-                "actor_not_found",
-                format!("actor `{aid}` is not active"),
-            )),
+            error: Some(error),
         });
     }
 
@@ -4243,7 +4274,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn actor_stop_waits_for_reserved_state_operations() {
+    async fn actor_stop_waits_for_reserved_operations() {
         let operations = ActorOperations::default();
         let first = operations.begin().expect("first state operation");
         let second = operations.begin().expect("second state operation");

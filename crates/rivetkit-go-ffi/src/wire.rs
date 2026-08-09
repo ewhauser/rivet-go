@@ -583,12 +583,16 @@ pub(crate) enum Command {
     KvGet {
         kv_id: u64,
         aid: String,
+        #[serde(default)]
+        r#gen: u64,
         #[serde(with = "serde_bytes")]
         key: Vec<u8>,
     },
     KvList {
         kv_id: u64,
         aid: String,
+        #[serde(default)]
+        r#gen: u64,
         #[serde(with = "serde_bytes")]
         prefix: Vec<u8>,
         #[serde(default)]
@@ -599,6 +603,8 @@ pub(crate) enum Command {
     KvPut {
         kv_id: u64,
         aid: String,
+        #[serde(default)]
+        r#gen: u64,
         #[serde(with = "serde_bytes")]
         key: Vec<u8>,
         #[serde(with = "serde_bytes")]
@@ -607,6 +613,8 @@ pub(crate) enum Command {
     KvDelete {
         kv_id: u64,
         aid: String,
+        #[serde(default)]
+        r#gen: u64,
         #[serde(with = "serde_bytes")]
         key: Vec<u8>,
     },
@@ -1862,17 +1870,21 @@ mod tests {
         save.r#gen = 7;
         save.state = Some(b"state".to_vec());
         let mut get = golden_command("kv_get");
+        get.r#gen = 7;
         get.kv_id = 11;
         get.key = Some(b"key".to_vec());
         let mut list = golden_command("kv_list");
+        list.r#gen = 7;
         list.kv_id = 12;
         list.prefix = Some(b"prefix".to_vec());
         list.limit = Some(32);
         let mut put = golden_command("kv_put");
+        put.r#gen = 7;
         put.kv_id = 13;
         put.key = Some(b"key".to_vec());
         put.value = Some(b"value".to_vec());
         let mut delete = golden_command("kv_delete");
+        delete.r#gen = 7;
         delete.kv_id = 14;
         delete.key = Some(b"key".to_vec());
         let command_m2 = rmp_serde::to_vec_named(&GoldenCommandBatch {

@@ -372,11 +372,12 @@ func TestNativeKVListCrossesPollBatchBoundaryAndReportsErrors(t *testing.T) {
 	puts := make([]wire.Command, 0, entryCount)
 	for i := uint64(1); i <= entryCount; i++ {
 		puts = append(puts, wire.Command{
-			Kind:  wire.CommandKVPut,
-			KVID:  i,
-			AID:   actor.ActorID,
-			Key:   []byte(fmt.Sprintf("entry/%03d", i)),
-			Value: []byte(fmt.Sprintf("value-%03d", i)),
+			Kind:       wire.CommandKVPut,
+			KVID:       i,
+			AID:        actor.ActorID,
+			Generation: started.Generation,
+			Key:        []byte(fmt.Sprintf("entry/%03d", i)),
+			Value:      []byte(fmt.Sprintf("value-%03d", i)),
 		})
 	}
 	submitNativeCommands(t, runner, puts...)
@@ -409,11 +410,12 @@ func TestNativeKVListCrossesPollBatchBoundaryAndReportsErrors(t *testing.T) {
 	limit := uint32(entryCount)
 	const listID = 1_000
 	submitNativeCommands(t, runner, wire.Command{
-		Kind:   wire.CommandKVList,
-		KVID:   listID,
-		AID:    actor.ActorID,
-		Prefix: []byte("entry/"),
-		Limit:  &limit,
+		Kind:       wire.CommandKVList,
+		KVID:       listID,
+		AID:        actor.ActorID,
+		Generation: started.Generation,
+		Prefix:     []byte("entry/"),
+		Limit:      &limit,
 	})
 	listed := waitForNativeKVResult(t, runner, listID, 10*time.Second)
 	if listed.Error != nil {
@@ -425,14 +427,15 @@ func TestNativeKVListCrossesPollBatchBoundaryAndReportsErrors(t *testing.T) {
 
 	const errorID = 1_001
 	submitNativeCommands(t, runner, wire.Command{
-		Kind: wire.CommandKVGet,
-		KVID: errorID,
-		AID:  "actor-that-is-not-active",
-		Key:  []byte("missing"),
+		Kind:       wire.CommandKVGet,
+		KVID:       errorID,
+		AID:        actor.ActorID,
+		Generation: started.Generation + 1,
+		Key:        []byte("missing"),
 	})
 	failed := waitForNativeKVResult(t, runner, errorID, 10*time.Second)
-	if failed.Error == nil || failed.Error.Code != "actor_not_found" {
-		t.Fatalf("KV error code = %v, want actor_not_found", failed.Error)
+	if failed.Error == nil || failed.Error.Code != "actor_generation_stale" {
+		t.Fatalf("KV error code = %v, want actor_generation_stale", failed.Error)
 	}
 
 	deleteActor(t, engine.endpoint, actor.ActorID)

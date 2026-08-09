@@ -36,7 +36,7 @@ const (
 	// The release workflow refuses to publish unless the pushed tag equals
 	// this constant and every rebuilt artifact hashes to its checksums.txt
 	// entry, so a loader at this commit can trust tag + checksum together.
-	artifactReleaseTag = "v0.1.1"
+	artifactReleaseTag = "v0.2.0"
 
 	defaultArtifactBaseURL = "https://github.com/ewhauser/rivet-go/releases/download"
 	envLibraryOverride     = "RIVET_GO_FFI_LIB"

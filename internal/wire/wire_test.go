@@ -444,6 +444,11 @@ func TestRustM2CommandBatchGolden(t *testing.T) {
 	if batch.Commands[4].Limit == nil || *batch.Commands[4].Limit != 32 {
 		t.Fatalf("unexpected KV list limit: %#v", batch.Commands[4].Limit)
 	}
+	for index := 3; index <= 6; index++ {
+		if batch.Commands[index].Generation != 7 {
+			t.Fatalf("KV command %d generation = %d, want 7", index, batch.Commands[index].Generation)
+		}
+	}
 	encoded, err := EncodeCommandBatch(batch)
 	if err != nil {
 		t.Fatal(err)
