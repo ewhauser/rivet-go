@@ -282,6 +282,7 @@ func (c *Context[T]) Destroy() error {
 	accepted, err := closeSQLiteAndRequestDestroy(c.db, c.session.Destroy)
 	if accepted {
 		c.destroyRequested = true
+		c.stopManagedAdmission()
 	}
 	return err
 }
@@ -483,6 +484,7 @@ func (a *actorAdapter[T]) Stop(
 	actorContext.lifecycleMu.Lock()
 	actorContext.lifecycleStopping = true
 	actorContext.lifecycleMu.Unlock()
+	actorContext.stopManagedAdmission()
 	actorContext.turnMu.Lock()
 	defer actorContext.turnMu.Unlock()
 	var stopErr error

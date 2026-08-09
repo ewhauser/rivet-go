@@ -130,6 +130,8 @@ ActorConnect connection state are each limited to 1 MiB; the Go adapter rejects
 oversized values as actor-local structured errors before they reach the shared
 native runner. `ActorStopResult` follows the
 actor stop callback, DB close, and core's admitted-operation fence.
+`WaitUntil` and `KeepAwake` reject new work with `ErrActorStopping` once
+graceful stop or accepted destruction has fenced the generation.
 
 ## Metrics and logging
 

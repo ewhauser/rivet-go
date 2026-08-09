@@ -126,9 +126,7 @@ func (c *Context[T]) drainManaged() error {
 	if c == nil {
 		return nil
 	}
-	c.managedMu.Lock()
-	c.managedStopping = true
-	c.managedMu.Unlock()
+	c.stopManagedAdmission()
 	done := make(chan struct{})
 	go func() {
 		c.managedWG.Wait()
@@ -146,4 +144,13 @@ func (c *Context[T]) drainManaged() error {
 			return errors.New("wait-until work did not stop after generation cancellation")
 		}
 	}
+}
+
+func (c *Context[T]) stopManagedAdmission() {
+	if c == nil {
+		return
+	}
+	c.managedMu.Lock()
+	c.managedStopping = true
+	c.managedMu.Unlock()
 }
