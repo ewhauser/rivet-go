@@ -1223,6 +1223,27 @@ func TestDurableActionScheduleOperationsAreGenerationFencedAndCorrelated(t *test
 	}
 }
 
+func TestScheduleAfterRoundsPositivePartialMillisecondsUp(t *testing.T) {
+	tests := []struct {
+		name  string
+		delay time.Duration
+		want  uint64
+	}{
+		{name: "zero", delay: 0, want: 0},
+		{name: "nanosecond", delay: time.Nanosecond, want: 1},
+		{name: "partial millisecond", delay: 999 * time.Microsecond, want: 1},
+		{name: "whole millisecond", delay: time.Millisecond, want: 1},
+		{name: "partial second millisecond", delay: time.Millisecond + time.Nanosecond, want: 2},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := durationMilliseconds(test.delay); got != test.want {
+				t.Fatalf("durationMilliseconds(%s) = %d, want %d", test.delay, got, test.want)
+			}
+		})
+	}
+}
+
 func TestLateActorIntentCompletionCannotResolveAReusedID(t *testing.T) {
 	p := New(newFakeRunner())
 	p.nextIntentID.Store(^uint64(0))
