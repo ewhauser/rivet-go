@@ -7,12 +7,12 @@ Define actor state, actions, HTTP handlers, and WebSocket handlers in Go.
 shutdown. It uses a prebuilt native adapter, so applications do not need cgo or
 a C toolchain.
 
-The current release is `v0.1.0` and targets Rivet Engine `v2.3.10`.
+The current release is `v0.1.1` and targets Rivet Engine `v2.3.10`.
 
 ## Install
 
 ```sh
-go get github.com/ewhauser/rivet-go/rivet@v0.1.0
+go get github.com/ewhauser/rivet-go/rivet@v0.1.1
 ```
 
 The first call to `rivet.Serve` downloads the native adapter for the current
@@ -27,7 +27,7 @@ Prebuilt adapters are available for:
 For offline environments, populate the cache ahead of time:
 
 ```sh
-go run github.com/ewhauser/rivet-go/cmd/rivet-go-fetch@v0.1.0
+go run github.com/ewhauser/rivet-go/cmd/rivet-go-fetch@v0.1.1
 ```
 
 ## Define an actor
