@@ -25,7 +25,7 @@ type Client struct {
 	conn      net.Conn
 	maxFrame  uint32
 	nextID    atomic.Uint32
-	writeMu   sync.Mutex
+	writeSem  chan struct{}
 	pendingMu sync.Mutex
 	pending   map[uint32]chan response
 	closed    chan struct{}
@@ -43,6 +43,7 @@ func Dial(ctx context.Context, path string) (*Client, error) {
 	client := &Client{
 		conn:     conn,
 		maxFrame: defaultMaxFrame,
+		writeSem: make(chan struct{}, 1),
 		pending:  make(map[uint32]chan response),
 		closed:   make(chan struct{}),
 	}
@@ -52,7 +53,7 @@ func Dial(ctx context.Context, path string) (*Client, error) {
 			return nil, fmt.Errorf("set Actor Runtime Socket handshake deadline: %w", err)
 		}
 	}
-	if err := client.writeFrame(encodeHello()); err != nil {
+	if _, err := client.writeFrame(ctx, encodeHello()); err != nil {
 		_ = conn.Close()
 		return nil, fmt.Errorf("write Actor Runtime Socket hello: %w", err)
 	}
@@ -132,9 +133,12 @@ func (c *Client) request(ctx context.Context, value request) (Result, error) {
 		c.removePending(value.id)
 		return Result{}, &wire.WireError{Code: "sqlite_request_too_large", Message: "SQLite request exceeds Actor Runtime Socket maxFrameBytes"}
 	}
-	if err := c.writeFrame(payload); err != nil {
+	writeStarted, err := c.writeFrame(ctx, payload)
+	if err != nil {
 		c.removePending(value.id)
-		_ = c.Close()
+		if writeStarted {
+			_ = c.Close()
+		}
 		return Result{}, err
 	}
 	select {
@@ -156,18 +160,59 @@ func (c *Client) request(ctx context.Context, value request) (Result, error) {
 	}
 }
 
-func (c *Client) writeFrame(payload []byte) error {
+func (c *Client) writeFrame(ctx context.Context, payload []byte) (started bool, resultErr error) {
 	if uint64(len(payload)) > uint64(^uint32(0)) {
-		return errors.New("Actor Runtime Socket frame exceeds u32 length")
+		return false, errors.New("Actor Runtime Socket frame exceeds u32 length")
 	}
-	c.writeMu.Lock()
-	defer c.writeMu.Unlock()
+	select {
+	case c.writeSem <- struct{}{}:
+	case <-ctx.Done():
+		return false, ctx.Err()
+	case <-c.closed:
+		return false, errors.New("Actor Runtime Socket is closed")
+	}
+	defer func() { <-c.writeSem }()
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+
+	started = true
+	deadline := time.Time{}
+	if value, ok := ctx.Deadline(); ok {
+		deadline = value
+	}
+	if err := c.conn.SetWriteDeadline(deadline); err != nil {
+		return true, fmt.Errorf("set Actor Runtime Socket write deadline: %w", err)
+	}
+	cancelDone := make(chan struct{})
+	stopCancel := context.AfterFunc(ctx, func() {
+		_ = c.conn.SetWriteDeadline(time.Now())
+		close(cancelDone)
+	})
+	defer func() {
+		if !stopCancel() {
+			<-cancelDone
+		}
+		if err := c.conn.SetWriteDeadline(time.Time{}); resultErr == nil && err != nil {
+			resultErr = fmt.Errorf("clear Actor Runtime Socket write deadline: %w", err)
+		}
+	}()
+
 	var header [4]byte
 	binary.BigEndian.PutUint32(header[:], uint32(len(payload)))
 	if err := writeAll(c.conn, header[:]); err != nil {
-		return err
+		if contextErr := ctx.Err(); contextErr != nil {
+			return true, contextErr
+		}
+		return true, err
 	}
-	return writeAll(c.conn, payload)
+	if err := writeAll(c.conn, payload); err != nil {
+		if contextErr := ctx.Err(); contextErr != nil {
+			return true, contextErr
+		}
+		return true, err
+	}
+	return true, nil
 }
 
 func writeAll(writer io.Writer, data []byte) error {

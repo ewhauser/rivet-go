@@ -724,10 +724,14 @@ lengths use unsigned varints. The 10-second hello must return version 1 and a
 positive `maxFrameBytes`; the client honors the smaller of that value and
 core's 32 MiB default.
 
-Requests use nonzero u32 IDs with a correlation table, serialized writer, and
-reader goroutine. A canceled request leaves a tombstone until its response is
-consumed. Disconnect fails every live request and closes the generation's DB
-handle; reconnect happens only through the next `ActorStart`. Transaction
+Requests use nonzero u32 IDs with a correlation table, context-aware serialized
+writer, and reader goroutine. Waiting for the writer and writing the frame both
+honor cancellation and deadlines. Cancellation before writing leaves the
+connection usable; cancellation after a frame may have started closes it so a
+partial frame cannot corrupt a later request. A canceled request whose frame
+was sent leaves a tombstone until its response is consumed. Disconnect fails
+every live request and closes the generation's DB handle; reconnect happens
+only through the next `ActorStart`. Transaction
 begin sends the Go lease key plus its timeout. Other transaction operations
 carry that key exactly where the upstream schema requires it, and connection
 close makes core expire every active lease. Public parameterized `Exec` uses
