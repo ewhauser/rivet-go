@@ -62,11 +62,34 @@ type nativeAPI struct {
 }
 
 var (
-	api           nativeAPI
-	activeRunners atomic.Int64
-	activeErrors  atomic.Int64
-	activeBuffers atomic.Int64
+	api                 nativeAPI
+	activeRunners       atomic.Int64
+	activeErrors        atomic.Int64
+	activeBuffers       atomic.Int64
+	processRunnerActive atomic.Bool
 )
+
+var errRunnerAlreadyActive = errors.New("another native runner is already active in this process")
+
+type runnerLease struct {
+	once sync.Once
+}
+
+func acquireRunnerLease() (*runnerLease, error) {
+	if !processRunnerActive.CompareAndSwap(false, true) {
+		return nil, errRunnerAlreadyActive
+	}
+	return &runnerLease{}, nil
+}
+
+func (l *runnerLease) release() {
+	if l == nil {
+		return
+	}
+	l.once.Do(func() {
+		processRunnerActive.Store(false)
+	})
+}
 
 // HandleCounts reports native allocations currently owned by Go wrappers.
 // It is used by the soak oracle after the runner has fully drained.
@@ -90,6 +113,7 @@ type Runner struct {
 	ptr    *cRunner
 	once   sync.Once
 	logger *slog.Logger
+	lease  *runnerLease
 }
 
 // Error is an owned structured native error handle.
@@ -209,6 +233,17 @@ func NewRunner(config []byte) (RunnerResult, error) {
 	if err := Load(); err != nil {
 		return RunnerResult{}, err
 	}
+	lease, err := acquireRunnerLease()
+	if err != nil {
+		return RunnerResult{}, err
+	}
+	leaseOwnedByRunner := false
+	defer func() {
+		if !leaseOwnedByRunner {
+			lease.release()
+		}
+	}()
+
 	var configPtr *byte
 	if len(config) > 0 {
 		configPtr = unsafe.SliceData(config)
@@ -218,7 +253,8 @@ func NewRunner(config []byte) (RunnerResult, error) {
 
 	var runner *Runner
 	if result.runner != nil {
-		runner = &Runner{ptr: result.runner}
+		runner = &Runner{ptr: result.runner, lease: lease}
+		leaseOwnedByRunner = true
 		activeRunners.Add(1)
 		runtime.SetFinalizer(runner, finalizeRunner)
 	}
@@ -276,6 +312,7 @@ func (r *Runner) Close() {
 		return
 	}
 	r.once.Do(func() {
+		defer r.lease.release()
 		runtime.SetFinalizer(r, nil)
 		r.mu.Lock()
 		defer r.mu.Unlock()

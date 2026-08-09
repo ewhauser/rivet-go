@@ -209,6 +209,24 @@ func TestNativeBoundaryConcurrencyAndLifecycle(t *testing.T) {
 	if connected.RunnerID == "" {
 		t.Fatal("RunnerConnected has an empty runner_id")
 	}
+	concurrentResult, err := ffi.NewRunner(encodeNativeRunnerConfig(
+		t,
+		engine.endpoint,
+		"rivet-go-concurrent-boundary",
+		[]string{},
+	))
+	if err == nil || !strings.Contains(err.Error(), "another native runner is already active") {
+		if concurrentResult.Runner != nil {
+			concurrentResult.Runner.Close()
+		}
+		if concurrentResult.Error != nil {
+			concurrentResult.Error.Close()
+		}
+		t.Fatalf("concurrent NewRunner error = %v, want process-global runner conflict", err)
+	}
+	if concurrentResult.Runner != nil || concurrentResult.Error != nil {
+		t.Fatalf("concurrent NewRunner result = %#v, want no native handles", concurrentResult)
+	}
 
 	firstPoll := make(chan struct {
 		batch wire.EventBatch
@@ -2038,21 +2056,7 @@ func startNativeRunner(t *testing.T, endpoint, name string) *ffi.Runner {
 
 func startNativeRunnerWithActors(t *testing.T, endpoint, name string, actorNames []string) *ffi.Runner {
 	t.Helper()
-	config, err := wire.EncodeRunnerConfig(wire.RunnerConfig{
-		EngineEndpoint:           endpoint,
-		Namespace:                "default",
-		RunnerName:               name,
-		Version:                  1,
-		TotalSlots:               1,
-		ActorNames:               actorNames,
-		ActorActions:             map[string][]string{},
-		ActorHibernateWebSockets: map[string]bool{},
-		ActorDatabases:           map[string]bool{},
-		LogLevel:                 "error",
-	})
-	if err != nil {
-		t.Fatalf("encode config: %v", err)
-	}
+	config := encodeNativeRunnerConfig(t, endpoint, name, actorNames)
 	result, err := ffi.NewRunner(config)
 	if err != nil {
 		t.Fatalf("invoke rk_runner_new: %v", err)
@@ -2070,6 +2074,26 @@ func startNativeRunnerWithActors(t *testing.T, endpoint, name string, actorNames
 	}
 	t.Cleanup(result.Runner.Close)
 	return result.Runner
+}
+
+func encodeNativeRunnerConfig(t *testing.T, endpoint, name string, actorNames []string) []byte {
+	t.Helper()
+	config, err := wire.EncodeRunnerConfig(wire.RunnerConfig{
+		EngineEndpoint:           endpoint,
+		Namespace:                "default",
+		RunnerName:               name,
+		Version:                  1,
+		TotalSlots:               1,
+		ActorNames:               actorNames,
+		ActorActions:             map[string][]string{},
+		ActorHibernateWebSockets: map[string]bool{},
+		ActorDatabases:           map[string]bool{},
+		LogLevel:                 "error",
+	})
+	if err != nil {
+		t.Fatalf("encode config: %v", err)
+	}
+	return config
 }
 
 func submitNativeCommands(t *testing.T, runner *ffi.Runner, commands ...wire.Command) {
