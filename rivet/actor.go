@@ -49,9 +49,10 @@ type Actor[T any] struct {
 	Actions Actions[T]
 	// OnFetch handles buffered HTTP requests from the pinned core. Response
 	// headers lock on the first WriteHeader or Write, concurrent Write calls are
-	// serialized, and writes after OnFetch returns fail. Header must not be
-	// mutated concurrently with a write. The M3 writer intentionally does not
-	// implement http.Flusher because v2.3.10 buffers the complete response.
+	// serialized, the aggregate body is capped at 16 MiB, and writes after
+	// OnFetch returns fail. Header must not be mutated concurrently with a write.
+	// The M3 writer intentionally does not implement http.Flusher because
+	// v2.3.10 buffers the complete response.
 	OnFetch   func(*Context[T], http.ResponseWriter, *http.Request)
 	OnConnect func(*Context[T], *Connection) error
 	OnMessage func(*Context[T], *Connection, Message)
