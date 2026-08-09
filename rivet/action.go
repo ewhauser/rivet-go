@@ -9,6 +9,8 @@ import (
 	"github.com/fxamacker/cbor/v2"
 )
 
+const maxActionResultBytes = 1 << 20
+
 // Actions is the explicit action table for an Actor. The engine delivers
 // action arguments as a CBOR array at v2.3.10; Action applies the same struct
 // tags and typed value rules as encoding/json while handling that transport.
@@ -55,7 +57,8 @@ func (e ActionError) Error() string {
 func (e ActionError) ActionCode() string { return e.Code }
 
 // Action adapts a typed single-argument Go function to Rivet's CBOR action
-// transport. JSON struct tags are honored by the codec.
+// transport. JSON struct tags are honored by the codec. The encoded result
+// must not exceed the 1 MiB boundary limit.
 func Action[T, A, R any](handler func(*Context[T], A) (R, error)) ActionHandler[T] {
 	return typedAction[T, A, R]{handler: handler}
 }
@@ -71,7 +74,7 @@ func ActionWithContext[T, A, R any](
 
 // RawAction bypasses typed argument and result encoding. Input is the exact
 // CBOR argument array delivered by rivetkit-core and output must be one CBOR
-// value suitable for the engine client response.
+// value no larger than the 1 MiB boundary limit.
 func RawAction[T any](handler func(*Context[T], []byte) ([]byte, error)) ActionHandler[T] {
 	return rawAction[T]{handler: handler}
 }
@@ -151,6 +154,9 @@ func invokeTypedAction[T, A, R any](
 			Message: fmt.Sprintf("encode action result: %v", err),
 		}
 	}
+	if err := validateActionResultSize(encodedResult); err != nil {
+		return nil, err
+	}
 	return encodedResult, nil
 }
 
@@ -194,6 +200,9 @@ func invokeRawAction[T any](
 	if err != nil {
 		return nil, actionHandlerError(err)
 	}
+	if err := validateActionResultSize(result); err != nil {
+		return nil, err
+	}
 	if err := cbor.Valid(result); err != nil {
 		return nil, pump.HandlerError{
 			Code:    "action_encode_failed",
@@ -201,6 +210,16 @@ func invokeRawAction[T any](
 		}
 	}
 	return append([]byte(nil), result...), nil
+}
+
+func validateActionResultSize(result []byte) error {
+	if len(result) <= maxActionResultBytes {
+		return nil
+	}
+	return pump.HandlerError{
+		Code:    "action_result_too_large",
+		Message: fmt.Sprintf("action result exceeds the %d-byte boundary limit", maxActionResultBytes),
+	}
 }
 
 func actionHandlerError(err error) error {

@@ -11,6 +11,21 @@ import (
 	"github.com/fxamacker/cbor/v2"
 )
 
+func encodedCBORBytes(t *testing.T, size int) cbor.RawMessage {
+	t.Helper()
+	if size < 5 {
+		t.Fatalf("encoded CBOR size %d is too small for the test value", size)
+	}
+	encoded, err := cbor.Marshal(make([]byte, size-5))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(encoded) != size {
+		t.Fatalf("encoded CBOR size = %d, want %d", len(encoded), size)
+	}
+	return cbor.RawMessage(encoded)
+}
+
 func TestTypedActionUsesCoreCBORArrayAndJSONTags(t *testing.T) {
 	type state struct{ Count int }
 	type argument struct {
@@ -63,6 +78,54 @@ func TestRawActionPreservesCoreBytes(t *testing.T) {
 	}
 	if !reflect.DeepEqual(output, want) {
 		t.Fatal("raw action output bytes changed at the SDK boundary")
+	}
+}
+
+func TestActionResultSizeLimit(t *testing.T) {
+	type state struct{}
+	arguments, err := cbor.Marshal([]any{0})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, test := range []struct {
+		name string
+		size int
+		raw  bool
+		code string
+	}{
+		{name: "typed exact limit", size: maxActionResultBytes},
+		{name: "typed over limit", size: maxActionResultBytes + 1, code: "action_result_too_large"},
+		{name: "raw exact limit", size: maxActionResultBytes, raw: true},
+		{name: "raw over limit", size: maxActionResultBytes + 1, raw: true, code: "action_result_too_large"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			result := encodedCBORBytes(t, test.size)
+			var handler ActionHandler[state]
+			if test.raw {
+				handler = RawAction(func(*Context[state], []byte) ([]byte, error) {
+					return result, nil
+				})
+			} else {
+				handler = Action(func(*Context[state], int) (cbor.RawMessage, error) {
+					return result, nil
+				})
+			}
+			output, invokeErr := handler.invoke(context.Background(), &Context[state]{}, arguments)
+			if test.code == "" {
+				if invokeErr != nil {
+					t.Fatal(invokeErr)
+				}
+				if len(output) != test.size {
+					t.Fatalf("action result size = %d, want %d", len(output), test.size)
+				}
+				return
+			}
+			var structured pump.HandlerError
+			if !errors.As(invokeErr, &structured) || structured.Code != test.code {
+				t.Fatalf("action error = %#v, want %s HandlerError", invokeErr, test.code)
+			}
+		})
 	}
 }
 

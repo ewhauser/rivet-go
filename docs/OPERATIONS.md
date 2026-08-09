@@ -125,7 +125,10 @@ protocol overhead. Large result APIs should paginate explicitly.
 SQL commits and actor-state saves are durable but separate; there is no atomic
 transaction spanning them. A SQL mutation returns after its Depot commit, and
 `Context.Save` returns after its state commit. Normal action completion also
-saves state before releasing the action result. `ActorStopResult` follows the
+saves state before releasing the action result. Encoded action results and
+ActorConnect connection state are each limited to 1 MiB; the Go adapter rejects
+oversized values as actor-local structured errors before they reach the shared
+native runner. `ActorStopResult` follows the
 actor stop callback, DB close, and core's admitted-operation fence.
 
 ## Metrics and logging
