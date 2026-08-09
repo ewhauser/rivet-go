@@ -27,15 +27,22 @@ type Message struct {
 	MessageIndex uint16
 }
 
-// Connection is one live raw gateway WebSocket. Methods are safe to call from
-// handler-owned goroutines; native submission is serialized away from the
-// polling goroutine.
+// Connection is one live core connection. ActorConnect actions and lifecycle
+// hooks can inspect parameters and typed state; raw gateway WebSockets also
+// support frame and close methods.
 type Connection struct {
 	session      *pump.ActorSession
 	id           string
+	parameters   []byte
 	path         string
 	headers      map[string]string
 	canHibernate bool
+	resumed      bool
+	actorConnect bool
+	rawWebSocket bool
+	stateMu      sync.RWMutex
+	state        any
+	encodedState []byte
 	closed       atomic.Bool
 	closeMu      sync.Mutex
 	closeCode    *uint16
@@ -49,7 +56,34 @@ func newConnection(session *pump.ActorSession, event wire.Event) *Connection {
 		path:         event.Path,
 		headers:      cloneStringMap(event.Headers),
 		canHibernate: event.CanHibernate,
+		resumed:      event.Resumed,
+		rawWebSocket: true,
 	}
+}
+
+func newActorConnection(session *pump.ActorSession, snapshot wire.Connection) *Connection {
+	return &Connection{
+		session:      session,
+		id:           snapshot.ID,
+		parameters:   append([]byte(nil), snapshot.Parameters...),
+		path:         snapshot.Path,
+		headers:      cloneStringMap(snapshot.Headers),
+		canHibernate: snapshot.CanHibernate,
+		resumed:      snapshot.Resumed,
+		actorConnect: snapshot.ActorConnect,
+		encodedState: append([]byte(nil), snapshot.State...),
+	}
+}
+
+func (c *Connection) updateWebSocketMetadata(event wire.Event) {
+	if c == nil {
+		return
+	}
+	c.path = event.Path
+	c.headers = cloneStringMap(event.Headers)
+	c.canHibernate = event.CanHibernate
+	c.resumed = event.Resumed
+	c.rawWebSocket = true
 }
 
 // ID is the core-assigned connection identifier.
@@ -58,6 +92,14 @@ func (c *Connection) ID() string {
 		return ""
 	}
 	return c.id
+}
+
+// Parameters returns a copy of the ActorConnect CBOR connection parameters.
+func (c *Connection) Parameters() []byte {
+	if c == nil {
+		return nil
+	}
+	return append([]byte(nil), c.parameters...)
 }
 
 // Path is the raw actor WebSocket request path, including its query string.
@@ -82,6 +124,10 @@ func (c *Connection) CanHibernate() bool {
 	return c != nil && c.canHibernate
 }
 
+// Resumed reports whether core restored this hibernatable connection into the
+// current actor generation.
+func (c *Connection) Resumed() bool { return c != nil && c.resumed }
+
 // Send sends one text frame. Data must be valid UTF-8 and no larger than one
 // MiB. Use SendBinary for a binary frame.
 func (c *Connection) Send(data []byte) error {
@@ -105,6 +151,9 @@ func (c *Connection) SendBinary(data []byte) error {
 func (c *Connection) SendContext(ctx context.Context, data []byte, binary bool) error {
 	if c == nil || c.session == nil {
 		return errors.New("WebSocket connection is unavailable")
+	}
+	if !c.rawWebSocket {
+		return errors.New("connection does not expose raw WebSocket frames")
 	}
 	if ctx == nil {
 		return errors.New("WebSocket send context is nil")
@@ -131,6 +180,9 @@ func (c *Connection) Close(code uint16, reason string) error {
 func (c *Connection) CloseContext(ctx context.Context, code uint16, reason string) error {
 	if c == nil || c.session == nil {
 		return errors.New("WebSocket connection is unavailable")
+	}
+	if !c.rawWebSocket {
+		return errors.New("connection does not expose a raw WebSocket close")
 	}
 	if ctx == nil {
 		return errors.New("WebSocket close context is nil")
@@ -186,8 +238,8 @@ func (c *Connection) setClose(code *uint16, reason string) {
 	c.closeMu.Unlock()
 }
 
-// Connections returns a snapshot of this actor generation's live raw
-// WebSocket connections, sorted by connection ID. The returned slice can be
+// Connections returns a snapshot of this actor generation's live ActorConnect
+// and raw WebSocket connections, sorted by connection ID. The returned slice can be
 // modified by the caller; a connection in the snapshot may close afterward.
 func (c *Context[T]) Connections() []*Connection {
 	if c == nil {
@@ -196,7 +248,9 @@ func (c *Context[T]) Connections() []*Connection {
 	c.connectionsMu.Lock()
 	connections := make([]*Connection, 0, len(c.connections))
 	for _, connection := range c.connections {
-		connections = append(connections, connection)
+		if connection.actorConnect || connection.rawWebSocket {
+			connections = append(connections, connection)
+		}
 	}
 	c.connectionsMu.Unlock()
 	slices.SortFunc(connections, func(left, right *Connection) int {
@@ -220,6 +274,9 @@ func (c *Context[T]) BroadcastExcept(event string, payload any, connection *Conn
 	}
 	if c == nil || c.session == nil || connection.session != c.session {
 		return errors.New("excluded WebSocket connection belongs to another actor generation")
+	}
+	if !connection.rawWebSocket {
+		return errors.New("excluded connection is not a raw WebSocket")
 	}
 	id := connection.ID()
 	return c.broadcast(event, payload, &id)

@@ -206,6 +206,8 @@ The response is:
   actor resolution, and company-created employee actors
 - [Cross-actor actions](examples/cross-actor-actions): checkout and inventory
   actors coordinating through actor-scoped clients
+- [Collaborative cursors](examples/cursors): ActorConnect caller context,
+  typed per-connection state, presence events, and hibernation-safe cursors
 
 ## RivetKit feature compatibility
 
@@ -221,12 +223,12 @@ is still missing.
 | Lifecycle hooks | Partial | `OnStart`, `OnStop`, and `OnAlarm` are available. There are no distinct create, wake, sleep, destroy, state-change, or background-run hooks. |
 | Actor input and identity | Partial | Context exposes raw creation input, actor ID, generation, actor name, and the engine-formatted key. Individual key segments, creation time, and region are not public. |
 | Actor-to-actor and external action clients | Supported | Concurrency-safe clients expose `Get`, `GetByKey`, `GetOrCreate`, `Create`, regional creation, exact creation input, typed/raw action calls, structured errors, cancellation, and actor-scoped clients with direct self-call rejection. |
-| ActorConnect and WebSocket clients | Not implemented | The Go client does not yet expose subscriptions, client events, reconnect, connection parameters, or the ActorConnect WebSocket protocol. Raw gateway WebSocket handlers remain supported on the actor side. |
+| ActorConnect and WebSocket clients | Partial | Actors support ActorConnect caller context, parameters, lifecycle hooks, state, enumeration, broadcast, and hibernation. The Go client does not yet expose the ActorConnect protocol, subscriptions, client events, or reconnect. Raw gateway WebSocket handlers remain supported. |
 | Actions and structured errors | Supported | Typed and raw CBOR actions, cooperative deadlines, panic isolation, and stable error codes are covered. |
 | Events and broadcast | Supported | Actors can broadcast named CBOR events to actor-connect and raw WebSocket clients, including exclusion of one raw connection. |
 | Raw HTTP handlers | Partial | Standard `net/http` request and response handling works, but the pinned core buffers complete responses, has no `http.Flusher`, and cannot represent repeated response-header values. |
 | Raw WebSocket handlers | Supported | Text and binary messages, connect/disconnect hooks, targeted sends, close frames, broadcast, and bounded backpressure are available. |
-| Connection state and enumeration | Partial | `Connections` returns a sorted snapshot of live raw WebSocket connections. Connections expose IDs, request paths, headers, and hibernation metadata, but have no user-defined per-connection state. |
+| Connection state and enumeration | Supported | `CurrentConnection` exposes an ActorConnect caller, `Connections` returns sorted live ActorConnect and raw WebSocket connections, and `NewConnectionState` provides typed ActorConnect state that persists across sleep/wake. Connections expose IDs, CBOR parameters, request metadata, hibernation capability, and resume status. |
 | Actor sleep and WebSocket hibernation | Supported | Actors can request sleep; opted-in raw WebSockets remain connected and can wake the actor with a message. |
 | Durable scheduling | Supported | `Context.Schedules` exposes durable one-shot `After` and `At` action schedules with typed payloads, stable IDs, get/list inspection, and independent cancellation. The original replaceable `Schedule`/`OnAlarm` API remains available for compatibility. |
 | Cron schedules | Not implemented | Recurring cron expressions must be modeled by scheduling the next one-shot action. |

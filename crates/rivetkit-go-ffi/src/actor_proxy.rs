@@ -18,7 +18,9 @@ use rivetkit_core::{
 use serde::{Deserialize, Serialize};
 
 use crate::correlation::{CorrelationError, CorrelationTable};
-use crate::wire::{Command, Event, KvEntry, ScheduledEvent, SqliteValue, WireError};
+use crate::wire::{
+    Command, Connection as WireConnection, Event, KvEntry, ScheduledEvent, SqliteValue, WireError,
+};
 
 const LIFECYCLE_RESULT_TIMEOUT: Duration = Duration::from_secs(30);
 const SAVE_STATE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -53,12 +55,19 @@ struct ActorStartupPayload {
     input: Vec<u8>,
     persisted_state: Option<Vec<u8>>,
     sqlite_socket_path: Option<String>,
+    connections: Vec<WireConnection>,
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
 struct SqliteLeaseIdentity {
     actor: ActorIdentity,
     lease_key: String,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+struct ConnectionIdentity {
+    actor: ActorIdentity,
+    connection_id: String,
 }
 
 impl ActorIdentity {
@@ -70,11 +79,25 @@ impl ActorIdentity {
     }
 }
 
+fn is_actor_connect_request(request: Option<&rivetkit_core::Request>) -> bool {
+    request.is_some_and(|request| {
+        let (_, path, _, _) = request.to_parts();
+        path.split('?').next() == Some("/connect")
+    })
+}
+
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 enum LifecycleKind {
     Start,
     Stop,
     Alarm,
+}
+
+#[derive(Clone, Copy)]
+enum ConnectionEventKind {
+    Preflight,
+    Open,
+    Close,
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
@@ -176,6 +199,15 @@ struct LifecycleResolution {
 struct ActionResolution {
     #[serde(default, with = "crate::wire::optional_bytes")]
     output: Option<Vec<u8>>,
+    #[serde(default, with = "crate::wire::optional_bytes")]
+    connection_state: Option<Vec<u8>>,
+    error: Option<WireError>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct ConnectionResolution {
+    #[serde(default, with = "crate::wire::optional_bytes")]
+    connection_state: Option<Vec<u8>>,
     error: Option<WireError>,
 }
 
@@ -391,6 +423,8 @@ pub(crate) struct ActorProxy {
     pending: LifecyclePending,
     pending_ws_open: WsOpenPending,
     actors: Arc<Mutex<HashMap<ActorIdentity, ActiveActor>>>,
+    connections: Arc<Mutex<HashMap<ConnectionIdentity, ConnHandle>>>,
+    actor_connect_ids: Arc<Mutex<HashMap<String, String>>>,
     websockets: Arc<Mutex<HashMap<String, ActiveWebSocket>>>,
     restoring_websockets: Arc<Mutex<HashMap<String, ActorIdentity>>>,
     stop_intents: Arc<Mutex<HashSet<ActorIdentity>>>,
@@ -409,6 +443,8 @@ impl ActorProxy {
             pending: LifecyclePending::default(),
             pending_ws_open: WsOpenPending::default(),
             actors: Arc::new(Mutex::new(HashMap::new())),
+            connections: Arc::new(Mutex::new(HashMap::new())),
+            actor_connect_ids: Arc::new(Mutex::new(HashMap::new())),
             websockets: Arc::new(Mutex::new(HashMap::new())),
             restoring_websockets: Arc::new(Mutex::new(HashMap::new())),
             stop_intents: Arc::new(Mutex::new(HashSet::new())),
@@ -530,11 +566,28 @@ impl ActorProxy {
             Command::ActionResult {
                 call_id,
                 output,
+                connection_state,
                 error,
             } => {
-                let payload = rmp_serde::to_vec_named(&ActionResolution { output, error })
-                    .expect("ActionResolution serialization is infallible");
+                let payload = rmp_serde::to_vec_named(&ActionResolution {
+                    output,
+                    connection_state,
+                    error,
+                })
+                .expect("ActionResolution serialization is infallible");
                 self.correlations.resolve(call_id, payload);
+            }
+            Command::ConnectionResult {
+                op_id,
+                connection_state,
+                error,
+            } => {
+                let payload = rmp_serde::to_vec_named(&ConnectionResolution {
+                    connection_state,
+                    error,
+                })
+                .expect("ConnectionResolution serialization is infallible");
+                self.correlations.resolve(op_id, payload);
             }
             Command::HttpResponseStart {
                 req_id,
@@ -838,15 +891,46 @@ impl ActorProxy {
                     alarm_updates: ActorAlarmUpdates::default(),
                 },
             );
+        let actor_connect_ids = self
+            .actor_connect_ids
+            .lock()
+            .expect("ActorConnect ID table poisoned")
+            .clone();
         {
             let mut restoring = self
                 .restoring_websockets
                 .lock()
                 .expect("restoring WebSocket table poisoned");
-            for (conn, _) in hibernated {
-                restoring.insert(conn.id().to_owned(), identity.clone());
+            let mut connections = self.connections.lock().expect("connection table poisoned");
+            for (conn, _) in &hibernated {
+                if actor_connect_ids.contains_key(conn.id()) {
+                    connections.insert(
+                        ConnectionIdentity {
+                            actor: identity.clone(),
+                            connection_id: conn.id().to_owned(),
+                        },
+                        conn.clone(),
+                    );
+                } else {
+                    restoring.insert(conn.id().to_owned(), identity.clone());
+                }
             }
         }
+
+        let restored_connections = hibernated
+            .into_iter()
+            .filter(|(conn, _)| actor_connect_ids.contains_key(conn.id()))
+            .map(|(conn, state)| WireConnection {
+                id: conn.id().to_owned(),
+                parameters: conn.params(),
+                state,
+                path: String::new(),
+                headers: BTreeMap::new(),
+                can_hibernate: conn.is_hibernatable(),
+                resumed: true,
+                actor_connect: actor_connect_ids.contains_key(conn.id()),
+            })
+            .collect();
 
         let result = self
             .run_actor_inner(
@@ -856,11 +940,14 @@ impl ActorProxy {
                     input: input.unwrap_or_default(),
                     persisted_state: snapshot,
                     sqlite_socket_path,
+                    connections: restored_connections,
                 },
                 &mut events,
                 startup_ready,
             )
             .await;
+        let preserving_hibernated_connections =
+            matches!(&result, Ok(true)) && !self.runner_draining.load(Ordering::Acquire);
         match &result {
             Ok(true) if !self.runner_draining.load(Ordering::Acquire) => {
                 self.hibernate_actor_websockets(&identity);
@@ -886,6 +973,16 @@ impl ActorProxy {
             .lock()
             .expect("active actor table poisoned")
             .remove(&identity);
+        self.connections
+            .lock()
+            .expect("connection table poisoned")
+            .retain(|key, _| key.actor != identity);
+        if !preserving_hibernated_connections {
+            self.actor_connect_ids
+                .lock()
+                .expect("ActorConnect ID table poisoned")
+                .retain(|_, actor_id| actor_id != &identity.aid);
+        }
         self.sqlite_transactions
             .lock()
             .expect("SQLite transaction table poisoned")
@@ -920,6 +1017,7 @@ impl ActorProxy {
                     input: startup.input,
                     persisted_state: startup.persisted_state,
                     sqlite_socket_path: startup.sqlite_socket_path,
+                    connections: startup.connections,
                 },
                 None,
             )
@@ -1043,8 +1141,71 @@ impl ActorProxy {
                 ActorEvent::QueueSend { reply, .. } => {
                     reply.send(Err(anyhow!("queue requests are outside the Go boundary")));
                 }
-                ActorEvent::ConnectionPreflight { reply, .. }
-                | ActorEvent::ConnectionOpen { reply, .. } => reply.send(Ok(())),
+                ActorEvent::ConnectionPreflight {
+                    conn,
+                    request,
+                    reply,
+                    ..
+                } => {
+                    if !is_actor_connect_request(request.as_ref()) {
+                        reply.send(Ok(()));
+                        continue;
+                    }
+                    let resolution = self
+                        .request_connection(
+                            identity,
+                            &conn,
+                            request.as_ref(),
+                            ConnectionEventKind::Preflight,
+                        )
+                        .await;
+                    match resolution {
+                        Ok(state) => {
+                            conn.set_state_initial(state);
+                            reply.send(Ok(()));
+                        }
+                        Err(error) => reply.send(Err(actor_wire_error(&error))),
+                    }
+                }
+                ActorEvent::ConnectionOpen {
+                    conn,
+                    request,
+                    reply,
+                } => {
+                    if !is_actor_connect_request(request.as_ref()) {
+                        reply.send(Ok(()));
+                        continue;
+                    }
+                    let resolution = self
+                        .request_connection(
+                            identity,
+                            &conn,
+                            request.as_ref(),
+                            ConnectionEventKind::Open,
+                        )
+                        .await;
+                    match resolution {
+                        Ok(state) => {
+                            conn.set_state(state);
+                            self.actor_connect_ids
+                                .lock()
+                                .expect("ActorConnect ID table poisoned")
+                                .insert(conn.id().to_owned(), identity.aid.clone());
+                            self.connections
+                                .lock()
+                                .expect("connection table poisoned")
+                                .insert(
+                                    ConnectionIdentity {
+                                        actor: identity.clone(),
+                                        connection_id: conn.id().to_owned(),
+                                    },
+                                    conn,
+                                );
+                            reply.send(Ok(()));
+                        }
+                        Err(error) => reply.send(Err(actor_wire_error(&error))),
+                    }
+                }
                 ActorEvent::WebSocketOpen {
                     conn,
                     ws,
@@ -1060,6 +1221,35 @@ impl ActorProxy {
                 ActorEvent::DisconnectConn { reply, .. } => reply.send(Ok(())),
                 ActorEvent::ConnectionClosed { conn } => {
                     self.websocket_closed(conn.id(), None, None);
+                    if !self
+                        .actor_connect_ids
+                        .lock()
+                        .expect("ActorConnect ID table poisoned")
+                        .contains_key(conn.id())
+                    {
+                        continue;
+                    }
+                    self.connections
+                        .lock()
+                        .expect("connection table poisoned")
+                        .remove(&ConnectionIdentity {
+                            actor: identity.clone(),
+                            connection_id: conn.id().to_owned(),
+                        });
+                    if let Err(error) = self
+                        .request_connection(identity, &conn, None, ConnectionEventKind::Close)
+                        .await
+                        && error.code == "handler_panic"
+                    {
+                        return Err(anyhow!(
+                            "Go connection close handler panicked: {}",
+                            error.message
+                        ));
+                    }
+                    self.actor_connect_ids
+                        .lock()
+                        .expect("ActorConnect ID table poisoned")
+                        .remove(conn.id());
                 }
                 ActorEvent::WorkflowHistoryRequested { reply }
                 | ActorEvent::WorkflowReplayRequested { reply, .. } => reply.send(Ok(None)),
@@ -1113,6 +1303,90 @@ impl ActorProxy {
             return Err(anyhow!("{}: {}", error.code, error.message));
         }
         Ok(())
+    }
+
+    async fn request_connection(
+        &self,
+        identity: &ActorIdentity,
+        conn: &ConnHandle,
+        request: Option<&rivetkit_core::Request>,
+        kind: ConnectionEventKind,
+    ) -> Result<Vec<u8>, WireError> {
+        let actor_connect = is_actor_connect_request(request)
+            || self
+                .actor_connect_ids
+                .lock()
+                .expect("ActorConnect ID table poisoned")
+                .contains_key(conn.id());
+        let (path, headers) = request
+            .map(|request| {
+                let (_, path, headers, _) = request.to_parts();
+                (path, headers.into_iter().collect())
+            })
+            .unwrap_or_else(|| (String::new(), BTreeMap::new()));
+        let connection = WireConnection {
+            id: conn.id().to_owned(),
+            parameters: conn.params(),
+            state: conn.state(),
+            path,
+            headers,
+            can_hibernate: conn.is_hibernatable(),
+            resumed: false,
+            actor_connect,
+        };
+        let (op_id, receiver) = self.correlations.insert(LIFECYCLE_RESULT_TIMEOUT);
+        let event = match kind {
+            ConnectionEventKind::Preflight => Event::ConnectionPreflight {
+                aid: identity.aid.clone(),
+                r#gen: identity.generation,
+                op_id,
+                connection,
+            },
+            ConnectionEventKind::Open => Event::ConnectionOpen {
+                aid: identity.aid.clone(),
+                r#gen: identity.generation,
+                op_id,
+                connection,
+            },
+            ConnectionEventKind::Close => Event::ConnectionClose {
+                aid: identity.aid.clone(),
+                r#gen: identity.generation,
+                op_id,
+                connection,
+            },
+        };
+        if self.events.send(event).is_err() {
+            self.correlations.resolve(
+                op_id,
+                rmp_serde::to_vec_named(&ConnectionResolution {
+                    connection_state: None,
+                    error: Some(WireError::new("runner_stopped", "Go event queue is closed")),
+                })
+                .expect("encode connection queue error"),
+            );
+        }
+        let payload = receiver
+            .await
+            .map_err(|_| WireError::new("runner_stopped", "connection result sender dropped"))?
+            .map_err(|error| match error {
+                CorrelationError::Timeout => WireError::new(
+                    "connection_handler_timed_out",
+                    "Go connection handler exceeded the boundary deadline",
+                ),
+                CorrelationError::Shutdown => {
+                    WireError::new("runner_stopped", "runner stopped during connection handler")
+                }
+            })?;
+        let resolution: ConnectionResolution = rmp_serde::from_slice(&payload)
+            .map_err(|error| WireError::new("connection_result_invalid", error.to_string()))?;
+        match (resolution.connection_state, resolution.error) {
+            (Some(state), None) => Ok(state),
+            (None, Some(error)) => Err(error),
+            _ => Err(WireError::new(
+                "connection_result_invalid",
+                "connection result must contain exactly one of state or error",
+            )),
+        }
     }
 
     async fn request_alarm(
@@ -1196,6 +1470,7 @@ impl ActorProxy {
             | Command::ActorStopResult { .. }
             | Command::AlarmHandled { .. }
             | Command::ActionResult { .. }
+            | Command::ConnectionResult { .. }
             | Command::HttpResponseStart { .. }
             | Command::HttpResponseChunk { .. }
             | Command::WsOpenResult { .. }
@@ -1869,6 +2144,12 @@ impl ActorProxy {
                 format!("action arguments exceed the {MAX_BODY_CHUNK}-byte boundary maximum"),
             ));
         }
+        let conn_id = conn_id.filter(|connection_id| {
+            self.actor_connect_ids
+                .lock()
+                .expect("ActorConnect ID table poisoned")
+                .contains_key(connection_id)
+        });
         let (call_id, receiver) = self.correlations.insert(ACTION_RESULT_TIMEOUT);
         if self
             .events
@@ -1882,7 +2163,7 @@ impl ActorProxy {
                     .try_into()
                     .expect("M3 action timeout fits u32 milliseconds"),
                 args,
-                conn_id,
+                conn_id: conn_id.clone(),
             })
             .is_err()
         {
@@ -1890,6 +2171,7 @@ impl ActorProxy {
                 call_id,
                 rmp_serde::to_vec_named(&ActionResolution {
                     output: None,
+                    connection_state: None,
                     error: Some(WireError::new("runner_stopped", "Go event queue is closed")),
                 })
                 .expect("encode action queue error"),
@@ -1901,9 +2183,48 @@ impl ActorProxy {
             .map_err(correlation_wire_error)?;
         let resolution: ActionResolution = rmp_serde::from_slice(&payload)
             .map_err(|error| WireError::new("action_result_invalid", error.to_string()))?;
-        match (resolution.output, resolution.error) {
-            (Some(output), None) => Ok(output),
-            (None, Some(error)) => Err(error),
+        match (
+            resolution.output,
+            resolution.connection_state,
+            resolution.error,
+        ) {
+            (Some(output), connection_state, None) => {
+                match (conn_id, connection_state) {
+                    (Some(connection_id), Some(state)) => {
+                        let connection = self
+                            .connections
+                            .lock()
+                            .expect("connection table poisoned")
+                            .get(&ConnectionIdentity {
+                                actor: identity.clone(),
+                                connection_id,
+                            })
+                            .cloned()
+                            .ok_or_else(|| {
+                                WireError::new(
+                                    "connection_not_found",
+                                    "calling connection closed before action state persisted",
+                                )
+                            })?;
+                        connection.set_state(state);
+                    }
+                    (Some(_), None) => {
+                        return Err(WireError::new(
+                            "action_result_invalid",
+                            "connected action result is missing connection state",
+                        ));
+                    }
+                    (None, None) => {}
+                    (None, Some(_)) => {
+                        return Err(WireError::new(
+                            "action_result_invalid",
+                            "stateless action result contains connection state",
+                        ));
+                    }
+                }
+                Ok(output)
+            }
+            (None, None, Some(error)) => Err(error),
             _ => Err(WireError::new(
                 "action_result_invalid",
                 "action result must contain exactly one of output or error",
@@ -3219,6 +3540,7 @@ mod tests {
         proxy.handle_command(Command::ActionResult {
             call_id,
             output: Some(vec![0x18, 0x2a]),
+            connection_state: None,
             error: None,
         });
 
@@ -3271,11 +3593,13 @@ mod tests {
         proxy.handle_command(Command::ActionResult {
             call_id: u64::MAX,
             output: Some(vec![0x01]),
+            connection_state: None,
             error: None,
         });
         proxy.handle_command(Command::ActionResult {
             call_id: expired_id,
             output: Some(vec![0x02]),
+            connection_state: None,
             error: None,
         });
         assert!(correlations.contains(live_id));
@@ -3283,6 +3607,7 @@ mod tests {
         proxy.handle_command(Command::ActionResult {
             call_id: live_id,
             output: Some(vec![0x03]),
+            connection_state: None,
             error: None,
         });
         let payload = live

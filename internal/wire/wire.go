@@ -22,6 +22,9 @@ const (
 	EventActorAlarm          EventKind = "actor_alarm"
 	EventActorIntentResult   EventKind = "actor_intent_result"
 	EventActorScheduleResult EventKind = "actor_schedule_result"
+	EventConnectionPreflight EventKind = "connection_preflight"
+	EventConnectionOpen      EventKind = "connection_open"
+	EventConnectionClose     EventKind = "connection_close"
 	EventActionCall          EventKind = "action_call"
 	EventHTTPRequest         EventKind = "http_request"
 	EventHTTPRequestChunk    EventKind = "http_request_chunk"
@@ -41,6 +44,7 @@ const (
 	CommandActorStopResult   CommandKind = "actor_stop_result"
 	CommandAlarmHandled      CommandKind = "alarm_handled"
 	CommandActionResult      CommandKind = "action_result"
+	CommandConnectionResult  CommandKind = "connection_result"
 	CommandHTTPResponseStart CommandKind = "http_response_start"
 	CommandHTTPResponseChunk CommandKind = "http_response_chunk"
 	CommandWSOpenResult      CommandKind = "ws_open_result"
@@ -105,6 +109,7 @@ type Event struct {
 	Input             []byte            `msgpack:"input,omitempty"`
 	PersistedState    []byte            `msgpack:"persisted_state,omitempty"`
 	SQLiteSocketPath  string            `msgpack:"sqlite_socket_path,omitempty"`
+	Connections       []Connection      `msgpack:"connections,omitempty"`
 	KVID              uint64            `msgpack:"kv_id,omitempty"`
 	Value             []byte            `msgpack:"value,omitempty"`
 	Entries           []KVEntry         `msgpack:"entries,omitempty"`
@@ -115,6 +120,7 @@ type Event struct {
 	ActionTimeoutMS   uint32            `msgpack:"timeout_ms,omitempty"`
 	Args              []byte            `msgpack:"args,omitempty"`
 	ConnID            *string           `msgpack:"conn_id,omitempty"`
+	Connection        *Connection       `msgpack:"connection,omitempty"`
 	RequestID         uint64            `msgpack:"req_id,omitempty"`
 	Method            string            `msgpack:"method,omitempty"`
 	Path              string            `msgpack:"path,omitempty"`
@@ -142,6 +148,19 @@ type Event struct {
 	ChunkIndex        uint32            `msgpack:"chunk_index,omitempty"`
 	Done              bool              `msgpack:"done,omitempty"`
 	SQLiteRequestID   uint64            `msgpack:"request_id,omitempty"`
+}
+
+// Connection is one core connection snapshot. ActorConnect marks the public
+// long-lived connection kind; Parameters and State are CBOR values.
+type Connection struct {
+	ID           string            `msgpack:"id"`
+	Parameters   []byte            `msgpack:"parameters"`
+	State        []byte            `msgpack:"state"`
+	Path         string            `msgpack:"path"`
+	Headers      map[string]string `msgpack:"headers"`
+	CanHibernate bool              `msgpack:"can_hibernate"`
+	Resumed      bool              `msgpack:"resumed"`
+	ActorConnect bool              `msgpack:"actor_connect"`
 }
 
 type DrainReport struct {
@@ -209,6 +228,7 @@ type Command struct {
 	Value           []byte            `msgpack:"value"`
 	CallID          uint64            `msgpack:"call_id"`
 	Output          []byte            `msgpack:"output"`
+	ConnectionState *[]byte           `msgpack:"connection_state"`
 	RequestID       uint64            `msgpack:"req_id"`
 	Status          uint16            `msgpack:"status"`
 	Headers         map[string]string `msgpack:"headers"`
@@ -297,6 +317,17 @@ func validateEvent(event Event) error {
 		if event.SQLiteSocketPath != "" && event.SQLiteSocketPath[0] != '/' {
 			return fmt.Errorf("%s event has a non-absolute SQLite socket path", event.Kind)
 		}
+		if len(event.Connections) > 1_024 {
+			return fmt.Errorf("%s event exceeds the 1,024 restored-connection limit", event.Kind)
+		}
+		for index, connection := range event.Connections {
+			if err := validateConnection(connection); err != nil {
+				return fmt.Errorf("%s restored connection %d: %w", event.Kind, index, err)
+			}
+			if !connection.ActorConnect || !connection.Resumed || !connection.CanHibernate {
+				return fmt.Errorf("%s restored connection %d is not a resumed hibernatable ActorConnect connection", event.Kind, index)
+			}
+		}
 	case EventActorStop:
 		if event.AID == "" || event.Reason == "" {
 			return fmt.Errorf("%s event requires aid and reason", event.Kind)
@@ -315,6 +346,16 @@ func validateEvent(event Event) error {
 	case EventActorScheduleResult:
 		if err := validateScheduleResult(event); err != nil {
 			return fmt.Errorf("%s event: %w", event.Kind, err)
+		}
+	case EventConnectionPreflight, EventConnectionOpen, EventConnectionClose:
+		if event.AID == "" || event.OperationID == 0 || event.Connection == nil {
+			return fmt.Errorf("%s event requires aid, op_id, and connection", event.Kind)
+		}
+		if err := validateConnection(*event.Connection); err != nil {
+			return fmt.Errorf("%s event: %w", event.Kind, err)
+		}
+		if !event.Connection.ActorConnect {
+			return fmt.Errorf("%s event does not contain an ActorConnect connection", event.Kind)
 		}
 	case EventActionCall:
 		if event.AID == "" || event.CallID == 0 || event.Action == "" || event.ActionTimeoutMS == 0 {
@@ -390,6 +431,30 @@ func validateEvent(event Event) error {
 	}
 	if event.Error != nil && (event.Error.Code == "" || event.Error.Message == "") {
 		return fmt.Errorf("%s event has incomplete structured error", event.Kind)
+	}
+	return nil
+}
+
+func validateConnection(connection Connection) error {
+	if connection.ID == "" || len(connection.ID) > 1<<20 {
+		return errors.New("connection ID must be non-empty and at most one MiB")
+	}
+	if len(connection.Parameters) > 1<<20 {
+		return errors.New("connection parameters exceed the one MiB limit")
+	}
+	if len(connection.State) > 1<<20 {
+		return errors.New("connection state exceeds the one MiB limit")
+	}
+	if len(connection.Path) > 1<<20 {
+		return errors.New("connection request path exceeds the one MiB limit")
+	}
+	if len(connection.Headers) > 256 {
+		return errors.New("connection exceeds the 256-header schema limit")
+	}
+	for name, value := range connection.Headers {
+		if len(name) > 1<<20 || len(value) > 1<<20 {
+			return errors.New("connection header name or value exceeds the one MiB limit")
+		}
 	}
 	return nil
 }

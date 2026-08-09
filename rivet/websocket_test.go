@@ -98,8 +98,9 @@ func TestWebSocketHooksPreserveConnectionAndFrameMetadata(t *testing.T) {
 
 func TestConnectionsReturnsSortedSnapshot(t *testing.T) {
 	actorContext := &Context[struct{}]{connections: map[string]*Connection{
-		"ws-z": {id: "ws-z"},
-		"ws-a": {id: "ws-a"},
+		"ws-z":    {id: "ws-z", rawWebSocket: true},
+		"ws-a":    {id: "ws-a", rawWebSocket: true},
+		"request": {id: "request"},
 	}}
 	connections := actorContext.Connections()
 	if len(connections) != 2 || connections[0].ID() != "ws-a" || connections[1].ID() != "ws-z" {

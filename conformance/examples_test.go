@@ -908,6 +908,98 @@ func TestPortedRunnableExamples(t *testing.T) {
 
 		stopExampleCleanly(t, engine.endpoint, runnerName, process)
 	})
+
+	t.Run("cursors", func(t *testing.T) {
+		runnerName := fmt.Sprintf("cursors-example-%d", time.Now().UnixNano())
+		process := startExample(t, buildExample(t, "cursors"),
+			"-endpoint", engine.endpoint,
+			"-runner-name", runnerName,
+		)
+		waitForRunner(t, engine.endpoint, runnerName, true)
+		actor := createActor(t, engine.endpoint, "cursor-room", runnerName, "restart", nil, nil)
+		waitForActor(t, engine.endpoint, actor.ActorID, false, func(actor actorRecord) bool {
+			return actor.ConnectableTS != nil && actor.DestroyTS == nil
+		})
+
+		type cursor struct {
+			UserID    string  `json:"userId"`
+			X         float64 `json:"x"`
+			Y         float64 `json:"y"`
+			Timestamp int64   `json:"timestamp"`
+		}
+		type label struct {
+			ID        string  `json:"id"`
+			UserID    string  `json:"userId"`
+			Text      string  `json:"text"`
+			X         float64 `json:"x"`
+			Y         float64 `json:"y"`
+			Timestamp int64   `json:"timestamp"`
+		}
+		type state struct {
+			Cursors    map[string]cursor `json:"cursors"`
+			TextLabels []label           `json:"textLabels"`
+		}
+
+		ada := openActorConnect(t, engine.endpoint, actor.ActorID, map[string]string{"name": "Ada"})
+		grace := openActorConnect(t, engine.endpoint, actor.ActorID, map[string]string{"name": "Grace"})
+		for _, event := range []string{"cursorMoved", "cursorRemoved", "textUpdated", "textRemoved"} {
+			grace.subscribe(t, event)
+		}
+		// Subscription messages have no protocol acknowledgement. A serialized
+		// action on the same connection is the barrier proving they were applied.
+		_ = actorConnectCall[state](t, grace, "getRoomState", struct{}{})
+		adaCursor := actorConnectCall[cursor](t, ada, "updateCursor", map[string]any{
+			"userId": "ada", "x": 12.5, "y": 24.0,
+		})
+		if adaCursor.UserID != "ada" || adaCursor.X != 12.5 || adaCursor.Y != 24 || adaCursor.Timestamp == 0 {
+			t.Fatalf("Ada cursor = %#v", adaCursor)
+		}
+		movedArgs := grace.nextEvent(t, "cursorMoved")
+		if len(movedArgs) != 1 {
+			t.Fatalf("cursorMoved args = %#v", movedArgs)
+		}
+		var moved cursor
+		if err := cbor.Unmarshal(movedArgs[0], &moved); err != nil || moved != adaCursor {
+			t.Fatalf("cursorMoved = %#v, %v; want %#v", moved, err, adaCursor)
+		}
+		graceCursor := actorConnectCall[cursor](t, grace, "updateCursor", map[string]any{
+			"userId": "grace", "x": 40.0, "y": 60.0,
+		})
+		room := actorConnectCall[state](t, ada, "getRoomState", struct{}{})
+		if len(room.Cursors) != 2 || room.Cursors["ada"] != adaCursor || room.Cursors["grace"] != graceCursor {
+			t.Fatalf("cursor room state = %#v", room)
+		}
+		created := actorConnectCall[label](t, ada, "updateText", map[string]any{
+			"id": "label-1", "userId": "ada", "text": "hello", "x": 8.0, "y": 9.0,
+		})
+		updatedArgs := grace.nextEvent(t, "textUpdated")
+		if len(updatedArgs) != 1 {
+			t.Fatalf("textUpdated args = %#v", updatedArgs)
+		}
+		var updated label
+		if err := cbor.Unmarshal(updatedArgs[0], &updated); err != nil || updated != created {
+			t.Fatalf("textUpdated = %#v, %v; want %#v", updated, err, created)
+		}
+		room = actorConnectCall[state](t, grace, "getRoomState", struct{}{})
+		if len(room.TextLabels) != 1 || room.TextLabels[0] != created {
+			t.Fatalf("durable text state = %#v", room.TextLabels)
+		}
+		ada.close()
+		removedArgs := grace.nextEvent(t, "cursorRemoved")
+		if len(removedArgs) != 1 {
+			t.Fatalf("cursorRemoved args = %#v", removedArgs)
+		}
+		var removed cursor
+		if err := cbor.Unmarshal(removedArgs[0], &removed); err != nil || removed != adaCursor {
+			t.Fatalf("cursorRemoved = %#v, %v; want %#v", removed, err, adaCursor)
+		}
+		room = actorConnectCall[state](t, grace, "getRoomState", struct{}{})
+		if len(room.Cursors) != 1 || room.Cursors["grace"] != graceCursor {
+			t.Fatalf("room after disconnect = %#v", room)
+		}
+
+		stopExampleCleanly(t, engine.endpoint, runnerName, process)
+	})
 }
 
 func decodeActionOutput[T any](t *testing.T, result gatewayResponse, status int) T {

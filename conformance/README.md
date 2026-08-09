@@ -127,9 +127,19 @@ connection-admin, actor-actions, and cross-actor-actions examples. It exercises
 SQLite migration, CRUD, and transactions; explicit HTTP state persistence; an
 alarm waking a sleeping actor; keyed state isolation; text and binary KV
 operations; live connection administration; external Go actor creation and
-resolution; typed and raw action calls; and company-to-employee plus
-checkout-to-inventory calls through actor-scoped clients. Every runner must
+resolution, typed and raw action calls, and company-to-employee plus
+checkout-to-inventory calls through actor-scoped clients. It also runs the
+collaborative-cursors port through two real ActorConnect clients and verifies
+per-connection cursor state, subscribed events, durable text, enumeration, and
+disconnect cleanup. Every runner must
 also leave the engine cleanly after `SIGTERM`.
+
+`TestActorConnectConnectionContextPersistsAcrossSleep` exercises the ABI 10
+connection boundary directly. It distinguishes ActorConnect from transient
+gateway HTTP connections, verifies typed parameter initialization and current
+connection access, schedules a connectionless action, sleeps with a live
+hibernatable client, wakes through that same socket, and requires the original
+connection ID and mutated state to survive with resume metadata.
 
 The soak is intentionally separate from `go test`: `cmd/soak` owns its engine,
 runner, gateway clients, chaos schedule, strict truth models, and final leak

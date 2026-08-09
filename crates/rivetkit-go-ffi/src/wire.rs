@@ -104,6 +104,8 @@ pub(crate) enum Event {
         persisted_state: Option<Vec<u8>>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         sqlite_socket_path: Option<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        connections: Vec<Connection>,
     },
     ActorStop {
         aid: String,
@@ -131,6 +133,24 @@ pub(crate) enum Event {
         schedules: Vec<ScheduledEvent>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         error: Option<WireError>,
+    },
+    ConnectionPreflight {
+        aid: String,
+        r#gen: u64,
+        op_id: u64,
+        connection: Connection,
+    },
+    ConnectionOpen {
+        aid: String,
+        r#gen: u64,
+        op_id: u64,
+        connection: Connection,
+    },
+    ConnectionClose {
+        aid: String,
+        r#gen: u64,
+        op_id: u64,
+        connection: Connection,
     },
     ActionCall {
         aid: String,
@@ -216,6 +236,21 @@ pub(crate) enum Event {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         error: Option<WireError>,
     },
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub(crate) struct Connection {
+    pub id: String,
+    #[serde(with = "serde_bytes")]
+    pub parameters: Vec<u8>,
+    #[serde(with = "serde_bytes")]
+    pub state: Vec<u8>,
+    pub path: String,
+    #[serde(default)]
+    pub headers: BTreeMap<String, String>,
+    pub can_hibernate: bool,
+    pub resumed: bool,
+    pub actor_connect: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -318,6 +353,15 @@ pub(crate) enum Command {
         call_id: u64,
         #[serde(default, with = "optional_bytes")]
         output: Option<Vec<u8>>,
+        #[serde(default, with = "optional_bytes")]
+        connection_state: Option<Vec<u8>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<WireError>,
+    },
+    ConnectionResult {
+        op_id: u64,
+        #[serde(default, with = "optional_bytes")]
+        connection_state: Option<Vec<u8>>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         error: Option<WireError>,
     },
@@ -578,12 +622,18 @@ impl CommandBatch {
                 Command::ActionResult {
                     call_id,
                     output,
+                    connection_state,
                     error,
                 } => {
                     require_correlation("action_result", *call_id)?;
                     if output.is_some() == error.is_some() {
                         return Err(
                             "action_result must contain exactly one of output or error".to_owned()
+                        );
+                    }
+                    if error.is_some() && connection_state.is_some() {
+                        return Err(
+                            "action_result error must not contain connection state".to_owned()
                         );
                     }
                     require_wire_error(error.as_ref())?;
@@ -595,6 +645,22 @@ impl CommandBatch {
                             "action_result output exceeds boundary maximum {MAX_BODY_CHUNK} bytes"
                         ));
                     }
+                    require_connection_state(connection_state.as_deref())?;
+                }
+                Command::ConnectionResult {
+                    op_id,
+                    connection_state,
+                    error,
+                } => {
+                    require_correlation("connection_result", *op_id)?;
+                    if connection_state.is_some() == error.is_some() {
+                        return Err(
+                            "connection_result must contain exactly one of state or error"
+                                .to_owned(),
+                        );
+                    }
+                    require_connection_state(connection_state.as_deref())?;
+                    require_wire_error(error.as_ref())?;
                 }
                 Command::HttpResponseStart {
                     req_id,
@@ -839,6 +905,15 @@ impl CommandBatch {
     }
 }
 
+fn require_connection_state(state: Option<&[u8]>) -> Result<(), String> {
+    if state.is_some_and(|state| state.len() > MAX_BODY_CHUNK) {
+        return Err(format!(
+            "connection state exceeds boundary maximum {MAX_BODY_CHUNK} bytes"
+        ));
+    }
+    Ok(())
+}
+
 fn require_sqlite_request(request_id: u64, aid: &str, deadline_ms: u32) -> Result<(), String> {
     require_aid(aid)?;
     require_correlation("sqlite", request_id)?;
@@ -985,6 +1060,8 @@ mod tests {
         call_id: u64,
         #[serde(with = "optional_bytes")]
         output: Option<Vec<u8>>,
+        #[serde(with = "optional_bytes")]
+        connection_state: Option<Vec<u8>>,
         req_id: u64,
         status: u16,
         headers: Option<BTreeMap<String, String>>,
@@ -1042,6 +1119,7 @@ mod tests {
             value: None,
             call_id: 0,
             output: None,
+            connection_state: None,
             req_id: 0,
             status: 0,
             headers: None,
@@ -1160,6 +1238,19 @@ mod tests {
                 input: b"input".to_vec(),
                 persisted_state: Some(b"state".to_vec()),
                 sqlite_socket_path: None,
+                connections: vec![Connection {
+                    id: "connection-restored".to_owned(),
+                    parameters: vec![
+                        0xa1, 0x68, b'u', b's', b'e', b'r', b'n', b'a', b'm', b'e', 0x63, b'A',
+                        b'd', b'a',
+                    ],
+                    state: br#"{"username":"Ada","moves":2}"#.to_vec(),
+                    path: "/connect".to_owned(),
+                    headers: BTreeMap::new(),
+                    can_hibernate: true,
+                    resumed: true,
+                    actor_connect: true,
+                }],
             }],
         };
         write_golden(
@@ -1178,6 +1269,7 @@ mod tests {
                 input: Vec::new(),
                 persisted_state: None,
                 sqlite_socket_path: None,
+                connections: Vec::new(),
             }],
         };
         write_golden(
@@ -1198,6 +1290,7 @@ mod tests {
                 input: Vec::new(),
                 persisted_state: Some(Vec::new()),
                 sqlite_socket_path: None,
+                connections: Vec::new(),
             }],
         };
         write_golden(
@@ -1284,6 +1377,59 @@ mod tests {
             "event_action_call.msgpack",
             &action_call.encode().expect("encode action call event"),
         );
+
+        let connection = Connection {
+            id: "conn-golden".to_owned(),
+            parameters: vec![0xa1, 0x64, b'n', b'a', b'm', b'e', 0x63, b'A', b'd', b'a'],
+            state: br#"{"moves":2}"#.to_vec(),
+            path: "/connect".to_owned(),
+            headers: BTreeMap::from([("x-test".to_owned(), "one".to_owned())]),
+            can_hibernate: true,
+            resumed: false,
+            actor_connect: true,
+        };
+        for (name, seq, event) in [
+            (
+                "event_connection_preflight.msgpack",
+                21,
+                Event::ConnectionPreflight {
+                    aid: "actor-golden".to_owned(),
+                    r#gen: 7,
+                    op_id: 71,
+                    connection: connection.clone(),
+                },
+            ),
+            (
+                "event_connection_open.msgpack",
+                22,
+                Event::ConnectionOpen {
+                    aid: "actor-golden".to_owned(),
+                    r#gen: 7,
+                    op_id: 72,
+                    connection: connection.clone(),
+                },
+            ),
+            (
+                "event_connection_close.msgpack",
+                23,
+                Event::ConnectionClose {
+                    aid: "actor-golden".to_owned(),
+                    r#gen: 7,
+                    op_id: 73,
+                    connection: connection.clone(),
+                },
+            ),
+        ] {
+            write_golden(
+                name,
+                &EventBatch {
+                    seq,
+                    events: vec![event],
+                }
+                .encode()
+                .expect("encode connection event"),
+            );
+        }
 
         let http_request = EventBatch {
             seq: 11,
@@ -1631,6 +1777,23 @@ mod tests {
         decoded.validate().expect("M9 command batch is valid");
         assert_eq!(decoded.commands.len(), 5);
         write_golden("command_m9.msgpack", &command_m9);
+
+        let mut connection_result = golden_command("connection_result");
+        connection_result.op_id = 71;
+        connection_result.connection_state = Some(br#"{"moves":1}"#.to_vec());
+        let mut connected_action = golden_command("action_result");
+        connected_action.call_id = 74;
+        connected_action.output = Some(vec![0xf6]);
+        connected_action.connection_state = Some(br#"{"moves":3}"#.to_vec());
+        let command_m10 = rmp_serde::to_vec_named(&GoldenCommandBatch {
+            commands: vec![connection_result, connected_action],
+        })
+        .expect("encode M10 command batch");
+        let decoded = CommandBatch::decode(&command_m10)
+            .expect("Rust command decoder accepts the full Go M10 command shape");
+        decoded.validate().expect("M10 command batch is valid");
+        assert_eq!(decoded.commands.len(), 2);
+        write_golden("command_m10.msgpack", &command_m10);
     }
 
     #[test]
@@ -1732,6 +1895,46 @@ mod tests {
             },
         ];
         for command in invalid {
+            assert!(
+                CommandBatch {
+                    commands: vec![command]
+                }
+                .validate()
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn connection_command_validation_requires_correlation_and_state() {
+        CommandBatch {
+            commands: vec![Command::ConnectionResult {
+                op_id: 1,
+                connection_state: Some(Vec::new()),
+                error: None,
+            }],
+        }
+        .validate()
+        .expect("present empty connection state is valid");
+
+        for command in [
+            Command::ConnectionResult {
+                op_id: 0,
+                connection_state: Some(Vec::new()),
+                error: None,
+            },
+            Command::ConnectionResult {
+                op_id: 1,
+                connection_state: None,
+                error: None,
+            },
+            Command::ActionResult {
+                call_id: 2,
+                output: None,
+                connection_state: Some(Vec::new()),
+                error: Some(WireError::new("rejected", "action failed")),
+            },
+        ] {
             assert!(
                 CommandBatch {
                     commands: vec![command]

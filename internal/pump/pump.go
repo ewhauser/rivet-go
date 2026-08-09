@@ -88,6 +88,13 @@ type actorActionHandler interface {
 	Action(context.Context, *ActorSession, wire.Event, any) ([]byte, error)
 }
 
+type actorConnectionHandler interface {
+	ConnectionPreflight(context.Context, *ActorSession, wire.Event, any) ([]byte, error)
+	ConnectionOpen(context.Context, *ActorSession, wire.Event, any) ([]byte, error)
+	ConnectionClose(context.Context, *ActorSession, wire.Event, any) ([]byte, error)
+	ConnectionState(context.Context, *ActorSession, string, any) ([]byte, bool, error)
+}
+
 type actorAlarmHandler interface {
 	Alarm(context.Context, *ActorSession, wire.Event, any) error
 }
@@ -1860,6 +1867,12 @@ func (p *Pump) handleInternalEvent(event wire.Event) error {
 			return fmt.Errorf("ActionCall for unknown actor %s generation %d", event.AID, event.Generation)
 		}
 		worker.mailbox.put(event)
+	case wire.EventConnectionPreflight, wire.EventConnectionOpen, wire.EventConnectionClose:
+		worker := p.actor(event.AID, event.Generation)
+		if worker == nil {
+			return fmt.Errorf("%s for unknown actor %s generation %d", event.Kind, event.AID, event.Generation)
+		}
+		worker.mailbox.put(event)
 	case wire.EventHTTPRequest:
 		worker := p.actor(event.AID, event.Generation)
 		if worker == nil {
@@ -2017,17 +2030,49 @@ func (w *actorWorker) run(start wire.Event) {
 			if actionError == nil && output == nil {
 				output = []byte{}
 			}
+			var connectionState *[]byte
+			_, tracksConnectionState := w.handler.(actorConnectionHandler)
+			if actionError == nil && event.ConnID != nil && tracksConnectionState {
+				encoded, tracked, stateError := invokeConnectionState(w.ctx, w.handler, w.session, *event.ConnID, state)
+				if stateError != nil {
+					actionError = stateError
+					output = nil
+				} else if tracked {
+					connectionState = byteSlicePointer(encoded)
+				}
+			}
 			if err := w.pump.submitInternal(w.ctx, wire.Command{
-				Kind:   wire.CommandActionResult,
-				CallID: event.CallID,
-				Output: output,
-				Error:  actionError,
+				Kind:            wire.CommandActionResult,
+				CallID:          event.CallID,
+				Output:          output,
+				ConnectionState: connectionState,
+				Error:           actionError,
 			}); err != nil {
 				w.pump.reportWorkerError(fmt.Errorf("submit ActionResult: %w", err))
 				return
 			}
 			if actionError != nil && actionError.Code == "handler_panic" {
 				return
+			}
+		case wire.EventConnectionPreflight, wire.EventConnectionOpen, wire.EventConnectionClose:
+			connectionState, connectionError := invokeConnectionLifecycle(
+				w.ctx, w.handler, w.session, event, state,
+			)
+			w.pump.recordHandlerPanic(connectionError, string(event.Kind), w.session)
+			command := wire.Command{
+				Kind:        wire.CommandConnectionResult,
+				OperationID: event.OperationID,
+				Error:       connectionError,
+			}
+			if connectionError == nil {
+				command.ConnectionState = byteSlicePointer(connectionState)
+			}
+			if err := w.pump.submitInternal(w.ctx, command); err != nil {
+				w.pump.reportWorkerError(fmt.Errorf("submit ConnectionResult: %w", err))
+				return
+			}
+			if connectionError != nil && connectionError.Code == "handler_panic" {
+				w.requestErrorStop()
 			}
 		case wire.EventActorAlarm:
 			alarmError := invokeAlarm(w.ctx, w.handler, w.session, event, state)
@@ -2241,6 +2286,82 @@ func invokeAction(
 		return nil, handlerWireError("action "+event.Action, err)
 	}
 	return cloneBytes(output), nil
+}
+
+func invokeConnectionLifecycle(
+	ctx context.Context,
+	handler ActorHandler,
+	session *ActorSession,
+	event wire.Event,
+	state any,
+) (connectionState []byte, handlerError *wire.WireError) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			connectionState = nil
+			handlerError = &wire.WireError{
+				Code:    "handler_panic",
+				Message: fmt.Sprintf("%s panicked: %v", event.Kind, recovered),
+			}
+		}
+	}()
+	connectionHandler, ok := handler.(actorConnectionHandler)
+	if !ok {
+		return []byte{}, nil
+	}
+	var (
+		encoded []byte
+		err     error
+	)
+	switch event.Kind {
+	case wire.EventConnectionPreflight:
+		encoded, err = connectionHandler.ConnectionPreflight(ctx, session, event, state)
+	case wire.EventConnectionOpen:
+		encoded, err = connectionHandler.ConnectionOpen(ctx, session, event, state)
+	case wire.EventConnectionClose:
+		encoded, err = connectionHandler.ConnectionClose(ctx, session, event, state)
+	default:
+		return nil, &wire.WireError{Code: "handler_error", Message: "unknown connection lifecycle event"}
+	}
+	if err != nil {
+		return nil, handlerWireError(string(event.Kind), err)
+	}
+	return cloneBytes(encoded), nil
+}
+
+func invokeConnectionState(
+	ctx context.Context,
+	handler ActorHandler,
+	session *ActorSession,
+	connectionID string,
+	state any,
+) (connectionState []byte, tracked bool, handlerError *wire.WireError) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			connectionState = nil
+			tracked = false
+			handlerError = &wire.WireError{
+				Code:    "handler_panic",
+				Message: fmt.Sprintf("encode connection state panicked: %v", recovered),
+			}
+		}
+	}()
+	connectionHandler, ok := handler.(actorConnectionHandler)
+	if !ok {
+		return nil, false, nil
+	}
+	encoded, tracked, err := connectionHandler.ConnectionState(ctx, session, connectionID, state)
+	if err != nil {
+		return nil, false, handlerWireError("encode connection state", err)
+	}
+	return cloneBytes(encoded), tracked, nil
+}
+
+func byteSlicePointer(data []byte) *[]byte {
+	cloned := cloneBytes(data)
+	if cloned == nil {
+		cloned = []byte{}
+	}
+	return &cloned
 }
 
 func invokeFetch(
