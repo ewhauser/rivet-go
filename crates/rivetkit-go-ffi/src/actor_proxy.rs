@@ -26,9 +26,10 @@ const ACTION_RESULT_TIMEOUT: Duration = Duration::from_secs(60);
 const ALARM_RESULT_TIMEOUT: Duration = ACTION_RESULT_TIMEOUT;
 // DatabaseKv polls workflow signals every 1.5 seconds at the pinned engine.
 // Alarm and sleep are separate workflow signals, so hold the serialized alarm
-// operation for two complete polls plus a one-second scheduling margin before
-// allowing the Go handler to submit a later alarm, action schedule, or sleep
-// checkpoint.
+// operation for two complete polls plus a one-second scheduling margin. The
+// compatibility alarm API reports completion after this window. Action
+// schedules report their committed mutation immediately but retain their actor
+// operation guard through the window so a following sleep cannot overtake it.
 const ALARM_TRANSPORT_SETTLEMENT: Duration = Duration::from_millis(2 * 1_500 + 1_000);
 const HTTP_RESULT_TIMEOUT: Duration = Duration::from_secs(30);
 const WS_OPEN_RESULT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -1627,8 +1628,8 @@ impl ActorProxy {
                 .await
             {
                 Ok(schedule_id) => {
-                    tokio::time::sleep(ALARM_TRANSPORT_SETTLEMENT).await;
                     proxy.emit_schedule_create(op_id, schedule_id);
+                    tokio::time::sleep(ALARM_TRANSPORT_SETTLEMENT).await;
                 }
                 Err(error) => proxy.emit_schedule_error(op_id, "create", &error),
             }
@@ -1653,8 +1654,8 @@ impl ActorProxy {
             let _operation = operation;
             match actor.ctx.at(run_at, &action, &args).await {
                 Ok(schedule_id) => {
-                    tokio::time::sleep(ALARM_TRANSPORT_SETTLEMENT).await;
                     proxy.emit_schedule_create(op_id, schedule_id);
+                    tokio::time::sleep(ALARM_TRANSPORT_SETTLEMENT).await;
                 }
                 Err(error) => proxy.emit_schedule_error(op_id, "create", &error),
             }
@@ -1677,10 +1678,10 @@ impl ActorProxy {
             let _operation = operation;
             match actor.ctx.cancel_schedule(&schedule_id).await {
                 Ok(cancelled) => {
+                    proxy.emit_schedule_cancel(op_id, cancelled);
                     if cancelled {
                         tokio::time::sleep(ALARM_TRANSPORT_SETTLEMENT).await;
                     }
-                    proxy.emit_schedule_cancel(op_id, cancelled);
                 }
                 Err(error) => proxy.emit_schedule_error(op_id, "cancel", &error),
             }

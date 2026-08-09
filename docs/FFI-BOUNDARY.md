@@ -798,9 +798,9 @@ encoding an event.
 ABI 9 delegates schedule storage and wake delivery to the pinned core's
 `ActorContext::after`, `at`, `cancel_schedule`, `get_scheduled_event`, and
 `list_scheduled_events` methods. Mutations are exact-generation operations and
-remain in the actor work gate until core has committed the SQLite schedule and
-the existing four-second signal-settlement window has elapsed. A following
-`SleepIntent` therefore cannot overtake an accepted schedule mutation.
+report success once core has committed the SQLite schedule. Their actor work
+gate remains held until the existing four-second signal-settlement window has
+elapsed, so a following `SleepIntent` cannot overtake an accepted mutation.
 Scheduled work arrives from core as the ordinary `ActorEvent::Action` path;
 the Go adapter applies the same deadline, panic isolation, structured error,
 and automatic state-save rules as a client-dispatched action. The reserved

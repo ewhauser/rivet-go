@@ -71,17 +71,19 @@ func TestDurableActionSchedulesAcrossSleepAndRunnerRestart(t *testing.T) {
 					records := make([]durableScheduleRecord, 0, len(requests))
 					for _, request := range requests {
 						runAt := base.Add(request.delay)
+						scheduleContext, cancelScheduleContext := context.WithTimeout(ctx, 3*time.Second)
 						var id string
 						var scheduleErr error
 						if request.at {
 							id, scheduleErr = actor.Schedules().At(
-								ctx, runAt, request.action, durableSchedulePayload{Label: request.label},
+								scheduleContext, runAt, request.action, durableSchedulePayload{Label: request.label},
 							)
 						} else {
 							id, scheduleErr = actor.Schedules().After(
-								ctx, request.delay, request.action, durableSchedulePayload{Label: request.label},
+								scheduleContext, request.delay, request.action, durableSchedulePayload{Label: request.label},
 							)
 						}
+						cancelScheduleContext()
 						if scheduleErr != nil {
 							return nil, scheduleErr
 						}
@@ -96,7 +98,9 @@ func TestDurableActionSchedulesAcrossSleepAndRunnerRestart(t *testing.T) {
 					actor *rivet.Context[durableScheduleState],
 					id string,
 				) (bool, error) {
-					return actor.Schedules().Cancel(ctx, id)
+					cancelContext, cancel := context.WithTimeout(ctx, 3*time.Second)
+					defer cancel()
+					return actor.Schedules().Cancel(cancelContext, id)
 				}),
 				"inspectSchedules": rivet.ActionWithContext(func(
 					ctx context.Context,
