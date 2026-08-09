@@ -57,6 +57,7 @@ const (
 	CommandStopIntent        CommandKind = "stop_intent"
 	CommandSetAlarm          CommandKind = "set_alarm"
 	CommandSleepIntent       CommandKind = "sleep_intent"
+	CommandDestroyIntent     CommandKind = "destroy_intent"
 	CommandScheduleAfter     CommandKind = "schedule_after"
 	CommandScheduleAt        CommandKind = "schedule_at"
 	CommandScheduleCancel    CommandKind = "schedule_cancel"

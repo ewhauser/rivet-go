@@ -252,6 +252,13 @@ func (d *DB) closeForSleep() error {
 	return d.closeTransport()
 }
 
+func (d *DB) closeForDestroy() error {
+	if d == nil || d.backend == nil {
+		return nil
+	}
+	return d.closeTransport()
+}
+
 func (d *DB) beginOperation() error {
 	if d == nil || d.backend == nil {
 		return sqliteUnavailableError()

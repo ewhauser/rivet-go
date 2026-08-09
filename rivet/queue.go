@@ -22,7 +22,6 @@ var (
 	ErrQueueMessageTooLarge = errors.New("queue message is too large")
 	ErrQueueTimedOut        = errors.New("queue wait timed out")
 	ErrActorAborted         = errors.New("actor generation was aborted")
-	ErrActorStopping        = errors.New("actor generation is stopping")
 )
 
 // QueueNextOptions filters and controls one durable receive. A zero Timeout

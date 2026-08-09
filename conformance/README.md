@@ -155,6 +155,17 @@ its action-backed prompt path, and uses the external queue client to wait for a
 provider response. The included provider is deterministic and credential-free;
 the actor code depends only on the example's provider interface.
 
+## M12 generation-owned actor destruction
+
+`TestContextDestroyOwnsGenerationTeardown` requests destruction from a live
+action and requires the action response to complete first. Two concurrent
+calls produce one accepted result and one stable `ErrActorStopping`; calls from
+`OnStart` and `OnStop` return the corresponding lifecycle errors. The test
+holds registered managed work and an open SQLite transaction across the
+request, verifies the lease is fenced and teardown waits for the admitted
+work, observes the raw WebSocket close, and finally requires destroyed actor
+metadata, default-list disappearance, and failed wake attempts.
+
 The soak is intentionally separate from `go test`: `cmd/soak` owns its engine,
 runner, gateway clients, chaos schedule, strict truth models, and final leak
 oracles. Its two-minute default is suitable for a smoke job; the 24-hour

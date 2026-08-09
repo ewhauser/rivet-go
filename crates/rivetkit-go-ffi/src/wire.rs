@@ -462,6 +462,12 @@ pub(crate) enum Command {
         #[serde(default)]
         r#gen: u64,
     },
+    DestroyIntent {
+        op_id: u64,
+        aid: String,
+        #[serde(default)]
+        r#gen: u64,
+    },
     ScheduleAfter {
         op_id: u64,
         aid: String,
@@ -885,7 +891,9 @@ impl CommandBatch {
                     }
                 }
                 Command::StopIntent { aid } => require_aid(aid)?,
-                Command::SetAlarm { op_id, aid, .. } | Command::SleepIntent { op_id, aid, .. } => {
+                Command::SetAlarm { op_id, aid, .. }
+                | Command::SleepIntent { op_id, aid, .. }
+                | Command::DestroyIntent { op_id, aid, .. } => {
                     require_aid(aid)?;
                     if *op_id == 0 {
                         return Err("actor intent op_id must not be zero".to_owned());
@@ -2111,6 +2119,19 @@ mod tests {
         decoded.validate().expect("M11 command batch is valid");
         assert_eq!(decoded.commands.len(), 9);
         write_golden("command_m11.msgpack", &command_m11);
+
+        let mut destroy_intent = golden_command("destroy_intent");
+        destroy_intent.r#gen = 12;
+        destroy_intent.op_id = 87;
+        let command_m12 = rmp_serde::to_vec_named(&GoldenCommandBatch {
+            commands: vec![destroy_intent],
+        })
+        .expect("encode M12 command batch");
+        let decoded = CommandBatch::decode(&command_m12)
+            .expect("Rust command decoder accepts the full Go M12 command shape");
+        decoded.validate().expect("M12 command batch is valid");
+        assert_eq!(decoded.commands.len(), 1);
+        write_golden("command_m12.msgpack", &command_m12);
     }
 
     #[test]
