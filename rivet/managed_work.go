@@ -90,7 +90,7 @@ func (c *Context[T]) keepAwake(
 	work func(context.Context) error,
 	beforeWork func(),
 	afterWork func(),
-) error {
+) (resultErr error) {
 	if c == nil || c.session == nil {
 		return errors.New("actor context is unavailable")
 	}
@@ -110,11 +110,15 @@ func (c *Context[T]) keepAwake(
 	if err != nil {
 		return queueError(err)
 	}
-	defer func() { _ = c.session.EndManagedWork(workID) }()
 	if beforeWork != nil {
 		beforeWork()
-		defer afterWork()
+		if afterWork != nil {
+			defer afterWork()
+		}
 	}
+	defer func() {
+		resultErr = errors.Join(resultErr, c.session.EndManagedWork(workID))
+	}()
 	return work(ctx)
 }
 

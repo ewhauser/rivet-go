@@ -710,12 +710,39 @@ func (s *ActorSession) EndManagedWork(workID uint64) error {
 	if workID == 0 {
 		return errors.New("managed work ID is zero")
 	}
-	return s.pump.submitInternal(context.Background(), wire.Command{
+	command := wire.Command{
 		Kind:       wire.CommandManagedWorkEnd,
 		AID:        s.identity.aid,
 		Generation: s.identity.generation,
 		WorkID:     workID,
-	})
+	}
+	backoff := time.Millisecond
+	for {
+		err := s.pump.submitInternal(context.Background(), command)
+		if err == nil {
+			return nil
+		}
+		var coded interface{ ErrorCode() string }
+		if !errors.As(err, &coded) || coded.ErrorCode() != "backpressure" {
+			return err
+		}
+		jitter := time.Duration(rand.Int64N(int64(backoff/2) + 1))
+		timer := time.NewTimer(backoff + jitter)
+		select {
+		case <-timer.C:
+		case <-s.done:
+			if !timer.Stop() {
+				<-timer.C
+			}
+			return ErrShuttingDown
+		case <-s.pump.done:
+			if !timer.Stop() {
+				<-timer.C
+			}
+			return ErrShuttingDown
+		}
+		backoff = min(backoff*2, 25*time.Millisecond)
+	}
 }
 
 // Sleep requests engine-managed eviction after already accepted actor work
