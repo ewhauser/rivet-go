@@ -461,7 +461,7 @@ func (s *ActorSession) ScheduleAfter(
 	}
 	event, err := s.submitActorOperation(ctx, wire.Command{
 		Kind:         wire.CommandScheduleAfter,
-		DelayMS:      uint64(delay / time.Millisecond),
+		DelayMS:      durationMilliseconds(delay),
 		Action:       action,
 		ScheduleArgs: cloneBytesOrEmpty(args),
 	})
