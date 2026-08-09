@@ -876,8 +876,10 @@ core tracks it as a sleep-compatible active queue wait and sleep aborts it.
 
 `ManagedWorkBegin(wait_until)` registers a core shutdown task backed by a
 oneshot; `ManagedWorkBegin(keep_awake)` retains a core keep-awake region. Go
-always sends `ManagedWorkEnd` after accepted work. Generation cleanup releases
-every remaining token, completable message, and managed-work handle. Public
+always sends `ManagedWorkEnd` after accepted work and retries transient native
+backpressure until the command is accepted or the session stops. Generation
+cleanup releases every remaining token, completable message, and managed-work
+handle. Public
 `WaitUntil` callbacks receive only a generation-scoped context and may not
 capture actor state or storage; serialized background actor work belongs in
 `Run`.

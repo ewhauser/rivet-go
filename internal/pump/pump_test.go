@@ -917,6 +917,74 @@ func TestActorSessionQueueAndManagedWorkCorrelation(t *testing.T) {
 	}
 }
 
+func TestManagedWorkEndRetriesNativeBackpressure(t *testing.T) {
+	defer goleak.VerifyNone(t)
+	base := newFakeRunner()
+	runner := &retryRunner{fakeRunner: base}
+	hooks := newRecordingHooks()
+	p := NewWithOptions(runner, nil, Options{Hooks: hooks})
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() { result <- p.Run(ctx) }()
+	waitPumpStarted(t, p)
+
+	session := &ActorSession{
+		pump:     p,
+		done:     make(chan struct{}),
+		identity: actorIdentity{aid: "managed-retry", generation: 3},
+	}
+	runner.remaining.Store(3)
+	if err := session.EndManagedWork(9); err != nil {
+		t.Fatal(err)
+	}
+	if command := nextCommand(t, base); command.Kind != wire.CommandManagedWorkEnd ||
+		command.AID != "managed-retry" || command.Generation != 3 || command.WorkID != 9 {
+		t.Fatalf("ManagedWorkEnd = %#v", command)
+	}
+	if attempts := runner.attempts.Load(); attempts != 4 {
+		t.Fatalf("native submit attempts = %d, want 4", attempts)
+	}
+
+	cancel()
+	if err := <-result; err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	counters, _, _ := hooks.snapshot()
+	if counters[metricBackpressureHits] != 3 {
+		t.Fatalf("backpressure metric = %d, want 3", counters[metricBackpressureHits])
+	}
+}
+
+func TestManagedWorkEndRetryStopsWithPump(t *testing.T) {
+	defer goleak.VerifyNone(t)
+	base := newFakeRunner()
+	runner := &retryRunner{fakeRunner: base}
+	runner.remaining.Store(1<<31 - 1)
+	p := New(runner)
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() { result <- p.Run(ctx) }()
+	waitPumpStarted(t, p)
+
+	session := &ActorSession{pump: p, done: make(chan struct{})}
+	endResult := make(chan error, 1)
+	go func() { endResult <- session.EndManagedWork(7) }()
+	deadline := time.Now().Add(time.Second)
+	for runner.attempts.Load() == 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if runner.attempts.Load() == 0 {
+		t.Fatal("ManagedWorkEnd did not reach the native runner")
+	}
+	cancel()
+	if err := <-result; err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if err := <-endResult; !errors.Is(err, ErrShuttingDown) {
+		t.Fatalf("ManagedWorkEnd error = %v, want ErrShuttingDown", err)
+	}
+}
+
 func TestActorAlarmIsOrderedAndAcknowledged(t *testing.T) {
 	runner := newFakeRunner()
 	actionStarted := make(chan struct{})
