@@ -847,7 +847,10 @@ names and values retain the one MiB boundary maximum; snapshots allow at most
 256 headers and 1,024 restored connections. Connection lifecycle events require
 an exact actor generation and nonempty connection ID; correlated results require
 a positive operation ID and present state on success. Present-empty state
-remains distinct from an absent result arm.
+remains distinct from an absent result arm. Go validates action output and
+connection state before command submission, returning `action_result_too_large`
+or `connection_state_too_large` for the current operation instead of allowing
+an invalid command batch to stop the shared runner.
 
 ## M11 durable queues and managed actor work — 2026-08-09
 

@@ -21,6 +21,8 @@ var (
 	ErrActorStopping    = errors.New("actor generation is stopping")
 )
 
+const maxConnectionStateBytes = 1 << 20
+
 // Actor defines typed state, lifecycle hooks, actions, raw HTTP handling, and
 // raw gateway WebSocket handling.
 type Actor[T any] struct {
@@ -36,7 +38,7 @@ type Actor[T any] struct {
 	// that magnitude is workload-specific and is not a network-latency estimate.
 	HibernateWebSockets bool
 	// ConnectionState defines typed state initialized for every ActorConnect
-	// connection.
+	// connection. Its encoded form must not exceed the 1 MiB boundary limit.
 	ConnectionState ConnectionStateConfig[T]
 	OnStart         func(*Context[T]) error
 	OnStop          func(*Context[T]) error
@@ -711,7 +713,15 @@ func (a *actorAdapter[T]) ConnectionOpen(
 			return nil, err
 		}
 	}
-	return a.encodeConnectionState(connection)
+	encoded, err := a.encodeConnectionState(connection)
+	if err != nil {
+		actorContext.connectionsMu.Lock()
+		delete(actorContext.connections, connection.ID())
+		actorContext.connectionsMu.Unlock()
+		connection.markClosed()
+		return nil, err
+	}
+	return encoded, nil
 }
 
 func (a *actorAdapter[T]) ConnectionClose(
@@ -786,14 +796,31 @@ func (a *actorAdapter[T]) encodeConnectionState(connection *Connection) ([]byte,
 	connection.stateMu.Lock()
 	defer connection.stateMu.Unlock()
 	if !connection.actorConnect || a.definition.ConnectionState == nil {
-		return append([]byte(nil), connection.encodedState...), nil
+		encoded := append([]byte(nil), connection.encodedState...)
+		if err := validateConnectionStateSize(encoded); err != nil {
+			return nil, err
+		}
+		return encoded, nil
 	}
 	encoded, err := a.definition.ConnectionState.encode(connection.state)
 	if err != nil {
 		return nil, err
 	}
+	if err := validateConnectionStateSize(encoded); err != nil {
+		return nil, err
+	}
 	connection.encodedState = append(connection.encodedState[:0], encoded...)
 	return append([]byte(nil), encoded...), nil
+}
+
+func validateConnectionStateSize(state []byte) error {
+	if len(state) <= maxConnectionStateBytes {
+		return nil
+	}
+	return pump.HandlerError{
+		Code:    "connection_state_too_large",
+		Message: fmt.Sprintf("connection state exceeds the %d-byte boundary limit", maxConnectionStateBytes),
+	}
 }
 
 func (a *actorAdapter[T]) WebSocketOpen(

@@ -1,10 +1,13 @@
 package rivet
 
 import (
+	"bytes"
 	"context"
+	"errors"
 	"reflect"
 	"testing"
 
+	"github.com/ewhauser/rivet-go/internal/pump"
 	"github.com/ewhauser/rivet-go/internal/wire"
 	"github.com/fxamacker/cbor/v2"
 )
@@ -16,6 +19,14 @@ type testConnectionParameters struct {
 type testConnectionState struct {
 	Username string `json:"username"`
 	Opens    int    `json:"opens"`
+}
+
+type sizedConnectionState struct {
+	Size int
+}
+
+func (s sizedConnectionState) MarshalBinary() ([]byte, error) {
+	return bytes.Repeat([]byte{'s'}, s.Size), nil
 }
 
 func newConnectionTestContext[T any]() *Context[T] {
@@ -168,6 +179,87 @@ func TestConnectionStateHelpersRejectMissingAndWrongTypes(t *testing.T) {
 	if current := (*Context[struct{}])(nil).CurrentConnection(); current != nil {
 		t.Fatalf("nil context current connection = %#v", current)
 	}
+}
+
+func TestConnectionStateSizeLimit(t *testing.T) {
+	t.Run("exact limit", func(t *testing.T) {
+		adapter := &actorAdapter[struct{}]{definition: Actor[struct{}]{
+			ConnectionState: NewConnectionState(func(*Context[struct{}], *Connection) (sizedConnectionState, error) {
+				return sizedConnectionState{Size: maxConnectionStateBytes}, nil
+			}),
+		}}
+		actorContext := newConnectionTestContext[struct{}]()
+		encoded, err := adapter.ConnectionPreflight(context.Background(), nil, wire.Event{
+			Kind:       wire.EventConnectionPreflight,
+			Connection: &wire.Connection{ID: "exact", ActorConnect: true},
+		}, actorContext)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(encoded) != maxConnectionStateBytes {
+			t.Fatalf("connection state size = %d, want %d", len(encoded), maxConnectionStateBytes)
+		}
+	})
+
+	t.Run("preflight over limit", func(t *testing.T) {
+		adapter := &actorAdapter[struct{}]{definition: Actor[struct{}]{
+			ConnectionState: NewConnectionState(func(*Context[struct{}], *Connection) (sizedConnectionState, error) {
+				return sizedConnectionState{Size: maxConnectionStateBytes + 1}, nil
+			}),
+		}}
+		actorContext := newConnectionTestContext[struct{}]()
+		_, err := adapter.ConnectionPreflight(context.Background(), nil, wire.Event{
+			Kind:       wire.EventConnectionPreflight,
+			Connection: &wire.Connection{ID: "oversized", ActorConnect: true},
+		}, actorContext)
+		var structured pump.HandlerError
+		if !errors.As(err, &structured) || structured.Code != "connection_state_too_large" {
+			t.Fatalf("connection error = %#v, want connection_state_too_large HandlerError", err)
+		}
+		if len(actorContext.pendingConnections) != 0 {
+			t.Fatalf("oversized preflight left pending connections: %#v", actorContext.pendingConnections)
+		}
+	})
+
+	t.Run("open mutation over limit rolls back", func(t *testing.T) {
+		var opened *Connection
+		adapter := &actorAdapter[struct{}]{definition: Actor[struct{}]{
+			ConnectionState: NewConnectionState(func(*Context[struct{}], *Connection) (sizedConnectionState, error) {
+				return sizedConnectionState{Size: 1}, nil
+			}),
+			OnActorConnect: func(_ *Context[struct{}], connection *Connection) error {
+				opened = connection
+				state, err := GetConnectionState[sizedConnectionState](connection)
+				if err != nil {
+					return err
+				}
+				state.Size = maxConnectionStateBytes + 1
+				return nil
+			},
+		}}
+		actorContext := newConnectionTestContext[struct{}]()
+		snapshot := wire.Connection{ID: "open-oversized", ActorConnect: true}
+		preflight, err := adapter.ConnectionPreflight(context.Background(), nil, wire.Event{
+			Kind: wire.EventConnectionPreflight, Connection: &snapshot,
+		}, actorContext)
+		if err != nil {
+			t.Fatal(err)
+		}
+		snapshot.State = preflight
+		_, err = adapter.ConnectionOpen(context.Background(), nil, wire.Event{
+			Kind: wire.EventConnectionOpen, Connection: &snapshot,
+		}, actorContext)
+		var structured pump.HandlerError
+		if !errors.As(err, &structured) || structured.Code != "connection_state_too_large" {
+			t.Fatalf("connection error = %#v, want connection_state_too_large HandlerError", err)
+		}
+		if opened == nil || !opened.Closed() {
+			t.Fatalf("oversized opened connection was not closed: %#v", opened)
+		}
+		if len(actorContext.connections) != 0 || len(actorContext.pendingConnections) != 0 {
+			t.Fatalf("oversized open left tracked connections: active=%#v pending=%#v", actorContext.connections, actorContext.pendingConnections)
+		}
+	})
 }
 
 func decodeJSONState[T any](data []byte, target *T) error {
