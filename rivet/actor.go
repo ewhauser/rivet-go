@@ -486,16 +486,18 @@ func (a *actorAdapter[T]) Stop(
 	if a.definition.OnStop != nil {
 		stopErr = a.definition.OnStop(actorContext)
 	}
-	if err := actorContext.drainManaged(); err != nil {
-		actorContext.managedCancel()
-		return err
-	}
-	actorContext.managedCancel()
-	closeErr := actorContext.db.close()
-	if stopErr != nil {
-		return stopErr
-	}
-	return closeErr
+	drainErr := actorContext.drainManaged()
+	return completeActorStop(stopErr, drainErr, actorContext.managedCancel, actorContext.db.close)
+}
+
+func completeActorStop(
+	stopErr error,
+	drainErr error,
+	cancel context.CancelFunc,
+	closeDatabase func() error,
+) error {
+	cancel()
+	return errors.Join(stopErr, drainErr, closeDatabase())
 }
 
 func (a *actorAdapter[T]) Action(
