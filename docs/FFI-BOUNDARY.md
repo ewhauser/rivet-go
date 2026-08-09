@@ -101,12 +101,13 @@ instance ID, `gen` = generation; both assigned by core.
 | `RunnerConnected` | runner_id, engine metadata | — |
 | `RunnerDisconnected` | reason; core auto-reconnects | — |
 | `RunnerStopped` | drain report | — (pump exits) |
-| `ActorStart` | aid, gen, name, key, create_ts, input, persisted_state (optional; absent differs from present-empty), sqlite_socket_path? | `ActorStartResult { aid, gen, ok / error }` |
+| `ActorStart` | aid, gen, name, key, create_ts, input, persisted_state (optional; absent differs from present-empty), sqlite_socket_path?, restored connections[] | `ActorStartResult { aid, gen, ok / error }` |
 | `ActorStop` | aid, gen, reason (stop cmd / sleep intent / drain) | `ActorStopResult { aid, gen }` after handler cleanup |
 | `ActorAlarm` | aid, gen, alarm_ts | `AlarmHandled { aid, gen }` |
 | `ActorIntentResult` | op_id, error? | completes the matching `SetAlarm` or `SleepIntent` admission |
 | `ActorScheduleResult` | op_id, operation, schedule_id?, cancelled?, schedules[], error? | completes the matching one-shot schedule create, cancel, get, or list operation |
-| `ActionCall` | aid, gen, call_id, action name, timeout_ms, args (raw bytes: JSON/CBOR per client encoding), conn_id | `ActionResult { call_id, output / error }` |
+| `ConnectionPreflight` / `ConnectionOpen` / `ConnectionClose` | aid, gen, op_id, connection snapshot | `ConnectionResult { op_id, connection_state / error }` |
+| `ActionCall` | aid, gen, call_id, action name, timeout_ms, args (raw bytes: JSON/CBOR per client encoding), conn_id | `ActionResult { call_id, output / error, connection_state? }` |
 | `HttpRequest` | aid, req_id, method, path, headers, body?, stream flag | `HttpResponseStart` (+ chunks) |
 | `HttpRequestChunk` | req_id, body, finish | — (feeds request body reader) |
 | `HttpRequestAbort` | req_id | abort handler ctx |
@@ -122,6 +123,7 @@ instance ID, `gen` = generation; both assigned by core.
 | Command | Payload | Completed by |
 |---|---|---|
 | `ActorStartResult` / `ActorStopResult` / `AlarmHandled` / `ActionResult` | see above | — |
+| `ConnectionResult` | op_id, connection_state / error | settles one connection lifecycle event |
 | `HttpResponseStart` | req_id, status, headers, body?, stream | — |
 | `HttpResponseChunk` | req_id, body, finish | — |
 | `WsSend` | ws_id, data, binary | — |
@@ -806,3 +808,32 @@ the Go adapter applies the same deadline, panic isolation, structured error,
 and automatic state-save rules as a client-dispatched action. The reserved
 `__rivet_go_alarm` row is excluded from public get/list results, so the
 replaceable `OnAlarm` compatibility API remains independent.
+
+## M10 ActorConnect connection state — 2026-08-08
+
+ABI 10 adds explicit ActorConnect lifecycle and state transport. Core
+`ConnectionPreflight`, `ConnectionOpen`, and `ConnectionClosed` events become
+correlated boundary events. Go initializes typed state before the connection
+is enumerable, runs the public connect/disconnect hooks in actor order, and
+returns the complete encoded state in `ConnectionResult`. Connection-open
+rejection remains an actor-local structured error.
+
+`ActionCall.conn_id` now resolves to the matching live ActorConnect handle.
+Successful connected actions include the complete connection state alongside
+their output; Rust applies that state to `ConnHandle` before resolving the core
+action reply. Gateway HTTP action connections remain internal and are not
+reported by `CurrentConnection` or public enumeration. Raw WebSocket behavior
+continues through the existing `Ws*` events and commands.
+
+Hibernated ActorConnect handles arrive in `ActorStart.connections` with parameters,
+persisted state, capability, resume status, and an explicit ActorConnect
+marker. Go decodes them before `OnStart`, and the same connection ID remains
+current after message-driven wake. Raw WebSockets remain on the pre-ABI-10
+`Ws*` flow and do not emit connection-state commands.
+
+Connection IDs, parameter/state blobs, request path, and individual header
+names and values retain the one MiB boundary maximum; snapshots allow at most
+256 headers and 1,024 restored connections. Connection lifecycle events require
+an exact actor generation and nonempty connection ID; correlated results require
+a positive operation ID and present state on success. Present-empty state
+remains distinct from an absent result arm.

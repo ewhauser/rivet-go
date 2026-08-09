@@ -429,6 +429,50 @@ type dispatchHandler struct {
 	wsCloseAll func(context.Context, *ActorSession, any, string)
 }
 
+type connectionDispatchHandler struct {
+	dispatchHandler
+	preflight func(context.Context, *ActorSession, wire.Event, any) ([]byte, error)
+	open      func(context.Context, *ActorSession, wire.Event, any) ([]byte, error)
+	close     func(context.Context, *ActorSession, wire.Event, any) ([]byte, error)
+	state     func(context.Context, *ActorSession, string, any) ([]byte, bool, error)
+}
+
+func (h connectionDispatchHandler) ConnectionPreflight(
+	ctx context.Context,
+	session *ActorSession,
+	event wire.Event,
+	state any,
+) ([]byte, error) {
+	return h.preflight(ctx, session, event, state)
+}
+
+func (h connectionDispatchHandler) ConnectionOpen(
+	ctx context.Context,
+	session *ActorSession,
+	event wire.Event,
+	state any,
+) ([]byte, error) {
+	return h.open(ctx, session, event, state)
+}
+
+func (h connectionDispatchHandler) ConnectionClose(
+	ctx context.Context,
+	session *ActorSession,
+	event wire.Event,
+	state any,
+) ([]byte, error) {
+	return h.close(ctx, session, event, state)
+}
+
+func (h connectionDispatchHandler) ConnectionState(
+	ctx context.Context,
+	session *ActorSession,
+	connectionID string,
+	state any,
+) ([]byte, bool, error) {
+	return h.state(ctx, session, connectionID, state)
+}
+
 func (h dispatchHandler) WebSocketOpen(
 	ctx context.Context,
 	session *ActorSession,
@@ -518,6 +562,106 @@ func (h lifecycleHandler) Stop(ctx context.Context, session *ActorSession, event
 		return nil
 	}
 	return h.stop(ctx, session, event, state)
+}
+
+func TestConnectionLifecycleAndCallingActionStateAreOrdered(t *testing.T) {
+	runner := newFakeRunner()
+	connectionState := []byte("preflight")
+	seen := make(chan string, 4)
+	handler := connectionDispatchHandler{
+		dispatchHandler: dispatchHandler{
+			action: func(_ context.Context, _ *ActorSession, event wire.Event, _ any) ([]byte, error) {
+				if event.ConnID == nil || *event.ConnID != "connection-1" {
+					return nil, fmt.Errorf("calling connection = %#v", event.ConnID)
+				}
+				connectionState = []byte("action-mutated")
+				seen <- "action"
+				return []byte("ok"), nil
+			},
+		},
+		preflight: func(_ context.Context, _ *ActorSession, event wire.Event, _ any) ([]byte, error) {
+			seen <- "preflight"
+			if event.Connection == nil || event.Connection.ID != "connection-1" {
+				return nil, errors.New("missing connection snapshot")
+			}
+			return connectionState, nil
+		},
+		open: func(_ context.Context, _ *ActorSession, _ wire.Event, _ any) ([]byte, error) {
+			connectionState = []byte("open-mutated")
+			seen <- "open"
+			return connectionState, nil
+		},
+		close: func(_ context.Context, _ *ActorSession, _ wire.Event, _ any) ([]byte, error) {
+			seen <- "close"
+			return connectionState, nil
+		},
+		state: func(_ context.Context, _ *ActorSession, connectionID string, _ any) ([]byte, bool, error) {
+			if connectionID != "connection-1" {
+				return nil, false, fmt.Errorf("connection ID = %q", connectionID)
+			}
+			return connectionState, true, nil
+		},
+	}
+	p := NewWithHandlers(runner, map[string]ActorHandler{"connected": handler})
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() { result <- p.Run(ctx) }()
+	waitPumpStarted(t, p)
+
+	runner.emit(wire.Event{
+		Kind: wire.EventActorStart, AID: "connected-aid", Generation: 1, Name: "connected",
+	})
+	if command := nextCommand(t, runner); command.Kind != wire.CommandActorStartResult || !command.OK {
+		t.Fatalf("start result = %#v", command)
+	}
+	snapshot := &wire.Connection{ID: "connection-1", CanHibernate: true, ActorConnect: true}
+	for index, lifecycle := range []wire.EventKind{
+		wire.EventConnectionPreflight,
+		wire.EventConnectionOpen,
+	} {
+		runner.emit(wire.Event{
+			Kind: lifecycle, AID: "connected-aid", Generation: 1,
+			OperationID: uint64(index + 11), Connection: snapshot,
+		})
+		if got := <-seen; got != []string{"preflight", "open"}[index] {
+			t.Fatalf("lifecycle observation = %q", got)
+		}
+		command := nextCommand(t, runner)
+		if command.Kind != wire.CommandConnectionResult || command.OperationID != uint64(index+11) ||
+			command.ConnectionState == nil || command.Error != nil {
+			t.Fatalf("connection result = %#v", command)
+		}
+	}
+	connectionID := "connection-1"
+	runner.emit(wire.Event{
+		Kind: wire.EventActionCall, AID: "connected-aid", Generation: 1,
+		CallID: 21, Action: "move", ActionTimeoutMS: 1_000, ConnID: &connectionID,
+	})
+	if got := <-seen; got != "action" {
+		t.Fatalf("action observation = %q", got)
+	}
+	actionResult := nextCommand(t, runner)
+	if actionResult.Kind != wire.CommandActionResult || string(actionResult.Output) != "ok" ||
+		actionResult.ConnectionState == nil || string(*actionResult.ConnectionState) != "action-mutated" {
+		t.Fatalf("action result = %#v", actionResult)
+	}
+	runner.emit(wire.Event{
+		Kind: wire.EventConnectionClose, AID: "connected-aid", Generation: 1,
+		OperationID: 13, Connection: snapshot,
+	})
+	if got := <-seen; got != "close" {
+		t.Fatalf("close observation = %q", got)
+	}
+	closeResult := nextCommand(t, runner)
+	if closeResult.Kind != wire.CommandConnectionResult || closeResult.OperationID != 13 ||
+		closeResult.ConnectionState == nil || string(*closeResult.ConnectionState) != "action-mutated" {
+		t.Fatalf("close result = %#v", closeResult)
+	}
+
+	cancel()
+	if err := <-result; err != nil {
+		t.Fatalf("Run: %v", err)
+	}
 }
 
 func TestActorStopWaitsForCleanupAndPreservesActorOrder(t *testing.T) {
@@ -1911,10 +2055,15 @@ func TestWebSocketEventsAreActorOrderedAndCommandsDoNotUsePoller(t *testing.T) {
 func TestNonHibernatingWebSocketMessageSkipsBoundaryAcknowledgement(t *testing.T) {
 	runner := newFakeRunner()
 	handled := make(chan struct{}, 1)
-	handler := dispatchHandler{
-		wsMessage: func(context.Context, *ActorSession, wire.Event, any) error {
-			handled <- struct{}{}
-			return nil
+	handler := connectionDispatchHandler{
+		dispatchHandler: dispatchHandler{
+			wsMessage: func(context.Context, *ActorSession, wire.Event, any) error {
+				handled <- struct{}{}
+				return nil
+			},
+		},
+		state: func(context.Context, *ActorSession, string, any) ([]byte, bool, error) {
+			return nil, false, nil
 		},
 	}
 	p := NewWithHandlers(runner, map[string]ActorHandler{"socket": handler})

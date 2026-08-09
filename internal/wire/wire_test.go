@@ -67,6 +67,9 @@ func TestRustEventBatchGoldens(t *testing.T) {
 		{"event_actor_alarm.msgpack", EventActorAlarm, 17},
 		{"event_actor_intent_result.msgpack", EventActorIntentResult, 18},
 		{"event_actor_schedule_result.msgpack", EventActorScheduleResult, 20},
+		{"event_connection_preflight.msgpack", EventConnectionPreflight, 21},
+		{"event_connection_open.msgpack", EventConnectionOpen, 22},
+		{"event_connection_close.msgpack", EventConnectionClose, 23},
 		{"event_kv_result.msgpack", EventKVResult, 6},
 		{"event_state_persisted.msgpack", EventStatePersisted, 7},
 		{"event_action_call.msgpack", EventActionCall, 10},
@@ -96,7 +99,51 @@ func TestRustEventBatchGoldens(t *testing.T) {
 			if test.kind == EventWSOpen && !batch.Events[0].Resumed {
 				t.Fatal("WebSocket open golden does not carry the M5 resume marker")
 			}
+			if test.kind == EventActorStart &&
+				(len(batch.Events[0].Connections) != 1 ||
+					batch.Events[0].Connections[0].ID != "connection-restored" ||
+					!batch.Events[0].Connections[0].Resumed) {
+				t.Fatalf("actor start restored connections = %#v", batch.Events[0].Connections)
+			}
+			if (test.kind == EventConnectionPreflight || test.kind == EventConnectionOpen ||
+				test.kind == EventConnectionClose) &&
+				(batch.Events[0].Connection == nil || batch.Events[0].Connection.ID != "conn-golden") {
+				t.Fatalf("connection lifecycle golden = %#v", batch.Events[0])
+			}
 		})
+	}
+}
+
+func TestRustM10CommandBatchGolden(t *testing.T) {
+	data := golden(t, "command_m10.msgpack")
+	var batch CommandBatch
+	if err := decode(data, &batch); err != nil {
+		t.Fatal(err)
+	}
+	want := []CommandKind{
+		CommandConnectionResult,
+		CommandActionResult,
+	}
+	if len(batch.Commands) != len(want) {
+		t.Fatalf("command count = %d, want %d", len(batch.Commands), len(want))
+	}
+	for index, kind := range want {
+		if batch.Commands[index].Kind != kind {
+			t.Fatalf("command %d kind = %q, want %q", index, batch.Commands[index].Kind, kind)
+		}
+	}
+	if batch.Commands[0].OperationID != 71 || batch.Commands[0].ConnectionState == nil {
+		t.Fatalf("connection result = %#v", batch.Commands[0])
+	}
+	if batch.Commands[1].CallID != 74 || batch.Commands[1].ConnectionState == nil {
+		t.Fatalf("connected action result = %#v", batch.Commands[1])
+	}
+	encoded, err := EncodeCommandBatch(batch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(encoded, data) {
+		t.Fatal("Go CommandBatch encoding differs from the Rust-generated M10 golden")
 	}
 }
 
@@ -406,6 +453,35 @@ func TestScheduleResultValidationRejectsInconsistentPayloads(t *testing.T) {
 		}
 		if _, err := DecodeEventBatch(data); err == nil {
 			t.Fatalf("invalid schedule result %d was accepted: %#v", index, event)
+		}
+	}
+}
+
+func TestConnectionEventValidationRejectsRawAndOversizedSnapshots(t *testing.T) {
+	valid := Connection{ID: "connection", ActorConnect: true}
+	tests := []Event{
+		{Kind: EventConnectionOpen, AID: "actor", OperationID: 1, Connection: &Connection{ID: "raw"}},
+		{
+			Kind: EventConnectionOpen, AID: "actor", OperationID: 1,
+			Connection: &Connection{ID: "connection", ActorConnect: true, State: make([]byte, 1<<20+1)},
+		},
+		{
+			Kind: EventActorStart, AID: "actor", Name: "kind",
+			Connections: make([]Connection, 1_025),
+		},
+	}
+	for index, event := range tests {
+		if event.Kind == EventActorStart {
+			for connectionIndex := range event.Connections {
+				event.Connections[connectionIndex] = valid
+			}
+		}
+		data, err := encode(EventBatch{Seq: uint64(index + 1), Events: []Event{event}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := DecodeEventBatch(data); err == nil {
+			t.Fatalf("invalid connection event %d was accepted", index)
 		}
 	}
 }
