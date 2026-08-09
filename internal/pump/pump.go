@@ -22,6 +22,7 @@ const (
 	defaultShutdownTimeout = 10 * time.Second
 	defaultSaveTimeout     = 35 * time.Second
 	defaultIntentTimeout   = 35 * time.Second
+	defaultRunStopTimeout  = 8 * time.Second
 	defaultHTTPSubmitLimit = 30 * time.Second
 	defaultWSSubmitLimit   = 30 * time.Second
 	defaultSQLiteTimeout   = 65 * time.Second
@@ -86,6 +87,11 @@ type ActorHandler interface {
 
 type actorActionHandler interface {
 	Action(context.Context, *ActorSession, wire.Event, any) ([]byte, error)
+}
+
+type actorRunHandler interface {
+	RunEnabled() bool
+	Run(context.Context, *ActorSession, any) error
 }
 
 type actorConnectionHandler interface {
@@ -171,6 +177,7 @@ type ActorSession struct {
 	input          []byte
 	persistedState []byte
 	done           chan struct{}
+	nextWorkID     atomic.Uint64
 
 	saveMu       sync.Mutex
 	saveResult   chan error
@@ -211,6 +218,15 @@ type ScheduledEvent struct {
 	Action string
 	Args   []byte
 	RunAt  int64
+}
+
+// QueueMessage is one durable queue record returned by core.
+type QueueMessage struct {
+	ID          uint64
+	Name        string
+	Body        []byte
+	CreatedAt   int64
+	Completable bool
 }
 
 type sqliteResponseAssembler struct {
@@ -539,6 +555,167 @@ func scheduledEvent(event wire.ScheduledEvent) ScheduledEvent {
 	}
 }
 
+func (s *ActorSession) QueueSend(ctx context.Context, name string, body []byte) (QueueMessage, error) {
+	event, err := s.submitActorOperation(ctx, wire.Command{
+		Kind: wire.CommandQueueSend,
+		Name: name,
+		Body: cloneBytesOrEmpty(body),
+	})
+	if err != nil {
+		return QueueMessage{}, err
+	}
+	if event.QueueOperation != "send" || event.QueueMessage == nil {
+		return QueueMessage{}, HandlerError{Code: "queue_result_invalid", Message: "native send result is incomplete"}
+	}
+	return queueMessage(*event.QueueMessage), nil
+}
+
+func (s *ActorSession) QueueEnqueueWait(
+	ctx context.Context,
+	name string,
+	body []byte,
+	timeout *time.Duration,
+) ([]byte, bool, error) {
+	var timeoutMS *uint64
+	if timeout != nil {
+		value := durationMilliseconds(*timeout)
+		timeoutMS = &value
+	}
+	event, err := s.submitActorOperation(ctx, wire.Command{
+		Kind:           wire.CommandQueueEnqueueWait,
+		Name:           name,
+		Body:           cloneBytesOrEmpty(body),
+		QueueTimeoutMS: timeoutMS,
+	})
+	if err != nil {
+		return nil, false, err
+	}
+	if event.QueueOperation != "enqueue_wait" || event.QueueMessage != nil {
+		return nil, false, HandlerError{Code: "queue_result_invalid", Message: "native enqueue-and-wait result is invalid"}
+	}
+	if event.QueueResponse == nil {
+		return nil, false, nil
+	}
+	return cloneBytesOrEmpty(*event.QueueResponse), true, nil
+}
+
+func (s *ActorSession) QueueNext(
+	ctx context.Context,
+	names []string,
+	timeout *time.Duration,
+	completable bool,
+) (*QueueMessage, error) {
+	var timeoutMS *uint64
+	if timeout != nil {
+		value := durationMilliseconds(*timeout)
+		timeoutMS = &value
+	}
+	event, err := s.submitActorOperation(ctx, wire.Command{
+		Kind:           wire.CommandQueueNext,
+		Names:          append([]string(nil), names...),
+		QueueTimeoutMS: timeoutMS,
+		Completable:    completable,
+	})
+	if err != nil {
+		return nil, err
+	}
+	if event.QueueOperation != "next" || event.QueueResponse != nil {
+		return nil, HandlerError{Code: "queue_result_invalid", Message: "native next result is invalid"}
+	}
+	if event.QueueMessage == nil {
+		return nil, nil
+	}
+	message := queueMessage(*event.QueueMessage)
+	return &message, nil
+}
+
+func durationMilliseconds(duration time.Duration) uint64 {
+	if duration <= 0 {
+		return 0
+	}
+	milliseconds := duration / time.Millisecond
+	if duration%time.Millisecond != 0 {
+		milliseconds++
+	}
+	return uint64(milliseconds)
+}
+
+func (s *ActorSession) QueueComplete(
+	ctx context.Context,
+	messageID uint64,
+	response *[]byte,
+) error {
+	var cloned *[]byte
+	if response != nil {
+		value := cloneBytesOrEmpty(*response)
+		cloned = &value
+	}
+	event, err := s.submitActorOperation(ctx, wire.Command{
+		Kind:      wire.CommandQueueComplete,
+		MessageID: messageID,
+		Response:  cloned,
+	})
+	if err != nil {
+		return err
+	}
+	if event.QueueOperation != "complete" || event.QueueMessage != nil || event.QueueResponse != nil {
+		return HandlerError{Code: "queue_result_invalid", Message: "native complete result is invalid"}
+	}
+	return nil
+}
+
+func (s *ActorSession) QueueRetry(ctx context.Context, messageID uint64) error {
+	event, err := s.submitActorOperation(ctx, wire.Command{
+		Kind:      wire.CommandQueueRetry,
+		MessageID: messageID,
+	})
+	if err != nil {
+		return err
+	}
+	if event.QueueOperation != "retry" || event.QueueMessage != nil || event.QueueResponse != nil {
+		return HandlerError{Code: "queue_result_invalid", Message: "native retry result is invalid"}
+	}
+	return nil
+}
+
+func queueMessage(message wire.QueueMessage) QueueMessage {
+	return QueueMessage{
+		ID: message.ID, Name: message.Name, Body: cloneBytesOrEmpty(message.Body),
+		CreatedAt: message.CreatedAt, Completable: message.Completable,
+	}
+}
+
+func (s *ActorSession) BeginManagedWork(ctx context.Context, kind string) (uint64, error) {
+	workID := s.nextWorkID.Add(1)
+	if workID == 0 {
+		workID = s.nextWorkID.Add(1)
+	}
+	_, err := s.submitActorOperation(ctx, wire.Command{
+		Kind:     wire.CommandManagedWorkBegin,
+		WorkID:   workID,
+		WorkKind: kind,
+	})
+	if err != nil {
+		return 0, err
+	}
+	return workID, nil
+}
+
+func (s *ActorSession) EndManagedWork(workID uint64) error {
+	if s == nil || s.pump == nil {
+		return errors.New("actor session is unavailable")
+	}
+	if workID == 0 {
+		return errors.New("managed work ID is zero")
+	}
+	return s.pump.submitInternal(context.Background(), wire.Command{
+		Kind:       wire.CommandManagedWorkEnd,
+		AID:        s.identity.aid,
+		Generation: s.identity.generation,
+		WorkID:     workID,
+	})
+}
+
 // Sleep requests engine-managed eviction after already accepted actor work
 // has drained. Hibernatable gateway WebSockets are detached without a
 // disconnect and restored by core in the next generation.
@@ -594,6 +771,25 @@ func (s *ActorSession) submitActorOperation(ctx context.Context, command wire.Co
 		}
 		return event, nil
 	case <-ctx.Done():
+		if command.Kind == wire.CommandQueueNext || command.Kind == wire.CommandQueueEnqueueWait {
+			cancelErr := s.pump.submitInternal(context.Background(), wire.Command{
+				Kind:            wire.CommandQueueCancel,
+				AID:             s.identity.aid,
+				Generation:      s.identity.generation,
+				TargetOperation: operationID,
+			})
+			if cancelErr == nil {
+				select {
+				case event := <-result:
+					if event.Error == nil && (command.Kind == wire.CommandQueueEnqueueWait || event.QueueMessage != nil) {
+						return event, nil
+					}
+				case <-timer.C:
+				case <-s.done:
+				case <-s.pump.done:
+				}
+			}
+		}
 		s.pump.abandonActorIntentWaiter(operationID)
 		return wire.Event{}, ctx.Err()
 	case <-timer.C:
@@ -1853,7 +2049,7 @@ func (p *Pump) handleInternalEvent(event wire.Event) error {
 			return fmt.Errorf("ActorAlarm for unknown actor %s generation %d", event.AID, event.Generation)
 		}
 		worker.mailbox.put(event)
-	case wire.EventActorIntentResult, wire.EventActorScheduleResult:
+	case wire.EventActorIntentResult, wire.EventActorScheduleResult, wire.EventActorQueueResult:
 		p.intentMu.Lock()
 		result := p.intentPending[event.OperationID]
 		delete(p.intentPending, event.OperationID)
@@ -1995,11 +2191,14 @@ func (w *actorWorker) run(start wire.Event) {
 
 	state, lifecycleError := invokeStart(w.ctx, w.handler, w.session, start)
 	w.pump.recordHandlerPanic(lifecycleError, "OnStart", w.session)
+	runHandler, hasRun := w.handler.(actorRunHandler)
+	hasRun = hasRun && runHandler.RunEnabled()
 	if err := w.pump.submitInternal(w.ctx, wire.Command{
 		Kind:       wire.CommandActorStartResult,
 		AID:        w.session.identity.aid,
 		Generation: w.session.identity.generation,
 		OK:         lifecycleError == nil,
+		Run:        lifecycleError == nil && hasRun,
 		Error:      lifecycleError,
 	}); err != nil {
 		w.pump.reportWorkerError(fmt.Errorf("submit ActorStartResult: %w", err))
@@ -2007,6 +2206,41 @@ func (w *actorWorker) run(start wire.Event) {
 	}
 	if lifecycleError != nil {
 		return
+	}
+	var (
+		runCancel context.CancelFunc
+		runDone   chan struct{}
+	)
+	if hasRun {
+		runContext, cancelRun := context.WithCancel(w.ctx)
+		runCancel = cancelRun
+		runDone = make(chan struct{})
+		go func() {
+			defer close(runDone)
+			runError := invokeRun(runContext, w.handler, w.session, state)
+			w.pump.recordHandlerPanic(runError, "Run", w.session)
+			if runError != nil {
+				logger := w.pump.logger
+				if logger == nil {
+					logger = slog.Default()
+				}
+				logger.Error(
+					"actor Run failed",
+					slog.String("actor_id", w.session.identity.aid),
+					slog.Uint64("generation", w.session.identity.generation),
+					slog.String("code", runError.Code),
+					slog.String("error", runError.Message),
+				)
+			}
+			if err := w.pump.submitInternal(w.ctx, wire.Command{
+				Kind:       wire.CommandActorRunResult,
+				AID:        w.session.identity.aid,
+				Generation: w.session.identity.generation,
+				Error:      runError,
+			}); err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, ErrShuttingDown) {
+				w.pump.reportWorkerError(fmt.Errorf("submit ActorRunResult: %w", err))
+			}
+		}()
 	}
 	stopReason := "actor worker stopped"
 	defer func() {
@@ -2145,7 +2379,20 @@ func (w *actorWorker) run(start wire.Event) {
 			}
 		case wire.EventActorStop:
 			stopReason = event.Reason
-			lifecycleError = invokeStop(w.ctx, w.handler, w.session, event, state)
+			if runCancel != nil {
+				runCancel()
+				select {
+				case <-runDone:
+				case <-time.After(defaultRunStopTimeout):
+					lifecycleError = &wire.WireError{
+						Code:    "run_shutdown_timeout",
+						Message: fmt.Sprintf("Run did not stop within %s", defaultRunStopTimeout),
+					}
+				}
+			}
+			if lifecycleError == nil {
+				lifecycleError = invokeStop(w.ctx, w.handler, w.session, event, state)
+			}
 			w.pump.recordHandlerPanic(lifecycleError, "OnStop", w.session)
 			w.session.closeGracefully()
 			if err := w.pump.submitInternal(w.ctx, wire.Command{
@@ -2286,6 +2533,33 @@ func invokeAction(
 		return nil, handlerWireError("action "+event.Action, err)
 	}
 	return cloneBytes(output), nil
+}
+
+func invokeRun(
+	ctx context.Context,
+	handler ActorHandler,
+	session *ActorSession,
+	state any,
+) (runError *wire.WireError) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			runError = &wire.WireError{
+				Code:    "handler_panic",
+				Message: fmt.Sprintf("Run panicked: %v", recovered),
+			}
+		}
+	}()
+	runHandler, ok := handler.(actorRunHandler)
+	if !ok {
+		return nil
+	}
+	if err := runHandler.Run(ctx, session, state); err != nil {
+		if errors.Is(err, context.Canceled) || errors.Is(err, ErrShuttingDown) {
+			return nil
+		}
+		return handlerWireError("Run", err)
+	}
+	return nil
 }
 
 func invokeConnectionLifecycle(

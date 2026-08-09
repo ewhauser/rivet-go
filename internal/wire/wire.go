@@ -22,6 +22,7 @@ const (
 	EventActorAlarm          EventKind = "actor_alarm"
 	EventActorIntentResult   EventKind = "actor_intent_result"
 	EventActorScheduleResult EventKind = "actor_schedule_result"
+	EventActorQueueResult    EventKind = "actor_queue_result"
 	EventConnectionPreflight EventKind = "connection_preflight"
 	EventConnectionOpen      EventKind = "connection_open"
 	EventConnectionClose     EventKind = "connection_close"
@@ -42,6 +43,7 @@ type CommandKind string
 const (
 	CommandActorStartResult  CommandKind = "actor_start_result"
 	CommandActorStopResult   CommandKind = "actor_stop_result"
+	CommandActorRunResult    CommandKind = "actor_run_result"
 	CommandAlarmHandled      CommandKind = "alarm_handled"
 	CommandActionResult      CommandKind = "action_result"
 	CommandConnectionResult  CommandKind = "connection_result"
@@ -60,6 +62,14 @@ const (
 	CommandScheduleCancel    CommandKind = "schedule_cancel"
 	CommandScheduleGet       CommandKind = "schedule_get"
 	CommandScheduleList      CommandKind = "schedule_list"
+	CommandQueueSend         CommandKind = "queue_send"
+	CommandQueueEnqueueWait  CommandKind = "queue_enqueue_wait"
+	CommandQueueNext         CommandKind = "queue_next"
+	CommandQueueComplete     CommandKind = "queue_complete"
+	CommandQueueRetry        CommandKind = "queue_retry"
+	CommandQueueCancel       CommandKind = "queue_cancel"
+	CommandManagedWorkBegin  CommandKind = "managed_work_begin"
+	CommandManagedWorkEnd    CommandKind = "managed_work_end"
 	CommandSaveState         CommandKind = "save_state"
 	CommandKVGet             CommandKind = "kv_get"
 	CommandKVList            CommandKind = "kv_list"
@@ -141,6 +151,9 @@ type Event struct {
 	ScheduleID        string            `msgpack:"schedule_id,omitempty"`
 	Cancelled         *bool             `msgpack:"cancelled,omitempty"`
 	Schedules         []ScheduledEvent  `msgpack:"schedules,omitempty"`
+	QueueOperation    string            `msgpack:"queue_operation,omitempty"`
+	QueueMessage      *QueueMessage     `msgpack:"message,omitempty"`
+	QueueResponse     *[]byte           `msgpack:"response,omitempty"`
 	SQLiteValues      []SQLiteValue     `msgpack:"values,omitempty"`
 	Columns           []string          `msgpack:"columns,omitempty"`
 	RowsAffected      int64             `msgpack:"rows_affected,omitempty"`
@@ -198,6 +211,15 @@ type ScheduledEvent struct {
 	RunAt  int64  `msgpack:"run_at"`
 }
 
+// QueueMessage is one durable queue record returned by the pinned core.
+type QueueMessage struct {
+	ID          uint64 `msgpack:"id"`
+	Name        string `msgpack:"name"`
+	Body        []byte `msgpack:"body"`
+	CreatedAt   int64  `msgpack:"created_at"`
+	Completable bool   `msgpack:"completable"`
+}
+
 type SQLiteValue struct {
 	Kind    string  `msgpack:"kind"`
 	Integer *int64  `msgpack:"integer,omitempty"`
@@ -218,6 +240,7 @@ type Command struct {
 	AID             string            `msgpack:"aid"`
 	Generation      uint64            `msgpack:"gen"`
 	OK              bool              `msgpack:"ok"`
+	Run             bool              `msgpack:"run"`
 	Error           *WireError        `msgpack:"error"`
 	State           []byte            `msgpack:"state"`
 	KVID            uint64            `msgpack:"kv_id"`
@@ -249,6 +272,7 @@ type Command struct {
 	AlarmTS         *int64            `msgpack:"alarm_ts"`
 	OperationID     uint64            `msgpack:"op_id"`
 	Action          string            `msgpack:"action"`
+	Name            string            `msgpack:"name"`
 	ScheduleArgs    []byte            `msgpack:"schedule_args"`
 	ScheduleID      string            `msgpack:"schedule_id"`
 	DelayMS         uint64            `msgpack:"delay_ms"`
@@ -259,6 +283,14 @@ type Command struct {
 	LeaseKey        *string           `msgpack:"lease_key"`
 	DeadlineMS      uint32            `msgpack:"deadline_ms"`
 	TimeoutMS       uint64            `msgpack:"timeout_ms"`
+	QueueTimeoutMS  *uint64           `msgpack:"queue_timeout_ms"`
+	Names           []string          `msgpack:"names"`
+	Completable     bool              `msgpack:"completable"`
+	MessageID       uint64            `msgpack:"message_id"`
+	Response        *[]byte           `msgpack:"response"`
+	TargetOperation uint64            `msgpack:"target_op_id"`
+	WorkID          uint64            `msgpack:"work_id"`
+	WorkKind        string            `msgpack:"work_kind"`
 }
 
 func EncodeRunnerConfig(config RunnerConfig) ([]byte, error) {
@@ -345,6 +377,10 @@ func validateEvent(event Event) error {
 		}
 	case EventActorScheduleResult:
 		if err := validateScheduleResult(event); err != nil {
+			return fmt.Errorf("%s event: %w", event.Kind, err)
+		}
+	case EventActorQueueResult:
+		if err := validateQueueResult(event); err != nil {
 			return fmt.Errorf("%s event: %w", event.Kind, err)
 		}
 	case EventConnectionPreflight, EventConnectionOpen, EventConnectionClose:
@@ -496,6 +532,50 @@ func validateScheduleResult(event Event) error {
 		if len(schedule.Args) > 1<<20 {
 			return fmt.Errorf("schedule %d args exceed the one MiB limit", index)
 		}
+	}
+	return nil
+}
+
+func validateQueueResult(event Event) error {
+	if event.OperationID == 0 {
+		return errors.New("invalid op_id")
+	}
+	if event.Error != nil {
+		if event.QueueMessage != nil || event.QueueResponse != nil {
+			return errors.New("error result contains a success payload")
+		}
+		return nil
+	}
+	switch event.QueueOperation {
+	case "send":
+		if event.QueueMessage == nil || event.QueueResponse != nil {
+			return errors.New("send result requires only a message")
+		}
+	case "enqueue_wait":
+		if event.QueueMessage != nil {
+			return errors.New("enqueue_wait result must not contain a message")
+		}
+	case "next":
+		if event.QueueResponse != nil {
+			return errors.New("next result must not contain a response")
+		}
+	case "complete", "retry":
+		if event.QueueMessage != nil || event.QueueResponse != nil {
+			return fmt.Errorf("%s result must not contain a payload", event.QueueOperation)
+		}
+	default:
+		return fmt.Errorf("unknown operation %q", event.QueueOperation)
+	}
+	if message := event.QueueMessage; message != nil {
+		if message.ID == 0 || message.Name == "" {
+			return errors.New("queue message requires id and name")
+		}
+		if len(message.Name) > 1<<20 || len(message.Body) > 1<<20 {
+			return errors.New("queue message exceeds the one MiB boundary limit")
+		}
+	}
+	if event.QueueResponse != nil && len(*event.QueueResponse) > 1<<20 {
+		return errors.New("queue response exceeds the one MiB boundary limit")
 	}
 	return nil
 }

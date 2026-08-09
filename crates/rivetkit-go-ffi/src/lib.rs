@@ -22,7 +22,7 @@ use wire::RunnerConfig;
 compile_error!("rivetkit-go-ffi requires panic=unwind for its C ABI firewall");
 
 /// The single source of truth for the native ABI version.
-pub const RK_ABI_VERSION: u32 = 10;
+pub const RK_ABI_VERSION: u32 = 11;
 
 // Keep the upstream dependency in the release dylib rather than merely in the
 // Cargo graph. Calling a small, stable core helper makes both the selected API

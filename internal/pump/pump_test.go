@@ -418,6 +418,17 @@ type lifecycleHandler struct {
 	stop  func(context.Context, *ActorSession, wire.Event, any) error
 }
 
+type runLifecycleHandler struct {
+	lifecycleHandler
+	run func(context.Context, *ActorSession, any) error
+}
+
+func (h runLifecycleHandler) RunEnabled() bool { return true }
+
+func (h runLifecycleHandler) Run(ctx context.Context, session *ActorSession, state any) error {
+	return h.run(ctx, session, state)
+}
+
 type dispatchHandler struct {
 	lifecycleHandler
 	action     func(context.Context, *ActorSession, wire.Event, any) ([]byte, error)
@@ -730,6 +741,142 @@ func TestActorStopWaitsForCleanupAndPreservesActorOrder(t *testing.T) {
 	cancel()
 	if err := <-result; err != nil {
 		t.Fatalf("Run: %v", err)
+	}
+}
+
+func TestActorRunOwnsQueueWaitAndStopsBeforeCleanup(t *testing.T) {
+	runner := newFakeRunner()
+	runStarted := make(chan struct{})
+	runCanceled := make(chan struct{})
+	stopCalled := make(chan struct{})
+	handler := runLifecycleHandler{
+		lifecycleHandler: lifecycleHandler{
+			stop: func(_ context.Context, _ *ActorSession, _ wire.Event, _ any) error {
+				select {
+				case <-runCanceled:
+				default:
+					return errors.New("Stop ran before Run observed cancellation")
+				}
+				close(stopCalled)
+				return nil
+			},
+		},
+		run: func(ctx context.Context, _ *ActorSession, _ any) error {
+			close(runStarted)
+			<-ctx.Done()
+			close(runCanceled)
+			return ctx.Err()
+		},
+	}
+	p := NewWithHandlers(runner, map[string]ActorHandler{"runner": handler})
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() { result <- p.Run(ctx) }()
+	waitPumpStarted(t, p)
+
+	runner.emit(wire.Event{Kind: wire.EventActorStart, AID: "run-aid", Generation: 2, Name: "runner"})
+	start := nextCommand(t, runner)
+	if start.Kind != wire.CommandActorStartResult || !start.OK || !start.Run {
+		t.Fatalf("ActorStartResult = %#v, want successful Run generation", start)
+	}
+	select {
+	case <-runStarted:
+	case <-time.After(time.Second):
+		t.Fatal("Run did not start")
+	}
+	runner.emit(wire.Event{Kind: wire.EventActorStop, AID: "run-aid", Generation: 2, Reason: "sleep"})
+	runResult := nextCommand(t, runner)
+	if runResult.Kind != wire.CommandActorRunResult || runResult.Error != nil {
+		t.Fatalf("ActorRunResult = %#v, want canceled success", runResult)
+	}
+	stopResult := nextCommand(t, runner)
+	if stopResult.Kind != wire.CommandActorStopResult || stopResult.Error != nil {
+		t.Fatalf("ActorStopResult = %#v, want success", stopResult)
+	}
+	select {
+	case <-stopCalled:
+	default:
+		t.Fatal("Stop was not called")
+	}
+	cancel()
+	if err := <-result; err != nil {
+		t.Fatalf("Run pump: %v", err)
+	}
+}
+
+func TestActorSessionQueueAndManagedWorkCorrelation(t *testing.T) {
+	runner := newFakeRunner()
+	sessionReady := make(chan *ActorSession, 1)
+	handler := lifecycleHandler{start: func(_ context.Context, session *ActorSession, _ wire.Event) (any, error) {
+		sessionReady <- session
+		return nil, nil
+	}}
+	p := NewWithHandlers(runner, map[string]ActorHandler{"queue": handler})
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() { result <- p.Run(ctx) }()
+	waitPumpStarted(t, p)
+	runner.emit(wire.Event{Kind: wire.EventActorStart, AID: "queue-aid", Generation: 4, Name: "queue"})
+	if command := nextCommand(t, runner); command.Kind != wire.CommandActorStartResult || !command.OK {
+		t.Fatalf("ActorStartResult = %#v", command)
+	}
+	session := <-sessionReady
+
+	sendResult := make(chan error, 1)
+	go func() {
+		message, err := session.QueueSend(context.Background(), "jobs", []byte{0xa1, 0x61, 0x78, 0x01})
+		if err == nil && (message.ID != 9 || message.Name != "jobs" || message.Completable) {
+			err = fmt.Errorf("queue message = %#v", message)
+		}
+		sendResult <- err
+	}()
+	send := nextCommand(t, runner)
+	if send.Kind != wire.CommandQueueSend || send.OperationID == 0 || send.AID != "queue-aid" || send.Generation != 4 {
+		t.Fatalf("QueueSend = %#v", send)
+	}
+	runner.emit(wire.Event{
+		Kind: wire.EventActorQueueResult, OperationID: send.OperationID, QueueOperation: "send",
+		QueueMessage: &wire.QueueMessage{ID: 9, Name: "jobs", Body: send.Body, CreatedAt: 123},
+	})
+	if err := <-sendResult; err != nil {
+		t.Fatal(err)
+	}
+
+	workResult := make(chan struct {
+		id  uint64
+		err error
+	}, 1)
+	go func() {
+		id, err := session.BeginManagedWork(context.Background(), "keep_awake")
+		workResult <- struct {
+			id  uint64
+			err error
+		}{id: id, err: err}
+	}()
+	begin := nextCommand(t, runner)
+	if begin.Kind != wire.CommandManagedWorkBegin || begin.WorkID == 0 || begin.WorkKind != "keep_awake" {
+		t.Fatalf("ManagedWorkBegin = %#v", begin)
+	}
+	runner.emit(wire.Event{Kind: wire.EventActorIntentResult, OperationID: begin.OperationID})
+	work := <-workResult
+	if work.err != nil || work.id != begin.WorkID {
+		t.Fatalf("BeginManagedWork = id %d, err %v", work.id, work.err)
+	}
+	if err := session.EndManagedWork(work.id); err != nil {
+		t.Fatal(err)
+	}
+	end := nextCommand(t, runner)
+	if end.Kind != wire.CommandManagedWorkEnd || end.WorkID != work.id || end.OperationID != 0 {
+		t.Fatalf("ManagedWorkEnd = %#v", end)
+	}
+
+	runner.emit(wire.Event{Kind: wire.EventActorStop, AID: "queue-aid", Generation: 4, Reason: "destroy"})
+	if command := nextCommand(t, runner); command.Kind != wire.CommandActorStopResult {
+		t.Fatalf("ActorStopResult = %#v", command)
+	}
+	cancel()
+	if err := <-result; err != nil {
+		t.Fatalf("Run pump: %v", err)
 	}
 }
 

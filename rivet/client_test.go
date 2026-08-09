@@ -222,6 +222,82 @@ func TestClientStructuredErrorsAndNotFound(t *testing.T) {
 	}
 }
 
+func TestActorQueueSender(t *testing.T) {
+	requests := make(chan map[string]any, 2)
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.Method != http.MethodPost || request.URL.EscapedPath() != "/gateway/actor%2Fone/queue/jobs%2Fhigh" {
+			t.Errorf("request = %s %s", request.Method, request.URL.EscapedPath())
+			http.NotFound(writer, request)
+			return
+		}
+		var body map[string]any
+		if err := json.NewDecoder(request.Body).Decode(&body); err != nil {
+			t.Errorf("decode queue body: %v", err)
+		}
+		requests <- body
+		writer.Header().Set("Content-Type", "application/json")
+		if body["wait"] == true {
+			_, _ = writer.Write([]byte(`{"status":"completed","response":{"accepted":true}}`))
+			return
+		}
+		_, _ = writer.Write([]byte(`{"status":"completed"}`))
+	}))
+	t.Cleanup(server.Close)
+	client, err := NewClient(ClientConfig{Endpoint: server.URL})
+	if err != nil {
+		t.Fatal(err)
+	}
+	handle := &ActorHandle{client: client, metadata: ActorMetadata{ID: "actor/one"}}
+	if err := handle.Queue().Send(context.Background(), "jobs/high", map[string]int{"value": 3}); err != nil {
+		t.Fatal(err)
+	}
+	sent := <-requests
+	if sent["wait"] != false || sent["timeout"] != nil {
+		t.Fatalf("send request = %#v", sent)
+	}
+
+	result, err := handle.Queue().SendAndWait(context.Background(), "jobs/high", "hello", 500*time.Microsecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	waited := <-requests
+	if waited["wait"] != true || waited["timeout"] != float64(1) {
+		t.Fatalf("wait request = %#v, want rounded 1ms timeout", waited)
+	}
+	if result.Status != ActorQueueCompleted || string(result.Response) != `{"accepted":true}` {
+		t.Fatalf("queue result = %#v", result)
+	}
+
+	self := *client
+	self.sourceActorID = "actor/one"
+	handle.client = &self
+	if err := handle.Queue().Send(context.Background(), "jobs", nil); !errors.Is(err, ErrSelfCall) {
+		t.Fatalf("self queue send error = %v, want ErrSelfCall", err)
+	}
+}
+
+func TestActorQueueSenderStructuredError(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		writer.Header().Set("Content-Type", "application/json")
+		writer.WriteHeader(http.StatusTooManyRequests)
+		_, _ = writer.Write([]byte(`{"group":"queue","code":"full","message":"capacity reached"}`))
+	}))
+	t.Cleanup(server.Close)
+	client, err := NewClient(ClientConfig{Endpoint: server.URL})
+	if err != nil {
+		t.Fatal(err)
+	}
+	handle := &ActorHandle{client: client, metadata: ActorMetadata{ID: "actor"}}
+	err = handle.Queue().Send(context.Background(), "jobs", nil)
+	if !errors.Is(err, ErrQueueFull) {
+		t.Fatalf("queue error = %v, want ErrQueueFull", err)
+	}
+	var clientError *ClientError
+	if !errors.As(err, &clientError) || clientError.Code != "full" {
+		t.Fatalf("queue error lost ClientError: %v", err)
+	}
+}
+
 func TestClientEmptyResolutionAndCancellation(t *testing.T) {
 	t.Run("empty", func(t *testing.T) {
 		server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {

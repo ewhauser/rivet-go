@@ -3,8 +3,8 @@
 `go test ./conformance` starts Rivet Engine `v2.3.10` with filesystem storage
 in a test temporary directory and exercises the complete public SDK through
 the real gateway. It covers registration, lifecycle and persistence, actions,
-HTTP, WebSockets, scheduling and hibernation, process replacement, runnable
-examples, and graceful process drain.
+HTTP, WebSockets, queues, scheduling and hibernation, process replacement,
+runnable examples, and graceful process drain.
 
 ## Engine acquisition
 
@@ -140,6 +140,20 @@ gateway HTTP connections, verifies typed parameter initialization and current
 connection access, schedules a connectionless action, sleeps with a live
 hibernatable client, wakes through that same socket, and requires the original
 connection ID and mutated state to survive with resume metadata.
+
+## M11 queues and managed actor work
+
+`TestDurableQueuesAndManagedWorkAcrossGenerations` drives the ABI 11 queue
+boundary through the real gateway. It verifies typed send, completable
+send-and-wait responses, explicit retry and redelivery, a context-cancelled
+receive, the core's 1,000-message backpressure limit and stable `ErrQueueFull`,
+`KeepAwake`, `WaitUntil`, queue-driven sleep/wake, state persistence, and `Run`
+restart on both a new actor generation and a replacement Go runner.
+
+Runnable-example conformance also builds and starts `examples/ai-agent`, calls
+its action-backed prompt path, and uses the external queue client to wait for a
+provider response. The included provider is deterministic and credential-free;
+the actor code depends only on the example's provider interface.
 
 The soak is intentionally separate from `go test`: `cmd/soak` owns its engine,
 runner, gateway clients, chaos schedule, strict truth models, and final leak

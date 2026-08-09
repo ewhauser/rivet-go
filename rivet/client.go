@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"time"
 )
 
 const maxClientResponseBytes = 16 << 20
@@ -90,6 +91,41 @@ type ActorMetadata struct {
 type ActorHandle struct {
 	client   *Client
 	metadata ActorMetadata
+}
+
+// ActorQueueSender sends durable queue messages through the Engine gateway.
+// It is immutable and safe for concurrent use.
+type ActorQueueSender struct {
+	handle *ActorHandle
+}
+
+// ActorQueueSendStatus is the core result of a queue send.
+type ActorQueueSendStatus string
+
+const (
+	ActorQueueCompleted ActorQueueSendStatus = "completed"
+	ActorQueueTimedOut  ActorQueueSendStatus = "timedOut"
+)
+
+// ActorQueueSendResult is returned by a wait=true queue send. Response is nil
+// when the consumer completed without a response or the wait timed out.
+type ActorQueueSendResult struct {
+	Status   ActorQueueSendStatus
+	Response json.RawMessage
+}
+
+// DecodeResponse decodes a response returned by a completable queue consumer.
+func (r ActorQueueSendResult) DecodeResponse(destination any) error {
+	if len(r.Response) == 0 {
+		return errors.New("queue response is absent")
+	}
+	if destination == nil {
+		return errors.New("queue response destination is nil")
+	}
+	if err := json.Unmarshal(r.Response, destination); err != nil {
+		return fmt.Errorf("decode queue response: %w", err)
+	}
+	return nil
 }
 
 // ActorErrorDetails identifies the actor generation attached to a structured
@@ -300,6 +336,104 @@ func (h *ActorHandle) Metadata() ActorMetadata {
 	metadata.SleepTimestamp = cloneInt64(h.metadata.SleepTimestamp)
 	metadata.StartTimestamp = cloneInt64(h.metadata.StartTimestamp)
 	return metadata
+}
+
+// Queue returns the external durable queue sender for this actor.
+func (h *ActorHandle) Queue() *ActorQueueSender {
+	if h == nil {
+		return nil
+	}
+	return &ActorQueueSender{handle: h}
+}
+
+// Send durably enqueues one JSON-compatible value without waiting for a
+// consumer response.
+func (q *ActorQueueSender) Send(ctx context.Context, name string, body any) error {
+	_, err := q.send(ctx, name, body, false, 0)
+	return err
+}
+
+// SendAndWait durably enqueues one JSON-compatible value and waits for a
+// completable consumer. A zero timeout uses the core's unbounded wait.
+func (q *ActorQueueSender) SendAndWait(
+	ctx context.Context,
+	name string,
+	body any,
+	timeout time.Duration,
+) (ActorQueueSendResult, error) {
+	if timeout < 0 {
+		return ActorQueueSendResult{}, errors.New("queue wait timeout is negative")
+	}
+	return q.send(ctx, name, body, true, timeout)
+}
+
+func (q *ActorQueueSender) send(
+	ctx context.Context,
+	name string,
+	body any,
+	wait bool,
+	timeout time.Duration,
+) (ActorQueueSendResult, error) {
+	if q == nil || q.handle == nil || q.handle.client == nil {
+		return ActorQueueSendResult{}, errors.New("actor queue sender is unavailable")
+	}
+	if strings.TrimSpace(name) == "" {
+		return ActorQueueSendResult{}, errors.New("queue name must not be empty")
+	}
+	if len(name) > maxQueuePayload {
+		return ActorQueueSendResult{}, fmt.Errorf("queue name is %d bytes, maximum is %d", len(name), maxQueuePayload)
+	}
+	if q.handle.client.sourceActorID != "" && q.handle.client.sourceActorID == q.handle.metadata.ID {
+		return ActorQueueSendResult{}, fmt.Errorf("send actor %q queue %q: %w", q.handle.metadata.ID, name, ErrSelfCall)
+	}
+	request := struct {
+		Body    any     `json:"body"`
+		Wait    bool    `json:"wait"`
+		Timeout *uint64 `json:"timeout,omitempty"`
+	}{Body: body, Wait: wait}
+	if timeout != 0 {
+		value := uint64(timeout / time.Millisecond)
+		if timeout%time.Millisecond != 0 {
+			value++
+		}
+		request.Timeout = &value
+	}
+	var response struct {
+		Status   ActorQueueSendStatus `json:"status"`
+		Response json.RawMessage      `json:"response"`
+	}
+	path := "/gateway/" + url.PathEscape(q.handle.metadata.ID) + "/queue/" + url.PathEscape(name)
+	if err := q.handle.client.doJSON(ctx, http.MethodPost, path, nil, request, &response); err != nil {
+		return ActorQueueSendResult{}, fmt.Errorf(
+			"send actor %q queue %q: %w", q.handle.metadata.ID, name, queueClientError(err),
+		)
+	}
+	if response.Status != ActorQueueCompleted && response.Status != ActorQueueTimedOut {
+		return ActorQueueSendResult{}, fmt.Errorf("send actor %q queue %q: Engine returned status %q", q.handle.metadata.ID, name, response.Status)
+	}
+	if response.Status == ActorQueueTimedOut && len(response.Response) != 0 {
+		return ActorQueueSendResult{}, fmt.Errorf("send actor %q queue %q: timed out response contains a payload", q.handle.metadata.ID, name)
+	}
+	return ActorQueueSendResult{Status: response.Status, Response: append(json.RawMessage(nil), response.Response...)}, nil
+}
+
+func queueClientError(err error) error {
+	var clientError *ClientError
+	if !errors.As(err, &clientError) || clientError.Group != "queue" {
+		return err
+	}
+	switch clientError.Code {
+	case "full":
+		return fmt.Errorf("%w: %w", err, ErrQueueFull)
+	case "message_too_large":
+		return fmt.Errorf("%w: %w", err, ErrQueueMessageTooLarge)
+	case "timed_out":
+		return fmt.Errorf("%w: %w", err, ErrQueueTimedOut)
+	case "aborted":
+		return fmt.Errorf("%w: %w", err, ErrActorAborted)
+	default:
+		return err
+	}
 }
 
 // Call marshals arguments as the Rivet action argument array and returns the

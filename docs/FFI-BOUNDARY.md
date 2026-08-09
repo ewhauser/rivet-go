@@ -101,11 +101,12 @@ instance ID, `gen` = generation; both assigned by core.
 | `RunnerConnected` | runner_id, engine metadata | — |
 | `RunnerDisconnected` | reason; core auto-reconnects | — |
 | `RunnerStopped` | drain report | — (pump exits) |
-| `ActorStart` | aid, gen, name, key, create_ts, input, persisted_state (optional; absent differs from present-empty), sqlite_socket_path?, restored connections[] | `ActorStartResult { aid, gen, ok / error }` |
+| `ActorStart` | aid, gen, name, key, create_ts, input, persisted_state (optional; absent differs from present-empty), sqlite_socket_path?, restored connections[] | `ActorStartResult { aid, gen, ok, run / error }` |
 | `ActorStop` | aid, gen, reason (stop cmd / sleep intent / drain) | `ActorStopResult { aid, gen }` after handler cleanup |
 | `ActorAlarm` | aid, gen, alarm_ts | `AlarmHandled { aid, gen }` |
 | `ActorIntentResult` | op_id, error? | completes the matching `SetAlarm` or `SleepIntent` admission |
 | `ActorScheduleResult` | op_id, operation, schedule_id?, cancelled?, schedules[], error? | completes the matching one-shot schedule create, cancel, get, or list operation |
+| `ActorQueueResult` | op_id, queue_operation, message?, response?, error? | completes the matching durable queue operation |
 | `ConnectionPreflight` / `ConnectionOpen` / `ConnectionClose` | aid, gen, op_id, connection snapshot | `ConnectionResult { op_id, connection_state / error }` |
 | `ActionCall` | aid, gen, call_id, action name, timeout_ms, args (raw bytes: JSON/CBOR per client encoding), conn_id | `ActionResult { call_id, output / error, connection_state? }` |
 | `HttpRequest` | aid, req_id, method, path, headers, body?, stream flag | `HttpResponseStart` (+ chunks) |
@@ -122,7 +123,7 @@ instance ID, `gen` = generation; both assigned by core.
 
 | Command | Payload | Completed by |
 |---|---|---|
-| `ActorStartResult` / `ActorStopResult` / `AlarmHandled` / `ActionResult` | see above | — |
+| `ActorStartResult` / `ActorRunResult` / `ActorStopResult` / `AlarmHandled` / `ActionResult` | see above | — |
 | `ConnectionResult` | op_id, connection_state / error | settles one connection lifecycle event |
 | `HttpResponseStart` | req_id, status, headers, body?, stream | — |
 | `HttpResponseChunk` | req_id, body, finish | — |
@@ -136,6 +137,13 @@ instance ID, `gen` = generation; both assigned by core.
 | `ScheduleAfter` / `ScheduleAt` | op_id, aid, gen, action, CBOR argument array, duration or absolute timestamp | `ActorScheduleResult` with a stable schedule ID |
 | `ScheduleCancel` / `ScheduleGet` | op_id, aid, gen, schedule ID | `ActorScheduleResult` with a boolean or zero/one pending record |
 | `ScheduleList` | op_id, aid, gen | `ActorScheduleResult` with pending records in run order |
+| `QueueSend` | op_id, aid, gen, name, CBOR body | `ActorQueueResult` with the durable message metadata |
+| `QueueEnqueueWait` | op_id, aid, gen, name, CBOR body, timeout? | `ActorQueueResult` with an optional completion response |
+| `QueueNext` | op_id, aid, gen, names, timeout?, completable | `ActorQueueResult` with zero or one message |
+| `QueueComplete` / `QueueRetry` | op_id, aid, gen, message ID, optional completion response | `ActorQueueResult` after removal or release |
+| `QueueCancel` | aid, gen, target op_id | cancels one blocking queue operation; its original result settles normally |
+| `ManagedWorkBegin` | op_id, aid, gen, work ID, `wait_until` or `keep_awake` | `ActorIntentResult` after registration with core |
+| `ManagedWorkEnd` | aid, gen, work ID | — |
 | `StopIntent` | aid | eventual `ActorStop` |
 | `SqliteExec` / `SqliteQuery` | request_id, aid, gen, deadline_ms, SQL, typed args, lease_key? | one or more ordered `SqliteResult` events |
 | `SqliteBegin` | request_id, aid, gen, deadline_ms, lease_key, timeout_ms | `SqliteResult` |
@@ -837,3 +845,33 @@ names and values retain the one MiB boundary maximum; snapshots allow at most
 an exact actor generation and nonempty connection ID; correlated results require
 a positive operation ID and present state on success. Present-empty state
 remains distinct from an absent result arm.
+
+## M11 durable queues and managed actor work — 2026-08-09
+
+ABI 11 adds a generation-owned `Run` lifecycle, durable queue operations, and
+core-registered managed work. A successful `ActorStartResult` carries whether
+Go started `Run`; Rust calls `ActorContext::begin_run_handler` before resolving
+startup and balances it exactly once on `ActorRunResult` or generation cleanup.
+Go cancels and joins `Run` before `OnStop`, so no run loop can retain an expired
+generation context. Matching the upstream runtime, an unexpected Run error or
+panic is reported and ends that hook without crashing the actor; the next actor
+generation starts a fresh Run hook.
+
+Queue bodies and completion responses are CBOR blobs with the existing one MiB
+boundary cap; core applies its configured encoded-message limit and 1,000-entry
+capacity. Blocking `QueueNext` and `QueueEnqueueWait` calls have explicit
+cancellation tokens keyed by their operation ID. A cancelled Go context sends
+`QueueCancel` and waits for the original native settlement, preserving a
+message that won the cancellation race. Completable messages remain in a
+generation-scoped Rust table until `QueueComplete`, `QueueRetry`, or cleanup;
+retry drops the core completion handle so a later receive can redeliver the
+record. Blocking `Next` does not hold the FFI's generic actor-operation fence:
+core tracks it as a sleep-compatible active queue wait and sleep aborts it.
+
+`ManagedWorkBegin(wait_until)` registers a core shutdown task backed by a
+oneshot; `ManagedWorkBegin(keep_awake)` retains a core keep-awake region. Go
+always sends `ManagedWorkEnd` after accepted work. Generation cleanup releases
+every remaining token, completable message, and managed-work handle. Public
+`WaitUntil` callbacks receive only a generation-scoped context and may not
+capture actor state or storage; serialized background actor work belongs in
+`Run`.

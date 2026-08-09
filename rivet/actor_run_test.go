@@ -1,0 +1,20 @@
+package rivet
+
+import (
+	"context"
+	"testing"
+)
+
+func TestActorAdapterRunEnabledOnlyWhenConfigured(t *testing.T) {
+	withoutRun := &actorAdapter[struct{}]{definition: Actor[struct{}]{}}
+	if withoutRun.RunEnabled() {
+		t.Fatal("RunEnabled = true for actor without Run")
+	}
+
+	withRun := &actorAdapter[struct{}]{definition: Actor[struct{}]{
+		Run: func(context.Context, *RunContext[struct{}]) error { return nil },
+	}}
+	if !withRun.RunEnabled() {
+		t.Fatal("RunEnabled = false for actor with Run")
+	}
+}
