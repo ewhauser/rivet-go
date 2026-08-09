@@ -40,6 +40,7 @@ const ALARM_TRANSPORT_SETTLEMENT: Duration = Duration::from_millis(2 * 1_500 + 1
 const HTTP_RESULT_TIMEOUT: Duration = Duration::from_secs(30);
 const WS_OPEN_RESULT_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_BODY_CHUNK: usize = 1 << 20;
+const MAX_HTTP_RESPONSE_BYTES: usize = 16 << 20;
 const MAX_HTTP_HEADERS: usize = 256;
 const MAX_KV_LIST_ENTRIES: u32 = 1_024;
 const WS_OUTBOUND_QUEUE_CAPACITY: usize = 64;
@@ -253,6 +254,13 @@ struct HttpResponseAssembly {
     status: u16,
     headers: BTreeMap<String, String>,
     body: Vec<u8>,
+}
+
+fn http_response_body_too_large_error() -> WireError {
+    WireError::new(
+        "http_response_body_too_large",
+        format!("HTTP response body exceeds the {MAX_HTTP_RESPONSE_BYTES}-byte aggregate maximum"),
+    )
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -3474,6 +3482,10 @@ impl ActorProxy {
             self.resolve_http_error(req_id, error);
             return;
         }
+        if body.len() > MAX_HTTP_RESPONSE_BYTES {
+            self.resolve_http_error(req_id, http_response_body_too_large_error());
+            return;
+        }
         if stream {
             let prior = self
                 .http_responses
@@ -3532,6 +3544,14 @@ impl ActorProxy {
                 );
                 return;
             };
+            if response.body.len() > MAX_HTTP_RESPONSE_BYTES
+                || body.len() > MAX_HTTP_RESPONSE_BYTES - response.body.len()
+            {
+                responses.remove(&req_id);
+                drop(responses);
+                self.resolve_http_error(req_id, http_response_body_too_large_error());
+                return;
+            }
             response.body.extend_from_slice(&body);
             finish.then(|| responses.remove(&req_id).expect("HTTP response exists"))
         };
@@ -4328,6 +4348,67 @@ mod tests {
         assert_eq!(correlations.len(), 0);
         proxy.sweep_pending();
         assert!(event_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn streamed_http_commands_reject_oversized_aggregate_body() {
+        let (events, _event_rx) = bounded(4);
+        let correlations = CorrelationTable::default();
+        let proxy = ActorProxy::new(events, correlations.clone());
+        let (req_id, receiver) = correlations.insert(Duration::from_secs(1));
+        proxy
+            .active_http
+            .lock()
+            .expect("active HTTP table")
+            .insert(req_id);
+
+        proxy.handle_command(Command::HttpResponseStart {
+            req_id,
+            status: 200,
+            headers: BTreeMap::new(),
+            body: Vec::new(),
+            stream: true,
+            error: None,
+        });
+        for _ in 0..MAX_HTTP_RESPONSE_BYTES / MAX_BODY_CHUNK {
+            proxy.handle_command(Command::HttpResponseChunk {
+                req_id,
+                body: vec![0; MAX_BODY_CHUNK],
+                finish: false,
+            });
+        }
+        proxy.handle_command(Command::HttpResponseChunk {
+            req_id,
+            body: vec![0],
+            finish: true,
+        });
+
+        let payload = receiver
+            .await
+            .expect("HTTP correlation sender")
+            .expect("HTTP correlation result");
+        let resolution: HttpResolution =
+            rmp_serde::from_slice(&payload).expect("decode HTTP resolution");
+        assert_eq!(resolution.status, 0);
+        assert_eq!(
+            resolution.error.expect("oversized response error").code,
+            "http_response_body_too_large"
+        );
+        assert_eq!(correlations.len(), 0);
+        assert!(
+            proxy
+                .active_http
+                .lock()
+                .expect("active HTTP table")
+                .is_empty()
+        );
+        assert!(
+            proxy
+                .http_responses
+                .lock()
+                .expect("HTTP response table")
+                .is_empty()
+        );
     }
 
     #[tokio::test]

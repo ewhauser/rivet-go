@@ -13,9 +13,10 @@ import (
 )
 
 const (
-	maxHTTPChunk       = 1 << 20
-	maxHTTPHeaders     = 256
-	maxHTTPHeaderBytes = 1 << 20
+	maxHTTPChunk         = 1 << 20
+	maxHTTPResponseBytes = 16 << 20
+	maxHTTPHeaders       = 256
+	maxHTTPHeaderBytes   = 1 << 20
 )
 
 var errResponseWriterFinished = errors.New("rivet: write after OnFetch returned")
@@ -82,6 +83,10 @@ func (w *responseWriter) writeHeaderLocked(statusCode int) {
 			}
 			return
 		}
+		if w.length > maxHTTPResponseBytes {
+			w.err = responseBodyTooLargeError()
+			return
+		}
 	}
 	w.err = w.session.StartHTTPResponse(
 		w.ctx,
@@ -113,6 +118,10 @@ func (w *responseWriter) Write(body []byte) (int, error) {
 		}
 		return 0, w.err
 	}
+	if int64(len(body)) > maxHTTPResponseBytes-w.written {
+		w.err = responseBodyTooLargeError()
+		return 0, w.err
+	}
 	written := 0
 	for len(body) != 0 {
 		chunkSize := min(len(body), maxHTTPChunk)
@@ -130,6 +139,16 @@ func (w *responseWriter) Write(body []byte) (int, error) {
 		body = body[chunkSize:]
 	}
 	return written, nil
+}
+
+func responseBodyTooLargeError() error {
+	return pump.HandlerError{
+		Code: "http_response_body_too_large",
+		Message: fmt.Sprintf(
+			"HTTP response body exceeds the %d-byte aggregate maximum",
+			maxHTTPResponseBytes,
+		),
+	}
 }
 
 func (w *responseWriter) finish() error {

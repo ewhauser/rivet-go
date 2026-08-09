@@ -338,8 +338,10 @@ buffers the incoming body before creating `ActorEvent::HttpRequest`, and the
 reply channel accepts only `Response<Vec<u8>>`. The FFI divides the buffered
 request into `HttpRequest` plus `HttpRequestChunk` events of at most 1 MiB and
 accepts `HttpResponseStart` plus equally bounded response chunks, but it must
-assemble all response chunks before replying to core. A 30-second boundary
-deadline applies because this callback exposes no separate core deadline.
+assemble all response chunks before replying to core. Go and Rust enforce a
+16 MiB aggregate response-body ceiling below the pinned core's default 20 MiB
+envoy payload maximum. A 30-second boundary deadline applies because this
+callback exposes no separate core deadline.
 Deadline expiry emits `HttpRequestAbort`; actor or runner shutdown cancels the
 Go request context directly. Client socket aborts are not visible through this
 v2.3.10 embedder callback and therefore cannot produce their own abort event.

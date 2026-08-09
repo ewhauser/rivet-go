@@ -164,6 +164,32 @@ func TestResponseWriterContentLengthCoherence(t *testing.T) {
 	})
 }
 
+func TestResponseWriterBoundsAggregateBodySize(t *testing.T) {
+	t.Run("declared", func(t *testing.T) {
+		writer := newResponseWriter(&recordingHTTPSession{}, 6, context.Background())
+		writer.Header().Set("Content-Length", fmt.Sprint(maxHTTPResponseBytes+1))
+		writer.WriteHeader(http.StatusOK)
+		var structured pump.HandlerError
+		if err := writer.finish(); !errors.As(err, &structured) || structured.Code != "http_response_body_too_large" {
+			t.Fatalf("finish error = %v, want body-size error", err)
+		}
+	})
+
+	t.Run("streamed", func(t *testing.T) {
+		writer := newResponseWriter(&recordingHTTPSession{}, 7, context.Background())
+		chunk := make([]byte, maxHTTPChunk)
+		for range maxHTTPResponseBytes / maxHTTPChunk {
+			if _, err := writer.Write(chunk); err != nil {
+				t.Fatalf("Write within limit: %v", err)
+			}
+		}
+		var structured pump.HandlerError
+		if written, err := writer.Write([]byte{0}); written != 0 || !errors.As(err, &structured) || structured.Code != "http_response_body_too_large" {
+			t.Fatalf("over-limit Write = %d, %v; want body-size error", written, err)
+		}
+	})
+}
+
 func TestResponseWriterRejectsUnrepresentableHeaders(t *testing.T) {
 	t.Run("repeated set-cookie", func(t *testing.T) {
 		writer := newResponseWriter(&recordingHTTPSession{}, 6, context.Background())
