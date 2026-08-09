@@ -159,6 +159,25 @@ func TestRustM11CommandBatchGolden(t *testing.T) {
 	}
 }
 
+func TestRustM12CommandBatchGolden(t *testing.T) {
+	data := golden(t, "command_m12.msgpack")
+	var batch CommandBatch
+	if err := decode(data, &batch); err != nil {
+		t.Fatal(err)
+	}
+	if len(batch.Commands) != 1 || batch.Commands[0].Kind != CommandDestroyIntent ||
+		batch.Commands[0].OperationID != 87 || batch.Commands[0].Generation != 12 {
+		t.Fatalf("M12 destroy command = %#v", batch.Commands)
+	}
+	encoded, err := EncodeCommandBatch(batch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(encoded, data) {
+		t.Fatal("Go CommandBatch encoding differs from the Rust-generated M12 golden")
+	}
+}
+
 func TestRustM10CommandBatchGolden(t *testing.T) {
 	data := golden(t, "command_m10.msgpack")
 	var batch CommandBatch

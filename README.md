@@ -241,7 +241,7 @@ is still missing.
 | Durable queues | Supported | Actor queues support typed CBOR send, filtered blocking receive, immediate poll, completable messages, explicit completion responses and retry, cancellation, sleep/wake, and stable capacity/size errors. External actor handles expose JSON `Send` and `SendAndWait`. |
 | Durable workflows | Not implemented | Workflow definitions, replay, steps, rollback, and history are not exposed. |
 | Actor-scoped background work | Supported | `Actor.Run` restarts with each generation and serializes actor-state access while queue waits and `RunContext.KeepAwake` yield the actor turn. `Context.KeepAwake` and restricted detached `WaitUntil` work are registered with core and drained during shutdown. |
-| Actor destruction | Not implemented | Actors can sleep but cannot request their own destruction through the Go context. |
+| Actor destruction | Supported | `Context.Destroy` sends the current callback response, drains admitted work, fences SQLite leases, closes WebSockets, and permanently destroys the generation. Calls during startup or teardown return stable errors. |
 | Dynamic actors | Not implemented | Loading actor definitions from generated or user-provided source is not supported. |
 | Custom inspector tabs | Not implemented | The inspector/devtools extension protocol and actor-supplied tab assets are not exposed. |
 | Serverless and WebAssembly runners | Not implemented | The SDK hosts long-running native runner processes; Cloudflare Workers, Supabase Functions, and custom serverless runtimes are outside the current target. |

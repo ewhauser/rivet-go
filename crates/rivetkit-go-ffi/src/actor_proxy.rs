@@ -577,10 +577,10 @@ impl ActorProxy {
                 error: _,
             } => {
                 let identity = ActorIdentity::new(aid, generation);
-                if let Some(actor) = self.actor_exact(&identity) {
-                    if actor.run_active.swap(false, Ordering::AcqRel) {
-                        actor.ctx.end_run_handler();
-                    }
+                if let Some(actor) = self.actor_exact(&identity)
+                    && actor.run_active.swap(false, Ordering::AcqRel)
+                {
+                    actor.ctx.end_run_handler();
                 }
             }
             Command::ActorStopResult {
@@ -715,6 +715,11 @@ impl ActorProxy {
                 aid,
                 r#gen: generation,
             } => self.dispatch_sleep_intent(op_id, aid, generation),
+            Command::DestroyIntent {
+                op_id,
+                aid,
+                r#gen: generation,
+            } => self.dispatch_destroy_intent(op_id, aid, generation),
             Command::ScheduleAfter {
                 op_id,
                 aid,
@@ -1688,6 +1693,7 @@ impl ActorProxy {
             | Command::StopIntent { .. }
             | Command::SetAlarm { .. }
             | Command::SleepIntent { .. }
+            | Command::DestroyIntent { .. }
             | Command::ScheduleAfter { .. }
             | Command::ScheduleAt { .. }
             | Command::ScheduleCancel { .. }
@@ -2094,6 +2100,37 @@ impl ActorProxy {
             // owns the sleep transition and reports it through ActorStop.
             let _ = actor.ctx.sleep();
         });
+    }
+
+    fn dispatch_destroy_intent(&self, op_id: u64, aid: String, generation: u64) {
+        let identity = ActorIdentity::new(aid.clone(), generation);
+        let Some(actor) = self.actor_exact(&identity) else {
+            self.emit_actor_intent_result(
+                op_id,
+                Err(WireError::new(
+                    "actor_generation_stale",
+                    format!("actor {aid} generation {generation} is not active"),
+                )),
+            );
+            return;
+        };
+        match actor.ctx.destroy() {
+            Ok(()) => {
+                // Core has atomically accepted the terminal request. Fence
+                // every proxy operation admitted after it; already admitted
+                // work is drained by ActorStopResult before cleanup.
+                actor.lifecycle_stopping.store(true, Ordering::Release);
+                actor.operations.begin_stop();
+                self.emit_actor_intent_result(op_id, Ok(()));
+            }
+            Err(error) => {
+                let structured = RivetError::extract(&error);
+                self.emit_actor_intent_result(
+                    op_id,
+                    Err(WireError::new(structured.code(), structured.message())),
+                );
+            }
+        }
     }
 
     fn dispatch_schedule_after(

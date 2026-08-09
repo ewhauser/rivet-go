@@ -15,6 +15,12 @@ import (
 	"github.com/ewhauser/rivet-go/internal/wire"
 )
 
+var (
+	ErrActorUnavailable = errors.New("actor context is unavailable")
+	ErrActorStarting    = errors.New("actor generation is starting")
+	ErrActorStopping    = errors.New("actor generation is stopping")
+)
+
 // Actor defines typed state, lifecycle hooks, actions, raw HTTP handling, and
 // raw gateway WebSocket handling.
 type Actor[T any] struct {
@@ -74,6 +80,10 @@ type Context[T any] struct {
 	pendingConnections  map[string]*Connection
 	currentConnectionMu sync.RWMutex
 	currentConnection   *Connection
+	lifecycleMu         sync.Mutex
+	lifecycleStarted    bool
+	lifecycleStopping   bool
+	destroyRequested    bool
 	managedCtx          context.Context
 	managedCancel       context.CancelFunc
 	managedMu           sync.Mutex
@@ -232,6 +242,65 @@ func (c *Context[T]) Sleep() error {
 	return c.session.Sleep()
 }
 
+// Destroy permanently destroys this actor after the current callback response
+// is sent and already accepted actor work completes. Unlike Sleep, a destroyed
+// actor cannot be woken again. All generation-scoped SQLite and WebSocket
+// handles are closed during teardown.
+func (c *Context[T]) Destroy() error {
+	if c == nil || c.session == nil {
+		return ErrActorUnavailable
+	}
+	c.lifecycleMu.Lock()
+	defer c.lifecycleMu.Unlock()
+	if !c.lifecycleStarted {
+		return ErrActorStarting
+	}
+	if c.lifecycleStopping || c.destroyRequested {
+		return ErrActorStopping
+	}
+	// Fence SQLite before core accepts destruction. This drains admitted calls
+	// and rolls back an open transaction lease instead of letting it hold the
+	// generation alive until its deadline.
+	if c.db != nil {
+		if err := c.db.closeForDestroy(); err != nil {
+			return fmt.Errorf("close actor SQLite transport for destroy: %w", err)
+		}
+	}
+	if err := c.session.Destroy(); err != nil {
+		return actorDestroyError(err)
+	}
+	c.destroyRequested = true
+	return nil
+}
+
+func (c *Context[T]) destructionRequested() bool {
+	if c == nil {
+		return false
+	}
+	c.lifecycleMu.Lock()
+	requested := c.destroyRequested
+	c.lifecycleMu.Unlock()
+	return requested
+}
+
+func actorDestroyError(err error) error {
+	if errors.Is(err, pump.ErrShuttingDown) {
+		return fmt.Errorf("actor runner is shutting down: %w", ErrActorStopping)
+	}
+	var handler pump.HandlerError
+	if !errors.As(err, &handler) {
+		return err
+	}
+	switch handler.Code {
+	case "starting", "actor_starting":
+		return fmt.Errorf("%s: %w", handler.Message, ErrActorStarting)
+	case "stopping", "destroying", "actor_stopping", "actor_generation_stale":
+		return fmt.Errorf("%s: %w", handler.Message, ErrActorStopping)
+	default:
+		return err
+	}
+}
+
 // Save serializes the current complete state and waits until rivetkit-core has
 // persisted it. State is JSON by default; BinaryMarshaler/BinaryUnmarshaler on
 // T or *T override JSON for custom binary formats.
@@ -337,6 +406,9 @@ func (a *actorAdapter[T]) Start(
 		}
 	}
 	actorContext.queue = actorContext.queue.forRun(actorContext.turnMu.Unlock, actorContext.turnMu.Lock)
+	actorContext.lifecycleMu.Lock()
+	actorContext.lifecycleStarted = true
+	actorContext.lifecycleMu.Unlock()
 	return actorContext, nil
 }
 
@@ -377,6 +449,9 @@ func (a *actorAdapter[T]) Stop(
 	if !ok || actorContext == nil {
 		return errors.New("typed actor context is unavailable during stop")
 	}
+	actorContext.lifecycleMu.Lock()
+	actorContext.lifecycleStopping = true
+	actorContext.lifecycleMu.Unlock()
 	actorContext.turnMu.Lock()
 	defer actorContext.turnMu.Unlock()
 	var stopErr error
@@ -441,10 +516,12 @@ func (a *actorAdapter[T]) Action(
 	if err != nil {
 		return nil, err
 	}
-	if err := actorContext.Save(ctx); err != nil {
-		return nil, pump.HandlerError{
-			Code:    "action_state_persist_failed",
-			Message: err.Error(),
+	if !actorContext.destructionRequested() {
+		if err := actorContext.Save(ctx); err != nil {
+			return nil, pump.HandlerError{
+				Code:    "action_state_persist_failed",
+				Message: err.Error(),
+			}
 		}
 	}
 	return output, nil
@@ -468,10 +545,12 @@ func (a *actorAdapter[T]) Alarm(
 	if err := a.definition.OnAlarm(actorContext); err != nil {
 		return err
 	}
-	if err := actorContext.Save(ctx); err != nil {
-		return pump.HandlerError{
-			Code:    "alarm_state_persist_failed",
-			Message: err.Error(),
+	if !actorContext.destructionRequested() {
+		if err := actorContext.Save(ctx); err != nil {
+			return pump.HandlerError{
+				Code:    "alarm_state_persist_failed",
+				Message: err.Error(),
+			}
 		}
 	}
 	return nil

@@ -1037,6 +1037,25 @@ func TestActorIntentsAreGenerationFencedAndWaitForCompletion(t *testing.T) {
 		t.Fatalf("Sleep error = %#v, want native structured sleep_intent_failed", intentErr)
 	}
 
+	destroyResult := make(chan error, 1)
+	go func() { destroyResult <- session.Destroy() }()
+	destroyCommand := nextCommand(t, runner)
+	if destroyCommand.Kind != wire.CommandDestroyIntent || destroyCommand.AID != "intent-aid" ||
+		destroyCommand.Generation != 9 || destroyCommand.OperationID == 0 {
+		t.Fatalf("destroy command = %#v", destroyCommand)
+	}
+	select {
+	case err := <-destroyResult:
+		t.Fatalf("Destroy returned before native completion: %v", err)
+	default:
+	}
+	runner.emit(wire.Event{
+		Kind: wire.EventActorIntentResult, OperationID: destroyCommand.OperationID,
+	})
+	if err := <-destroyResult; err != nil {
+		t.Fatalf("Destroy: %v", err)
+	}
+
 	cancel()
 	if err := <-result; err != nil {
 		t.Fatalf("Run: %v", err)
@@ -1278,6 +1297,48 @@ func TestRunnerShutdownRacingSleepIntentIsDeterministic(t *testing.T) {
 	cancel()
 	if err := <-sleepResult; !errors.Is(err, ErrShuttingDown) {
 		t.Fatalf("Sleep result = %v, want ErrShuttingDown", err)
+	}
+	if err := <-result; err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if !runner.stoppedPoll.Load() || runner.closeEarly.Load() {
+		t.Fatalf("shutdown order: stopped=%v close_early=%v", runner.stoppedPoll.Load(), runner.closeEarly.Load())
+	}
+}
+
+func TestRunnerShutdownRacingDestroyIntentIsDeterministic(t *testing.T) {
+	runner := newFakeRunner()
+	sessions := make(chan *ActorSession, 1)
+	handler := lifecycleHandler{start: func(
+		_ context.Context,
+		session *ActorSession,
+		_ wire.Event,
+	) (any, error) {
+		sessions <- session
+		return nil, nil
+	}}
+	p := NewWithHandlers(runner, map[string]ActorHandler{"destroy-race": handler})
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() { result <- p.Run(ctx) }()
+	waitPumpStarted(t, p)
+	runner.emit(wire.Event{
+		Kind: wire.EventActorStart, AID: "destroy-race-aid", Generation: 6, Name: "destroy-race",
+	})
+	if command := nextCommand(t, runner); command.Kind != wire.CommandActorStartResult {
+		t.Fatalf("start command = %#v", command)
+	}
+	session := <-sessions
+	destroyResult := make(chan error, 1)
+	go func() { destroyResult <- session.Destroy() }()
+	destroyCommand := nextCommand(t, runner)
+	if destroyCommand.Kind != wire.CommandDestroyIntent || destroyCommand.Generation != 6 {
+		t.Fatalf("destroy command = %#v", destroyCommand)
+	}
+
+	cancel()
+	if err := <-destroyResult; !errors.Is(err, ErrShuttingDown) {
+		t.Fatalf("Destroy result = %v, want ErrShuttingDown", err)
 	}
 	if err := <-result; err != nil {
 		t.Fatalf("Run: %v", err)

@@ -102,9 +102,9 @@ instance ID, `gen` = generation; both assigned by core.
 | `RunnerDisconnected` | reason; core auto-reconnects | — |
 | `RunnerStopped` | drain report | — (pump exits) |
 | `ActorStart` | aid, gen, name, key, create_ts, input, persisted_state (optional; absent differs from present-empty), sqlite_socket_path?, restored connections[] | `ActorStartResult { aid, gen, ok, run / error }` |
-| `ActorStop` | aid, gen, reason (stop cmd / sleep intent / drain) | `ActorStopResult { aid, gen }` after handler cleanup |
+| `ActorStop` | aid, gen, reason (stop cmd / sleep intent / destroy intent / drain) | `ActorStopResult { aid, gen }` after handler cleanup |
 | `ActorAlarm` | aid, gen, alarm_ts | `AlarmHandled { aid, gen }` |
-| `ActorIntentResult` | op_id, error? | completes the matching `SetAlarm` or `SleepIntent` admission |
+| `ActorIntentResult` | op_id, error? | completes the matching `SetAlarm`, `SleepIntent`, or `DestroyIntent` admission |
 | `ActorScheduleResult` | op_id, operation, schedule_id?, cancelled?, schedules[], error? | completes the matching one-shot schedule create, cancel, get, or list operation |
 | `ActorQueueResult` | op_id, queue_operation, message?, response?, error? | completes the matching durable queue operation |
 | `ConnectionPreflight` / `ConnectionOpen` / `ConnectionClose` | aid, gen, op_id, connection snapshot | `ConnectionResult { op_id, connection_state / error }` |
@@ -134,6 +134,7 @@ instance ID, `gen` = generation; both assigned by core.
 | `KvGet` / `KvList` / `KvPut` / `KvDelete` | kv_id, aid, op payload | `KvResult` |
 | `SetAlarm` | op_id, aid, gen, alarm_ts? (null clears) | `ActorIntentResult` after the core schedule operation succeeds or fails |
 | `SleepIntent` | op_id, aid, gen | `ActorIntentResult` after exact-generation admission; eventual `ActorStop` reports eviction |
+| `DestroyIntent` | op_id, aid, gen | `ActorIntentResult` after core atomically accepts exact-generation destruction; eventual `ActorStop` reports permanent destruction |
 | `ScheduleAfter` / `ScheduleAt` | op_id, aid, gen, action, CBOR argument array, duration or absolute timestamp | `ActorScheduleResult` with a stable schedule ID |
 | `ScheduleCancel` / `ScheduleGet` | op_id, aid, gen, schedule ID | `ActorScheduleResult` with a boolean or zero/one pending record |
 | `ScheduleList` | op_id, aid, gen | `ActorScheduleResult` with pending records in run order |
@@ -875,3 +876,21 @@ every remaining token, completable message, and managed-work handle. Public
 `WaitUntil` callbacks receive only a generation-scoped context and may not
 capture actor state or storage; serialized background actor work belongs in
 `Run`.
+
+## M12 generation-owned actor destruction — 2026-08-09
+
+ABI 12 adds `DestroyIntent`, a correlated command carrying the exact actor ID
+and generation. Rust calls the pinned core's `ActorContext::destroy` directly,
+preserves its `starting` and `stopping` lifecycle errors, and acknowledges only
+after core atomically accepts the terminal request. The accepted intent fences
+new generation-scoped proxy operations while previously admitted work drains.
+The current callback can still submit its action response; Go suppresses its
+usual post-action state save because destroyed state has no next generation.
+
+Go closes the generation's SQLite transport before submitting destruction, so
+admitted calls finish and an open transaction is rolled back without waiting
+for lease expiry. Core's graceful cleanup then waits for registered managed
+work, runs `OnStop`, and emits `ActorStop(reason=destroy)`. Rust removes every
+remaining queue, SQLite, correlation, and managed-work handle and closes raw
+and ActorConnect WebSockets with the normal actor-stop close frame. A destroyed
+actor is terminal and cannot be reawakened.

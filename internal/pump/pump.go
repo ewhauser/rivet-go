@@ -731,6 +731,20 @@ func (s *ActorSession) Sleep() error {
 	})
 }
 
+// Destroy requests permanent destruction of this exact actor generation.
+// Core completes the current callback response before beginning teardown.
+func (s *ActorSession) Destroy() error {
+	if s == nil || s.pump == nil {
+		return errors.New("actor session is unavailable")
+	}
+	if !s.isAccepting() {
+		return ErrShuttingDown
+	}
+	return s.submitActorIntent(wire.Command{
+		Kind: wire.CommandDestroyIntent,
+	})
+}
+
 func (s *ActorSession) submitActorIntent(command wire.Command) error {
 	_, err := s.submitActorOperation(context.Background(), command)
 	return err
