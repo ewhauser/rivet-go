@@ -9,6 +9,7 @@ use anyhow::{Context, Result, anyhow};
 use crossbeam_channel::Sender;
 use rivet_error::{RivetError, RivetErrorKind};
 use rivetkit_core::actor::ShutdownKind;
+use rivetkit_core::actor::schedule::ScheduledEventInfo;
 use rivetkit_core::{
     ActionDefinition, ActorConfig, ActorContext, ActorEvent, ActorFactory, ActorStart, BindParam,
     CanHibernateWebSocket, ColumnValue, ConnHandle, CoreRegistry, ExecuteResult, ListOpts,
@@ -17,7 +18,7 @@ use rivetkit_core::{
 use serde::{Deserialize, Serialize};
 
 use crate::correlation::{CorrelationError, CorrelationTable};
-use crate::wire::{Command, Event, KvEntry, SqliteValue, WireError};
+use crate::wire::{Command, Event, KvEntry, ScheduledEvent, SqliteValue, WireError};
 
 const LIFECYCLE_RESULT_TIMEOUT: Duration = Duration::from_secs(30);
 const SAVE_STATE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -25,8 +26,10 @@ const ACTION_RESULT_TIMEOUT: Duration = Duration::from_secs(60);
 const ALARM_RESULT_TIMEOUT: Duration = ACTION_RESULT_TIMEOUT;
 // DatabaseKv polls workflow signals every 1.5 seconds at the pinned engine.
 // Alarm and sleep are separate workflow signals, so hold the serialized alarm
-// operation for two complete polls plus a one-second scheduling margin before
-// allowing the Go handler to submit a later alarm or sleep checkpoint.
+// operation for two complete polls plus a one-second scheduling margin. The
+// compatibility alarm API reports completion after this window. Action
+// schedules report their committed mutation immediately but retain their actor
+// operation guard through the window so a following sleep cannot overtake it.
 const ALARM_TRANSPORT_SETTLEMENT: Duration = Duration::from_millis(2 * 1_500 + 1_000);
 const HTTP_RESULT_TIMEOUT: Duration = Duration::from_secs(30);
 const WS_OPEN_RESULT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -603,6 +606,46 @@ impl ActorProxy {
                 aid,
                 r#gen: generation,
             } => self.dispatch_sleep_intent(op_id, aid, generation),
+            Command::ScheduleAfter {
+                op_id,
+                aid,
+                r#gen: generation,
+                delay_ms,
+                action,
+                schedule_args,
+            } => self.dispatch_schedule_after(
+                op_id,
+                aid,
+                generation,
+                delay_ms,
+                action,
+                schedule_args,
+            ),
+            Command::ScheduleAt {
+                op_id,
+                aid,
+                r#gen: generation,
+                run_at,
+                action,
+                schedule_args,
+            } => self.dispatch_schedule_at(op_id, aid, generation, run_at, action, schedule_args),
+            Command::ScheduleCancel {
+                op_id,
+                aid,
+                r#gen: generation,
+                schedule_id,
+            } => self.dispatch_schedule_cancel(op_id, aid, generation, schedule_id),
+            Command::ScheduleGet {
+                op_id,
+                aid,
+                r#gen: generation,
+                schedule_id,
+            } => self.dispatch_schedule_get(op_id, aid, generation, schedule_id),
+            Command::ScheduleList {
+                op_id,
+                aid,
+                r#gen: generation,
+            } => self.dispatch_schedule_list(op_id, aid, generation),
             Command::SaveState {
                 aid,
                 r#gen: generation,
@@ -998,7 +1041,7 @@ impl ActorProxy {
                     }
                 }
                 ActorEvent::QueueSend { reply, .. } => {
-                    reply.send(Err(anyhow!("queue requests are outside the M5 surface")));
+                    reply.send(Err(anyhow!("queue requests are outside the Go boundary")));
                 }
                 ActorEvent::ConnectionPreflight { reply, .. }
                 | ActorEvent::ConnectionOpen { reply, .. } => reply.send(Ok(())),
@@ -1163,6 +1206,11 @@ impl ActorProxy {
             | Command::StopIntent { .. }
             | Command::SetAlarm { .. }
             | Command::SleepIntent { .. }
+            | Command::ScheduleAfter { .. }
+            | Command::ScheduleAt { .. }
+            | Command::ScheduleCancel { .. }
+            | Command::ScheduleGet { .. }
+            | Command::ScheduleList { .. }
             | Command::SqliteExec { .. }
             | Command::SqliteQuery { .. }
             | Command::SqliteBegin { .. }
@@ -1555,6 +1603,236 @@ impl ActorProxy {
             // exact generation and its already-admitted work are fenced, core
             // owns the sleep transition and reports it through ActorStop.
             let _ = actor.ctx.sleep();
+        });
+    }
+
+    fn dispatch_schedule_after(
+        &self,
+        op_id: u64,
+        aid: String,
+        generation: u64,
+        delay_ms: u64,
+        action: String,
+        args: Vec<u8>,
+    ) {
+        let Some((actor, operation)) = self.begin_schedule_operation(op_id, &aid, generation)
+        else {
+            return;
+        };
+        let proxy = self.clone();
+        tokio::spawn(async move {
+            let _operation = operation;
+            match actor
+                .ctx
+                .after(Duration::from_millis(delay_ms), &action, &args)
+                .await
+            {
+                Ok(schedule_id) => {
+                    proxy.emit_schedule_create(op_id, schedule_id);
+                    tokio::time::sleep(ALARM_TRANSPORT_SETTLEMENT).await;
+                }
+                Err(error) => proxy.emit_schedule_error(op_id, "create", &error),
+            }
+        });
+    }
+
+    fn dispatch_schedule_at(
+        &self,
+        op_id: u64,
+        aid: String,
+        generation: u64,
+        run_at: i64,
+        action: String,
+        args: Vec<u8>,
+    ) {
+        let Some((actor, operation)) = self.begin_schedule_operation(op_id, &aid, generation)
+        else {
+            return;
+        };
+        let proxy = self.clone();
+        tokio::spawn(async move {
+            let _operation = operation;
+            match actor.ctx.at(run_at, &action, &args).await {
+                Ok(schedule_id) => {
+                    proxy.emit_schedule_create(op_id, schedule_id);
+                    tokio::time::sleep(ALARM_TRANSPORT_SETTLEMENT).await;
+                }
+                Err(error) => proxy.emit_schedule_error(op_id, "create", &error),
+            }
+        });
+    }
+
+    fn dispatch_schedule_cancel(
+        &self,
+        op_id: u64,
+        aid: String,
+        generation: u64,
+        schedule_id: String,
+    ) {
+        let Some((actor, operation)) = self.begin_schedule_operation(op_id, &aid, generation)
+        else {
+            return;
+        };
+        let proxy = self.clone();
+        tokio::spawn(async move {
+            let _operation = operation;
+            match actor.ctx.cancel_schedule(&schedule_id).await {
+                Ok(cancelled) => {
+                    proxy.emit_schedule_cancel(op_id, cancelled);
+                    if cancelled {
+                        tokio::time::sleep(ALARM_TRANSPORT_SETTLEMENT).await;
+                    }
+                }
+                Err(error) => proxy.emit_schedule_error(op_id, "cancel", &error),
+            }
+        });
+    }
+
+    fn dispatch_schedule_get(&self, op_id: u64, aid: String, generation: u64, schedule_id: String) {
+        let Some((actor, operation)) = self.begin_schedule_operation(op_id, &aid, generation)
+        else {
+            return;
+        };
+        let proxy = self.clone();
+        tokio::spawn(async move {
+            let _operation = operation;
+            match actor.ctx.get_scheduled_event(&schedule_id).await {
+                Ok(Some(event)) if event.action != INTERNAL_ALARM_ACTION => {
+                    proxy.emit_schedule_events(op_id, "get", vec![scheduled_event(event)]);
+                }
+                Ok(_) => proxy.emit_schedule_events(op_id, "get", Vec::new()),
+                Err(error) => proxy.emit_schedule_error(op_id, "get", &error),
+            }
+        });
+    }
+
+    fn dispatch_schedule_list(&self, op_id: u64, aid: String, generation: u64) {
+        let Some((actor, operation)) = self.begin_schedule_operation(op_id, &aid, generation)
+        else {
+            return;
+        };
+        let proxy = self.clone();
+        tokio::spawn(async move {
+            let _operation = operation;
+            match actor.ctx.list_scheduled_events().await {
+                Ok(events) => proxy.emit_schedule_events(
+                    op_id,
+                    "list",
+                    events
+                        .into_iter()
+                        .filter(|event| event.action != INTERNAL_ALARM_ACTION)
+                        .map(scheduled_event)
+                        .collect(),
+                ),
+                Err(error) => proxy.emit_schedule_error(op_id, "list", &error),
+            }
+        });
+    }
+
+    fn begin_schedule_operation(
+        &self,
+        op_id: u64,
+        aid: &str,
+        generation: u64,
+    ) -> Option<(ActiveActor, ActorOperationGuard)> {
+        let identity = ActorIdentity::new(aid, generation);
+        let Some(actor) = self.actor_exact(&identity) else {
+            self.emit_schedule_wire_error(
+                op_id,
+                "operation",
+                WireError::new(
+                    "actor_generation_stale",
+                    format!("actor {aid} generation {generation} is not active"),
+                ),
+            );
+            return None;
+        };
+        let Some(operation) = actor.operations.begin() else {
+            self.emit_schedule_wire_error(
+                op_id,
+                "operation",
+                WireError::new(
+                    "actor_stopping",
+                    format!("actor {aid} generation {generation} is stopping"),
+                ),
+            );
+            return None;
+        };
+        Some((actor, operation))
+    }
+
+    fn emit_schedule_create(&self, op_id: u64, schedule_id: String) {
+        let _ = self.events.send(Event::ActorScheduleResult {
+            op_id,
+            operation: "create".to_owned(),
+            schedule_id: Some(schedule_id),
+            cancelled: None,
+            schedules: Vec::new(),
+            error: None,
+        });
+    }
+
+    fn emit_schedule_cancel(&self, op_id: u64, cancelled: bool) {
+        let _ = self.events.send(Event::ActorScheduleResult {
+            op_id,
+            operation: "cancel".to_owned(),
+            schedule_id: None,
+            cancelled: Some(cancelled),
+            schedules: Vec::new(),
+            error: None,
+        });
+    }
+
+    fn emit_schedule_events(&self, op_id: u64, operation: &str, schedules: Vec<ScheduledEvent>) {
+        let oversized_value = schedules.iter().any(|event| {
+            event.id.len() > MAX_BODY_CHUNK
+                || event.action.len() > MAX_BODY_CHUNK
+                || event.args.len() > MAX_BODY_CHUNK
+        });
+        let total_bytes = schedules.iter().fold(0usize, |total, event| {
+            total
+                .saturating_add(event.id.len())
+                .saturating_add(event.action.len())
+                .saturating_add(event.args.len())
+        });
+        if schedules.len() > 1_000 || oversized_value || total_bytes > MAX_SQLITE_RESULT_BYTES {
+            self.emit_schedule_wire_error(
+                op_id,
+                operation,
+                WireError::new(
+                    "schedule_result_too_large",
+                    "schedule result exceeds the boundary response limit",
+                ),
+            );
+            return;
+        }
+        let _ = self.events.send(Event::ActorScheduleResult {
+            op_id,
+            operation: operation.to_owned(),
+            schedule_id: None,
+            cancelled: None,
+            schedules,
+            error: None,
+        });
+    }
+
+    fn emit_schedule_error(&self, op_id: u64, operation: &str, error: &anyhow::Error) {
+        let structured = RivetError::extract(error);
+        self.emit_schedule_wire_error(
+            op_id,
+            operation,
+            WireError::new(structured.code(), structured.message()),
+        );
+    }
+
+    fn emit_schedule_wire_error(&self, op_id: u64, operation: &str, error: WireError) {
+        let _ = self.events.send(Event::ActorScheduleResult {
+            op_id,
+            operation: operation.to_owned(),
+            schedule_id: None,
+            cancelled: None,
+            schedules: Vec::new(),
+            error: Some(error),
         });
     }
 
@@ -2691,6 +2969,15 @@ fn cbor_empty_args() -> Vec<u8> {
     ciborium::into_writer(&Vec::<ciborium::Value>::new(), &mut encoded)
         .expect("empty CBOR argument encoding is infallible");
     encoded
+}
+
+fn scheduled_event(event: ScheduledEventInfo) -> ScheduledEvent {
+    ScheduledEvent {
+        id: event.id,
+        action: event.action,
+        args: event.args,
+        run_at: event.run_at,
+    }
 }
 
 fn cbor_null() -> Vec<u8> {

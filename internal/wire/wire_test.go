@@ -66,6 +66,7 @@ func TestRustEventBatchGoldens(t *testing.T) {
 		{"event_actor_stop.msgpack", EventActorStop, 5},
 		{"event_actor_alarm.msgpack", EventActorAlarm, 17},
 		{"event_actor_intent_result.msgpack", EventActorIntentResult, 18},
+		{"event_actor_schedule_result.msgpack", EventActorScheduleResult, 20},
 		{"event_kv_result.msgpack", EventKVResult, 6},
 		{"event_state_persisted.msgpack", EventStatePersisted, 7},
 		{"event_action_call.msgpack", EventActionCall, 10},
@@ -96,6 +97,43 @@ func TestRustEventBatchGoldens(t *testing.T) {
 				t.Fatal("WebSocket open golden does not carry the M5 resume marker")
 			}
 		})
+	}
+}
+
+func TestRustM9CommandBatchGolden(t *testing.T) {
+	data := golden(t, "command_m9.msgpack")
+	var batch CommandBatch
+	if err := decode(data, &batch); err != nil {
+		t.Fatal(err)
+	}
+	want := []CommandKind{
+		CommandScheduleAfter,
+		CommandScheduleAt,
+		CommandScheduleCancel,
+		CommandScheduleGet,
+		CommandScheduleList,
+	}
+	if len(batch.Commands) != len(want) {
+		t.Fatalf("command count = %d, want %d", len(batch.Commands), len(want))
+	}
+	for index, kind := range want {
+		if batch.Commands[index].Kind != kind {
+			t.Fatalf("command %d kind = %q, want %q", index, batch.Commands[index].Kind, kind)
+		}
+	}
+	if batch.Commands[0].OperationID != 61 || batch.Commands[0].Generation != 9 ||
+		batch.Commands[0].DelayMS != 1_500 || batch.Commands[0].Action != "remind" {
+		t.Fatalf("schedule after command = %#v", batch.Commands[0])
+	}
+	if batch.Commands[1].RunAt != 1_788_500_000_000 || batch.Commands[2].ScheduleID != "schedule-golden" {
+		t.Fatalf("M9 schedule commands = %#v", batch.Commands)
+	}
+	encoded, err := EncodeCommandBatch(batch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(encoded, data) {
+		t.Fatal("Go CommandBatch encoding differs from the Rust-generated M9 golden")
 	}
 }
 
@@ -339,6 +377,36 @@ func TestRustEmptyCommandBatchGolden(t *testing.T) {
 			"Go CommandBatch encoding differs from Rust golden: got len=%d sha256=%x, want len=%d sha256=%x",
 			len(encoded), sha256.Sum256(encoded), len(data), sha256.Sum256(data),
 		)
+	}
+}
+
+func TestScheduleResultValidationRejectsInconsistentPayloads(t *testing.T) {
+	cancelled := true
+	schedule := ScheduledEvent{ID: "one", Action: "run", Args: []byte{0x81, 0x01}, RunAt: 1}
+	tests := []Event{
+		{Kind: EventActorScheduleResult, OperationID: 1, ScheduleOperation: "create"},
+		{Kind: EventActorScheduleResult, OperationID: 1, ScheduleOperation: "cancel"},
+		{
+			Kind: EventActorScheduleResult, OperationID: 1, ScheduleOperation: "get",
+			Schedules: []ScheduledEvent{schedule, schedule},
+		},
+		{
+			Kind: EventActorScheduleResult, OperationID: 1, ScheduleOperation: "list",
+			Cancelled: &cancelled,
+		},
+		{
+			Kind: EventActorScheduleResult, OperationID: 1, ScheduleOperation: "create",
+			ScheduleID: "one", Error: &WireError{Code: "failed", Message: "failed"},
+		},
+	}
+	for index, event := range tests {
+		data, err := encode(EventBatch{Seq: uint64(index + 1), Events: []Event{event}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := DecodeEventBatch(data); err == nil {
+			t.Fatalf("invalid schedule result %d was accepted: %#v", index, event)
+		}
 	}
 }
 

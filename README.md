@@ -77,7 +77,7 @@ successful action is persisted automatically.
 
 The SDK also supports:
 
-- lifecycle hooks and durable alarms
+- lifecycle hooks, durable alarms, and typed one-shot action schedules
 - external and actor-scoped clients for actor creation, resolution, and actions
 - raw HTTP handlers
 - raw WebSocket handlers and broadcast
@@ -192,6 +192,8 @@ The response is:
   and transactions
 - [Durable reminder](examples/reminder): alarms, cancellation, actor sleep, and
   alarm-driven wake
+- [Durable action scheduling](examples/scheduling): multiple typed action
+  schedules, stable IDs, inspection, independent cancellation, and sleep/wake
 - [Raw HTTP counter](examples/http-counter): a `net/http` actor API with
   explicit state persistence
 - [Per-tenant company database](examples/per-tenant-database): keyed actors,
@@ -226,8 +228,8 @@ is still missing.
 | Raw WebSocket handlers | Supported | Text and binary messages, connect/disconnect hooks, targeted sends, close frames, broadcast, and bounded backpressure are available. |
 | Connection state and enumeration | Partial | `Connections` returns a sorted snapshot of live raw WebSocket connections. Connections expose IDs, request paths, headers, and hibernation metadata, but have no user-defined per-connection state. |
 | Actor sleep and WebSocket hibernation | Supported | Actors can request sleep; opted-in raw WebSockets remain connected and can wake the actor with a message. |
-| Durable scheduling | Partial | Each actor has one replaceable durable alarm with clear support. Multiple named schedules, action payloads, schedule IDs, and independent cancellation are not available. |
-| Cron schedules | Not implemented | Recurring cron expressions must be modeled manually by rescheduling the single alarm. |
+| Durable scheduling | Supported | `Context.Schedules` exposes durable one-shot `After` and `At` action schedules with typed payloads, stable IDs, get/list inspection, and independent cancellation. The original replaceable `Schedule`/`OnAlarm` API remains available for compatibility. |
+| Cron schedules | Not implemented | Recurring cron expressions must be modeled by scheduling the next one-shot action. |
 | Actor KV | Supported | The byte-oriented `KV` handle supports get, list, put, and delete. It is retained for RivetKit compatibility; prefer typed state or SQLite for new actors. |
 | Per-actor SQLite | Supported | Opt-in raw SQL, typed values, queries, transactions, isolation, sleep/wake, and durability are covered. Result limits are documented in [Operations](docs/OPERATIONS.md). |
 | Durable queues | Not implemented | Queue sends, consumers, completion, retries, and priority patterns are outside the current Go boundary. |

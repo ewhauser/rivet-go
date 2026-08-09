@@ -76,6 +76,14 @@ frames sent after engine-visible sleep rehydrate and run on the new generation.
 The test drains the exact sequence so a loss or duplicate fails the next
 expected observation.
 
+ABI 9 adds a separate durable-action scheduling case. It creates multiple
+`After` and `At` schedules with distinct typed payloads, verifies get/list run
+order, independently cancels one ID, sleeps the actor, restarts the complete
+Go runner, and requires the remaining schedules to wake and execute in order.
+One scheduled action returns a structured error; the following schedule must
+still execute and persist state. Runnable-example conformance drives the Go
+port in `examples/scheduling` through the same real gateway.
+
 Alarm assertions use engine timestamps and `eventually`, never a fixed sleep
 as the success condition. The pinned workflow poll tick is 16 seconds.
 Negative clear, overwrite, and one-shot observations cover one full tick plus

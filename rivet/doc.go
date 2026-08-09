@@ -5,10 +5,11 @@
 // actions persist the full state automatically; WebSocket and HTTP handlers
 // call Context.Save when they mutate state outside an action.
 //
-// Context exposes actor identity, an actor-scoped Client, live raw WebSocket
-// connection snapshots, and the low-level actor KV store. Actor.Database opts
-// one actor type into durable SQLite through Context.DB. Config's
-// SQLiteTransport selects the shared transport and defaults to FFI; setting it
+// Context exposes actor identity, an actor-scoped Client, durable one-shot
+// action schedules, live raw WebSocket connection snapshots, and the low-level
+// actor KV store. Actor.Database opts one actor type into durable SQLite
+// through Context.DB. Config's SQLiteTransport selects the shared transport and
+// defaults to FFI; setting it
 // to disabled overrides every actor declaration.
 //
 // NewClient creates an independent concurrency-safe client for resolving,

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"reflect"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -747,6 +748,167 @@ func TestActorIntentsAreGenerationFencedAndWaitForCompletion(t *testing.T) {
 
 	cancel()
 	if err := <-result; err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+}
+
+func TestDurableActionScheduleOperationsAreGenerationFencedAndCorrelated(t *testing.T) {
+	runner := newFakeRunner()
+	sessions := make(chan *ActorSession, 1)
+	handler := lifecycleHandler{start: func(
+		_ context.Context,
+		session *ActorSession,
+		_ wire.Event,
+	) (any, error) {
+		sessions <- session
+		return nil, nil
+	}}
+	p := NewWithHandlers(runner, map[string]ActorHandler{"scheduler": handler})
+	ctx, cancel := context.WithCancel(context.Background())
+	runResult := make(chan error, 1)
+	go func() { runResult <- p.Run(ctx) }()
+	waitPumpStarted(t, p)
+
+	runner.emit(wire.Event{
+		Kind: wire.EventActorStart, AID: "schedule-aid", Generation: 12, Name: "scheduler",
+	})
+	if command := nextCommand(t, runner); command.Kind != wire.CommandActorStartResult {
+		t.Fatalf("start command = %#v", command)
+	}
+	session := <-sessions
+	args := []byte{0x81, 0x01}
+
+	type createResult struct {
+		id  string
+		err error
+	}
+	afterResult := make(chan createResult, 1)
+	go func() {
+		id, err := session.ScheduleAfter(context.Background(), 1500*time.Millisecond, "remind", args)
+		afterResult <- createResult{id: id, err: err}
+	}()
+	after := nextCommand(t, runner)
+	if after.Kind != wire.CommandScheduleAfter || after.AID != "schedule-aid" ||
+		after.Generation != 12 || after.OperationID == 0 || after.DelayMS != 1500 ||
+		after.Action != "remind" || !reflect.DeepEqual(after.ScheduleArgs, args) {
+		t.Fatalf("schedule after command = %#v", after)
+	}
+	runner.emit(wire.Event{
+		Kind: wire.EventActorScheduleResult, OperationID: after.OperationID,
+		ScheduleOperation: "create", ScheduleID: "schedule-after",
+	})
+	if result := <-afterResult; result.err != nil || result.id != "schedule-after" {
+		t.Fatalf("ScheduleAfter = (%q, %v)", result.id, result.err)
+	}
+
+	atResult := make(chan createResult, 1)
+	go func() {
+		id, err := session.ScheduleAt(context.Background(), 1_788_500_000_000, "remind", args)
+		atResult <- createResult{id: id, err: err}
+	}()
+	at := nextCommand(t, runner)
+	if at.Kind != wire.CommandScheduleAt || at.RunAt != 1_788_500_000_000 ||
+		at.OperationID == after.OperationID {
+		t.Fatalf("schedule at command = %#v", at)
+	}
+	runner.emit(wire.Event{
+		Kind: wire.EventActorScheduleResult, OperationID: at.OperationID,
+		ScheduleOperation: "create", ScheduleID: "schedule-at",
+	})
+	if result := <-atResult; result.err != nil || result.id != "schedule-at" {
+		t.Fatalf("ScheduleAt = (%q, %v)", result.id, result.err)
+	}
+
+	cancelResult := make(chan struct {
+		cancelled bool
+		err       error
+	}, 1)
+	go func() {
+		cancelled, err := session.CancelSchedule(context.Background(), "schedule-after")
+		cancelResult <- struct {
+			cancelled bool
+			err       error
+		}{cancelled: cancelled, err: err}
+	}()
+	cancelCommand := nextCommand(t, runner)
+	if cancelCommand.Kind != wire.CommandScheduleCancel || cancelCommand.ScheduleID != "schedule-after" {
+		t.Fatalf("schedule cancel command = %#v", cancelCommand)
+	}
+	cancelled := true
+	runner.emit(wire.Event{
+		Kind: wire.EventActorScheduleResult, OperationID: cancelCommand.OperationID,
+		ScheduleOperation: "cancel", Cancelled: &cancelled,
+	})
+	if result := <-cancelResult; result.err != nil || !result.cancelled {
+		t.Fatalf("CancelSchedule = (%t, %v)", result.cancelled, result.err)
+	}
+
+	getResult := make(chan struct {
+		event ScheduledEvent
+		found bool
+		err   error
+	}, 1)
+	go func() {
+		event, found, err := session.GetSchedule(context.Background(), "schedule-at")
+		getResult <- struct {
+			event ScheduledEvent
+			found bool
+			err   error
+		}{event: event, found: found, err: err}
+	}()
+	getCommand := nextCommand(t, runner)
+	if getCommand.Kind != wire.CommandScheduleGet || getCommand.ScheduleID != "schedule-at" {
+		t.Fatalf("schedule get command = %#v", getCommand)
+	}
+	wireSchedule := wire.ScheduledEvent{
+		ID: "schedule-at", Action: "remind", Args: args, RunAt: 1_788_500_000_000,
+	}
+	runner.emit(wire.Event{
+		Kind: wire.EventActorScheduleResult, OperationID: getCommand.OperationID,
+		ScheduleOperation: "get", Schedules: []wire.ScheduledEvent{wireSchedule},
+	})
+	if result := <-getResult; result.err != nil || !result.found ||
+		result.event.ID != wireSchedule.ID || !reflect.DeepEqual(result.event.Args, args) {
+		t.Fatalf("GetSchedule = (%#v, %t, %v)", result.event, result.found, result.err)
+	}
+
+	listResult := make(chan struct {
+		events []ScheduledEvent
+		err    error
+	}, 1)
+	go func() {
+		events, err := session.ListSchedules(context.Background())
+		listResult <- struct {
+			events []ScheduledEvent
+			err    error
+		}{events: events, err: err}
+	}()
+	listCommand := nextCommand(t, runner)
+	if listCommand.Kind != wire.CommandScheduleList {
+		t.Fatalf("schedule list command = %#v", listCommand)
+	}
+	runner.emit(wire.Event{
+		Kind: wire.EventActorScheduleResult, OperationID: listCommand.OperationID,
+		ScheduleOperation: "list", Schedules: []wire.ScheduledEvent{wireSchedule},
+	})
+	if result := <-listResult; result.err != nil || len(result.events) != 1 ||
+		result.events[0].ID != "schedule-at" {
+		t.Fatalf("ListSchedules = (%#v, %v)", result.events, result.err)
+	}
+
+	cancelledContext, cancelOperation := context.WithCancel(context.Background())
+	cancelOperation()
+	if _, err := session.ListSchedules(cancelledContext); !errors.Is(err, context.Canceled) {
+		t.Fatalf("ListSchedules cancelled error = %v, want context.Canceled", err)
+	}
+	select {
+	case command := <-runner.submitted:
+		t.Fatalf("cancelled schedule operation submitted command %#v", command)
+	default:
+	}
+
+	cancel()
+	if err := <-runResult; err != nil {
 		t.Fatalf("Run: %v", err)
 	}
 }

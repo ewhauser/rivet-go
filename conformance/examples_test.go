@@ -412,6 +412,81 @@ func TestPortedRunnableExamples(t *testing.T) {
 		stopExampleCleanly(t, engine.endpoint, runnerName, process)
 	})
 
+	t.Run("scheduling", func(t *testing.T) {
+		runnerName := fmt.Sprintf("scheduling-example-%d", time.Now().UnixNano())
+		process := startExample(t, buildExample(t, "scheduling"),
+			"-endpoint", engine.endpoint,
+			"-runner-name", runnerName,
+		)
+		waitForRunner(t, engine.endpoint, runnerName, true)
+		actor := createActor(t, engine.endpoint, "scheduled-reminders", runnerName, "restart", nil, nil)
+		waitForActor(t, engine.endpoint, actor.ActorID, false, func(actor actorRecord) bool {
+			return actor.ConnectableTS != nil && actor.DestroyTS == nil
+		})
+
+		type reminderOutput struct {
+			ID          string `json:"id"`
+			ScheduleID  string `json:"scheduleId"`
+			Message     string `json:"message"`
+			ScheduledAt int64  `json:"scheduledAt"`
+			CompletedAt int64  `json:"completedAt"`
+		}
+		first := decodeActionOutput[reminderOutput](t, gatewayAction(
+			t, engine.endpoint, actor.ActorID, "scheduleReminder",
+			[]any{map[string]any{"message": "first", "delayMilliseconds": 35_000}},
+			10*time.Second,
+		), http.StatusOK)
+		second := decodeActionOutput[reminderOutput](t, gatewayAction(
+			t, engine.endpoint, actor.ActorID, "scheduleReminder",
+			[]any{map[string]any{"message": "cancelled", "delayMilliseconds": 55_000}},
+			10*time.Second,
+		), http.StatusOK)
+		if first.ScheduleID == "" || second.ScheduleID == "" || first.ScheduleID == second.ScheduleID {
+			t.Fatalf("created scheduling example reminders = %#v, %#v", first, second)
+		}
+		type scheduleOutput struct {
+			ID     string `json:"id"`
+			Action string `json:"action"`
+			RunAt  int64  `json:"runAt"`
+		}
+		pending := decodeActionOutput[[]scheduleOutput](t, gatewayAction(
+			t, engine.endpoint, actor.ActorID, "getPendingSchedules", []any{struct{}{}}, 10*time.Second,
+		), http.StatusOK)
+		if len(pending) != 2 || pending[0].ID != first.ScheduleID || pending[1].ID != second.ScheduleID {
+			t.Fatalf("scheduling example pending records = %#v", pending)
+		}
+		type cancelOutput struct {
+			Success bool `json:"success"`
+		}
+		cancelled := decodeActionOutput[cancelOutput](t, gatewayAction(
+			t, engine.endpoint, actor.ActorID, "cancelReminder", []any{map[string]string{"id": second.ID}}, 10*time.Second,
+		), http.StatusOK)
+		if !cancelled.Success {
+			t.Fatal("scheduling example did not cancel one reminder")
+		}
+		decodeActionOutput[bool](t, gatewayAction(
+			t, engine.endpoint, actor.ActorID, "sleep", []any{struct{}{}}, 10*time.Second,
+		), http.StatusOK)
+		waitForActor(t, engine.endpoint, actor.ActorID, false, func(actor actorRecord) bool {
+			return actor.ConnectableTS == nil && actor.SleepTS != nil && actor.DestroyTS == nil
+		})
+		eventually(t, 75*time.Second, func() (bool, error) {
+			observed, err := getActor(engine.endpoint, actor.ActorID, false)
+			if err != nil {
+				return false, err
+			}
+			return observed.ConnectableTS != nil && observed.DestroyTS == nil, nil
+		})
+		reminders := decodeActionOutput[[]reminderOutput](t, gatewayAction(
+			t, engine.endpoint, actor.ActorID, "getReminders", []any{struct{}{}}, 10*time.Second,
+		), http.StatusOK)
+		if len(reminders) != 1 || reminders[0].ID != first.ID || reminders[0].CompletedAt < reminders[0].ScheduledAt {
+			t.Fatalf("scheduling example reminders after wake = %#v", reminders)
+		}
+
+		stopExampleCleanly(t, engine.endpoint, runnerName, process)
+	})
+
 	t.Run("per-tenant-database", func(t *testing.T) {
 		runnerName := fmt.Sprintf("per-tenant-database-example-%d", time.Now().UnixNano())
 		process := startExample(t, buildExample(t, "per-tenant-database"),

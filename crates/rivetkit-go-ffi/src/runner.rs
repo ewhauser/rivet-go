@@ -141,7 +141,7 @@ impl RunnerInner {
         if batch.contains_unknown() {
             return Err(ErrorPayload::new(
                 "unknown_command",
-                "CommandBatch contains a command not supported by M5",
+                "CommandBatch contains a command not supported by this ABI",
             ));
         }
         batch

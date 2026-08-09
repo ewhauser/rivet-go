@@ -14,23 +14,24 @@ import (
 type EventKind string
 
 const (
-	EventRunnerConnected    EventKind = "runner_connected"
-	EventRunnerDisconnected EventKind = "runner_disconnected"
-	EventRunnerStopped      EventKind = "runner_stopped"
-	EventActorStart         EventKind = "actor_start"
-	EventActorStop          EventKind = "actor_stop"
-	EventActorAlarm         EventKind = "actor_alarm"
-	EventActorIntentResult  EventKind = "actor_intent_result"
-	EventActionCall         EventKind = "action_call"
-	EventHTTPRequest        EventKind = "http_request"
-	EventHTTPRequestChunk   EventKind = "http_request_chunk"
-	EventHTTPRequestAbort   EventKind = "http_request_abort"
-	EventWSOpen             EventKind = "ws_open"
-	EventWSMessage          EventKind = "ws_message"
-	EventWSClose            EventKind = "ws_close"
-	EventKVResult           EventKind = "kv_result"
-	EventStatePersisted     EventKind = "state_persisted"
-	EventSQLiteResult       EventKind = "sqlite_result"
+	EventRunnerConnected     EventKind = "runner_connected"
+	EventRunnerDisconnected  EventKind = "runner_disconnected"
+	EventRunnerStopped       EventKind = "runner_stopped"
+	EventActorStart          EventKind = "actor_start"
+	EventActorStop           EventKind = "actor_stop"
+	EventActorAlarm          EventKind = "actor_alarm"
+	EventActorIntentResult   EventKind = "actor_intent_result"
+	EventActorScheduleResult EventKind = "actor_schedule_result"
+	EventActionCall          EventKind = "action_call"
+	EventHTTPRequest         EventKind = "http_request"
+	EventHTTPRequestChunk    EventKind = "http_request_chunk"
+	EventHTTPRequestAbort    EventKind = "http_request_abort"
+	EventWSOpen              EventKind = "ws_open"
+	EventWSMessage           EventKind = "ws_message"
+	EventWSClose             EventKind = "ws_close"
+	EventKVResult            EventKind = "kv_result"
+	EventStatePersisted      EventKind = "state_persisted"
+	EventSQLiteResult        EventKind = "sqlite_result"
 )
 
 type CommandKind string
@@ -50,6 +51,11 @@ const (
 	CommandStopIntent        CommandKind = "stop_intent"
 	CommandSetAlarm          CommandKind = "set_alarm"
 	CommandSleepIntent       CommandKind = "sleep_intent"
+	CommandScheduleAfter     CommandKind = "schedule_after"
+	CommandScheduleAt        CommandKind = "schedule_at"
+	CommandScheduleCancel    CommandKind = "schedule_cancel"
+	CommandScheduleGet       CommandKind = "schedule_get"
+	CommandScheduleList      CommandKind = "schedule_list"
 	CommandSaveState         CommandKind = "save_state"
 	CommandKVGet             CommandKind = "kv_get"
 	CommandKVList            CommandKind = "kv_list"
@@ -83,55 +89,59 @@ type EventBatch struct {
 	Events []Event `msgpack:"events"`
 }
 
-// Event is the M5 event union. Fields not selected by Kind are absent from
+// Event is the versioned event union. Fields not selected by Kind are absent from
 // Rust's encoded map and remain zero-valued after decoding.
 type Event struct {
-	Kind             EventKind         `msgpack:"kind"`
-	RunnerID         string            `msgpack:"runner_id,omitempty"`
-	Metadata         map[string]string `msgpack:"metadata,omitempty"`
-	Reason           string            `msgpack:"reason,omitempty"`
-	DrainReport      *DrainReport      `msgpack:"drain_report,omitempty"`
-	AID              string            `msgpack:"aid,omitempty"`
-	Generation       uint64            `msgpack:"gen,omitempty"`
-	Name             string            `msgpack:"name,omitempty"`
-	Key              string            `msgpack:"key,omitempty"`
-	CreateTS         int64             `msgpack:"create_ts,omitempty"`
-	Input            []byte            `msgpack:"input,omitempty"`
-	PersistedState   []byte            `msgpack:"persisted_state,omitempty"`
-	SQLiteSocketPath string            `msgpack:"sqlite_socket_path,omitempty"`
-	KVID             uint64            `msgpack:"kv_id,omitempty"`
-	Value            []byte            `msgpack:"value,omitempty"`
-	Entries          []KVEntry         `msgpack:"entries,omitempty"`
-	StateVersion     uint64            `msgpack:"state_version,omitempty"`
-	Error            *WireError        `msgpack:"error,omitempty"`
-	CallID           uint64            `msgpack:"call_id,omitempty"`
-	Action           string            `msgpack:"action,omitempty"`
-	ActionTimeoutMS  uint32            `msgpack:"timeout_ms,omitempty"`
-	Args             []byte            `msgpack:"args,omitempty"`
-	ConnID           *string           `msgpack:"conn_id,omitempty"`
-	RequestID        uint64            `msgpack:"req_id,omitempty"`
-	Method           string            `msgpack:"method,omitempty"`
-	Path             string            `msgpack:"path,omitempty"`
-	Headers          map[string]string `msgpack:"headers,omitempty"`
-	Body             []byte            `msgpack:"body,omitempty"`
-	Stream           bool              `msgpack:"stream,omitempty"`
-	Finish           bool              `msgpack:"finish,omitempty"`
-	WSID             string            `msgpack:"ws_id,omitempty"`
-	CanHibernate     bool              `msgpack:"can_hibernate,omitempty"`
-	Resumed          bool              `msgpack:"resumed,omitempty"`
-	Data             []byte            `msgpack:"data,omitempty"`
-	Binary           bool              `msgpack:"binary,omitempty"`
-	MessageIndex     uint16            `msgpack:"msg_index,omitempty"`
-	CloseCode        *uint16           `msgpack:"code,omitempty"`
-	AlarmTS          int64             `msgpack:"alarm_ts,omitempty"`
-	OperationID      uint64            `msgpack:"op_id,omitempty"`
-	SQLiteValues     []SQLiteValue     `msgpack:"values,omitempty"`
-	Columns          []string          `msgpack:"columns,omitempty"`
-	RowsAffected     int64             `msgpack:"rows_affected,omitempty"`
-	LastInsertID     *int64            `msgpack:"last_insert_id,omitempty"`
-	ChunkIndex       uint32            `msgpack:"chunk_index,omitempty"`
-	Done             bool              `msgpack:"done,omitempty"`
-	SQLiteRequestID  uint64            `msgpack:"request_id,omitempty"`
+	Kind              EventKind         `msgpack:"kind"`
+	RunnerID          string            `msgpack:"runner_id,omitempty"`
+	Metadata          map[string]string `msgpack:"metadata,omitempty"`
+	Reason            string            `msgpack:"reason,omitempty"`
+	DrainReport       *DrainReport      `msgpack:"drain_report,omitempty"`
+	AID               string            `msgpack:"aid,omitempty"`
+	Generation        uint64            `msgpack:"gen,omitempty"`
+	Name              string            `msgpack:"name,omitempty"`
+	Key               string            `msgpack:"key,omitempty"`
+	CreateTS          int64             `msgpack:"create_ts,omitempty"`
+	Input             []byte            `msgpack:"input,omitempty"`
+	PersistedState    []byte            `msgpack:"persisted_state,omitempty"`
+	SQLiteSocketPath  string            `msgpack:"sqlite_socket_path,omitempty"`
+	KVID              uint64            `msgpack:"kv_id,omitempty"`
+	Value             []byte            `msgpack:"value,omitempty"`
+	Entries           []KVEntry         `msgpack:"entries,omitempty"`
+	StateVersion      uint64            `msgpack:"state_version,omitempty"`
+	Error             *WireError        `msgpack:"error,omitempty"`
+	CallID            uint64            `msgpack:"call_id,omitempty"`
+	Action            string            `msgpack:"action,omitempty"`
+	ActionTimeoutMS   uint32            `msgpack:"timeout_ms,omitempty"`
+	Args              []byte            `msgpack:"args,omitempty"`
+	ConnID            *string           `msgpack:"conn_id,omitempty"`
+	RequestID         uint64            `msgpack:"req_id,omitempty"`
+	Method            string            `msgpack:"method,omitempty"`
+	Path              string            `msgpack:"path,omitempty"`
+	Headers           map[string]string `msgpack:"headers,omitempty"`
+	Body              []byte            `msgpack:"body,omitempty"`
+	Stream            bool              `msgpack:"stream,omitempty"`
+	Finish            bool              `msgpack:"finish,omitempty"`
+	WSID              string            `msgpack:"ws_id,omitempty"`
+	CanHibernate      bool              `msgpack:"can_hibernate,omitempty"`
+	Resumed           bool              `msgpack:"resumed,omitempty"`
+	Data              []byte            `msgpack:"data,omitempty"`
+	Binary            bool              `msgpack:"binary,omitempty"`
+	MessageIndex      uint16            `msgpack:"msg_index,omitempty"`
+	CloseCode         *uint16           `msgpack:"code,omitempty"`
+	AlarmTS           int64             `msgpack:"alarm_ts,omitempty"`
+	OperationID       uint64            `msgpack:"op_id,omitempty"`
+	ScheduleOperation string            `msgpack:"operation,omitempty"`
+	ScheduleID        string            `msgpack:"schedule_id,omitempty"`
+	Cancelled         *bool             `msgpack:"cancelled,omitempty"`
+	Schedules         []ScheduledEvent  `msgpack:"schedules,omitempty"`
+	SQLiteValues      []SQLiteValue     `msgpack:"values,omitempty"`
+	Columns           []string          `msgpack:"columns,omitempty"`
+	RowsAffected      int64             `msgpack:"rows_affected,omitempty"`
+	LastInsertID      *int64            `msgpack:"last_insert_id,omitempty"`
+	ChunkIndex        uint32            `msgpack:"chunk_index,omitempty"`
+	Done              bool              `msgpack:"done,omitempty"`
+	SQLiteRequestID   uint64            `msgpack:"request_id,omitempty"`
 }
 
 type DrainReport struct {
@@ -160,6 +170,15 @@ type KVEntry struct {
 	Value []byte `msgpack:"value"`
 }
 
+// ScheduledEvent is the durable one-shot schedule record returned by the
+// pinned core. Args is the same CBOR argument array delivered to an action.
+type ScheduledEvent struct {
+	ID     string `msgpack:"id"`
+	Action string `msgpack:"action"`
+	Args   []byte `msgpack:"args"`
+	RunAt  int64  `msgpack:"run_at"`
+}
+
 type SQLiteValue struct {
 	Kind    string  `msgpack:"kind"`
 	Integer *int64  `msgpack:"integer,omitempty"`
@@ -172,7 +191,7 @@ type CommandBatch struct {
 	Commands []Command `msgpack:"commands"`
 }
 
-// Command is the M5 command union. All fields are encoded so zero-length keys,
+// Command is the versioned command union. All fields are encoded so zero-length keys,
 // values, state, and generation zero remain distinguishable from a missing
 // required field. Rust ignores fields that do not belong to the selected kind.
 type Command struct {
@@ -209,6 +228,11 @@ type Command struct {
 	ExcludeConn     *string           `msgpack:"exclude_conn"`
 	AlarmTS         *int64            `msgpack:"alarm_ts"`
 	OperationID     uint64            `msgpack:"op_id"`
+	Action          string            `msgpack:"action"`
+	ScheduleArgs    []byte            `msgpack:"schedule_args"`
+	ScheduleID      string            `msgpack:"schedule_id"`
+	DelayMS         uint64            `msgpack:"delay_ms"`
+	RunAt           int64             `msgpack:"run_at"`
 	SQLiteRequestID uint64            `msgpack:"request_id"`
 	SQL             string            `msgpack:"sql"`
 	SQLArgs         []SQLiteValue     `msgpack:"args"`
@@ -288,6 +312,10 @@ func validateEvent(event Event) error {
 		if event.OperationID == 0 {
 			return fmt.Errorf("%s event has invalid op_id", event.Kind)
 		}
+	case EventActorScheduleResult:
+		if err := validateScheduleResult(event); err != nil {
+			return fmt.Errorf("%s event: %w", event.Kind, err)
+		}
 	case EventActionCall:
 		if event.AID == "" || event.CallID == 0 || event.Action == "" || event.ActionTimeoutMS == 0 {
 			return fmt.Errorf("%s event requires aid, call_id, action, and timeout_ms", event.Kind)
@@ -362,6 +390,47 @@ func validateEvent(event Event) error {
 	}
 	if event.Error != nil && (event.Error.Code == "" || event.Error.Message == "") {
 		return fmt.Errorf("%s event has incomplete structured error", event.Kind)
+	}
+	return nil
+}
+
+func validateScheduleResult(event Event) error {
+	if event.OperationID == 0 {
+		return errors.New("invalid op_id")
+	}
+	if event.Error != nil {
+		if event.ScheduleID != "" || event.Cancelled != nil || len(event.Schedules) != 0 {
+			return errors.New("error result contains a success payload")
+		}
+		return nil
+	}
+	switch event.ScheduleOperation {
+	case "create":
+		if event.ScheduleID == "" || event.Cancelled != nil || len(event.Schedules) != 0 {
+			return errors.New("create result requires only schedule_id")
+		}
+	case "cancel":
+		if event.ScheduleID != "" || event.Cancelled == nil || len(event.Schedules) != 0 {
+			return errors.New("cancel result requires only cancelled")
+		}
+	case "get":
+		if event.ScheduleID != "" || event.Cancelled != nil || len(event.Schedules) > 1 {
+			return errors.New("get result requires at most one schedule")
+		}
+	case "list":
+		if event.ScheduleID != "" || event.Cancelled != nil {
+			return errors.New("list result contains an invalid payload")
+		}
+	default:
+		return fmt.Errorf("unknown operation %q", event.ScheduleOperation)
+	}
+	for index, schedule := range event.Schedules {
+		if schedule.ID == "" || schedule.Action == "" {
+			return fmt.Errorf("schedule %d requires id and action", index)
+		}
+		if len(schedule.Args) > 1<<20 {
+			return fmt.Errorf("schedule %d args exceed the one MiB limit", index)
+		}
 	}
 	return nil
 }
