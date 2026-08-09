@@ -136,7 +136,7 @@ instance ID, `gen` = generation; both assigned by core.
 | `WsCloseCmd` | ws_id, code?, reason?, hibernate | — |
 | `Broadcast` | aid, event name, payload, exclude_conn? | — |
 | `SaveState` | aid, gen, state bytes | `StatePersisted` |
-| `KvGet` / `KvList` / `KvPut` / `KvDelete` | kv_id, aid, op payload | `KvResult` |
+| `KvGet` / `KvList` / `KvPut` / `KvDelete` | kv_id, aid, gen, op payload | `KvResult` |
 | `SetAlarm` | op_id, aid, gen, alarm_ts? (null clears) | `ActorIntentResult` after the core schedule operation succeeds or fails |
 | `SleepIntent` | op_id, aid, gen | `ActorIntentResult` after exact-generation admission; eventual `ActorStop` reports eviction |
 | `DestroyIntent` | op_id, aid, gen | `ActorIntentResult` after core atomically accepts exact-generation destruction; eventual `ActorStop` reports permanent destruction |
@@ -912,3 +912,11 @@ work, runs `OnStop`, and emits `ActorStop(reason=destroy)`. Rust removes every
 remaining queue, SQLite, correlation, and managed-work handle and closes raw
 and ActorConnect WebSockets with the normal actor-stop close frame. A destroyed
 actor is terminal and cannot be reawakened.
+
+## M13 generation-fenced actor KV — 2026-08-09
+
+ABI 13 adds the actor generation to every KV command. Rust resolves that exact
+generation and reserves an actor operation across the core KV future, so a
+delayed command cannot mutate a newer generation and stop acknowledgement waits
+for already-admitted KV work. Stale and stopping requests return
+`actor_generation_stale` and `actor_stopping` respectively.

@@ -1059,7 +1059,6 @@ func (s *ActorSession) Save(ctx context.Context, state []byte) error {
 func (s *ActorSession) KVGet(ctx context.Context, key []byte) ([]byte, bool, error) {
 	result, err := s.kv(ctx, wire.Command{
 		Kind: wire.CommandKVGet,
-		AID:  s.AID(),
 		Key:  append([]byte(nil), key...),
 	})
 	if err != nil {
@@ -1076,7 +1075,6 @@ func (s *ActorSession) KVList(
 ) ([]wire.KVEntry, error) {
 	result, err := s.kv(ctx, wire.Command{
 		Kind:    wire.CommandKVList,
-		AID:     s.AID(),
 		Prefix:  append([]byte(nil), prefix...),
 		Reverse: reverse,
 		Limit:   limit,
@@ -1097,7 +1095,6 @@ func (s *ActorSession) KVList(
 func (s *ActorSession) KVPut(ctx context.Context, key, value []byte) error {
 	_, err := s.kv(ctx, wire.Command{
 		Kind:  wire.CommandKVPut,
-		AID:   s.AID(),
 		Key:   append([]byte(nil), key...),
 		Value: append([]byte(nil), value...),
 	})
@@ -1107,7 +1104,6 @@ func (s *ActorSession) KVPut(ctx context.Context, key, value []byte) error {
 func (s *ActorSession) KVDelete(ctx context.Context, key []byte) error {
 	_, err := s.kv(ctx, wire.Command{
 		Kind: wire.CommandKVDelete,
-		AID:  s.AID(),
 		Key:  append([]byte(nil), key...),
 	})
 	return err
@@ -1126,6 +1122,8 @@ func (s *ActorSession) kv(ctx context.Context, command wire.Command) (wire.Event
 	result := make(chan wire.Event, 1)
 	kvID := s.pump.addKVWaiter(result)
 	command.KVID = kvID
+	command.AID = s.identity.aid
+	command.Generation = s.identity.generation
 
 	if err := s.pump.submitInternal(ctx, command); err != nil {
 		s.pump.removeKVWaiter(kvID)

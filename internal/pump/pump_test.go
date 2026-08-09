@@ -2093,6 +2093,99 @@ func TestKVCorrelationErrorAndPendingDrain(t *testing.T) {
 	}
 }
 
+func TestKVCommandsCarryExactActorGeneration(t *testing.T) {
+	defer goleak.VerifyNone(t)
+	runner := newFakeRunner()
+	sessionReady := make(chan *ActorSession, 1)
+	p := NewWithHandlers(runner, map[string]ActorHandler{
+		"kv": lifecycleHandler{start: func(_ context.Context, session *ActorSession, _ wire.Event) (any, error) {
+			sessionReady <- session
+			return nil, nil
+		}},
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() { result <- p.Run(ctx) }()
+	waitPumpStarted(t, p)
+	const generation = 37
+	runner.emit(wire.Event{
+		Kind:       wire.EventActorStart,
+		AID:        "actor-kv-generation",
+		Generation: generation,
+		Name:       "kv",
+	})
+	if command := nextCommand(t, runner); command.Kind != wire.CommandActorStartResult || !command.OK {
+		t.Fatalf("start command kind/status = %q/%t", command.Kind, command.OK)
+	}
+	session := <-sessionReady
+
+	tests := []struct {
+		name string
+		kind wire.CommandKind
+		run  func() error
+	}{
+		{
+			name: "get",
+			kind: wire.CommandKVGet,
+			run: func() error {
+				_, _, err := session.KVGet(context.Background(), []byte("key"))
+				return err
+			},
+		},
+		{
+			name: "list",
+			kind: wire.CommandKVList,
+			run: func() error {
+				_, err := session.KVList(context.Background(), []byte("prefix"), false, nil)
+				return err
+			},
+		},
+		{
+			name: "put",
+			kind: wire.CommandKVPut,
+			run: func() error {
+				return session.KVPut(context.Background(), []byte("key"), []byte("value"))
+			},
+		},
+		{
+			name: "delete",
+			kind: wire.CommandKVDelete,
+			run: func() error {
+				return session.KVDelete(context.Background(), []byte("key"))
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			returned := make(chan error, 1)
+			go func() { returned <- test.run() }()
+			command := nextCommand(t, runner)
+			if command.Kind != test.kind || command.KVID == 0 ||
+				command.AID != "actor-kv-generation" || command.Generation != generation {
+				t.Fatalf("KV command = %#v, want kind %q and exact actor generation", command, test.kind)
+			}
+			runner.emit(wire.Event{Kind: wire.EventKVResult, KVID: command.KVID})
+			if err := <-returned; err != nil {
+				t.Fatalf("KV operation: %v", err)
+			}
+		})
+	}
+
+	runner.emit(wire.Event{
+		Kind:       wire.EventActorStop,
+		AID:        "actor-kv-generation",
+		Generation: generation,
+		Reason:     "destroy",
+	})
+	if command := nextCommand(t, runner); command.Kind != wire.CommandActorStopResult {
+		t.Fatalf("stop command kind = %q", command.Kind)
+	}
+	cancel()
+	if err := <-result; err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+}
+
 func TestKVIDSkipsZeroAndReusesOnlyCompletedID(t *testing.T) {
 	runner := newFakeRunner()
 	sessionReady := make(chan *ActorSession, 1)
