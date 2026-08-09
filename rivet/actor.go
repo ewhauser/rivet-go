@@ -53,6 +53,7 @@ type Context[T any] struct {
 	client        *Client
 	db            *DB
 	kv            *KV
+	schedules     *ActionSchedules
 	state         T
 	saveMu        sync.Mutex
 	connectionsMu sync.Mutex
@@ -135,6 +136,15 @@ func (c *Context[T]) KV() *KV {
 		return nil
 	}
 	return c.kv
+}
+
+// Schedules returns this actor generation's durable one-shot action scheduler.
+// It is independent from the compatibility Schedule/OnAlarm API below.
+func (c *Context[T]) Schedules() *ActionSchedules {
+	if c == nil {
+		return nil
+	}
+	return c.schedules
 }
 
 // Schedule replaces this actor's one durable alarm. The engine wakes a
@@ -253,6 +263,7 @@ func (a *actorAdapter[T]) Start(
 		client:      a.clientForActor(session.AID()),
 		db:          db,
 		kv:          newKV(session),
+		schedules:   newActionSchedules(session, a.definition.Actions),
 		state:       state,
 		connections: make(map[string]*Connection),
 	}

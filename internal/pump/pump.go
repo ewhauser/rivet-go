@@ -197,6 +197,15 @@ type SQLiteResponse struct {
 	LastInsertID *int64
 }
 
+// ScheduledEvent is one pending durable action schedule returned by core.
+// Args contains the action's CBOR argument array.
+type ScheduledEvent struct {
+	ID     string
+	Action string
+	Args   []byte
+	RunAt  int64
+}
+
 type sqliteResponseAssembler struct {
 	response   SQLiteResponse
 	nextChunk  uint32
@@ -416,6 +425,113 @@ func (s *ActorSession) SetAlarm(alarmTS *int64) error {
 	})
 }
 
+// ScheduleAfter creates a durable one-shot action schedule relative to core's
+// current time and waits for the exact actor generation to acknowledge it.
+func (s *ActorSession) ScheduleAfter(
+	ctx context.Context,
+	delay time.Duration,
+	action string,
+	args []byte,
+) (string, error) {
+	if delay < 0 {
+		return "", errors.New("schedule delay is negative")
+	}
+	event, err := s.submitActorOperation(ctx, wire.Command{
+		Kind:         wire.CommandScheduleAfter,
+		DelayMS:      uint64(delay / time.Millisecond),
+		Action:       action,
+		ScheduleArgs: cloneBytesOrEmpty(args),
+	})
+	if err != nil {
+		return "", err
+	}
+	if event.ScheduleOperation != "create" || event.ScheduleID == "" {
+		return "", HandlerError{Code: "schedule_result_invalid", Message: "native create result is incomplete"}
+	}
+	return event.ScheduleID, nil
+}
+
+// ScheduleAt creates a durable one-shot action schedule at a Unix millisecond
+// timestamp and waits for the exact actor generation to acknowledge it.
+func (s *ActorSession) ScheduleAt(
+	ctx context.Context,
+	runAt int64,
+	action string,
+	args []byte,
+) (string, error) {
+	event, err := s.submitActorOperation(ctx, wire.Command{
+		Kind:         wire.CommandScheduleAt,
+		RunAt:        runAt,
+		Action:       action,
+		ScheduleArgs: cloneBytesOrEmpty(args),
+	})
+	if err != nil {
+		return "", err
+	}
+	if event.ScheduleOperation != "create" || event.ScheduleID == "" {
+		return "", HandlerError{Code: "schedule_result_invalid", Message: "native create result is incomplete"}
+	}
+	return event.ScheduleID, nil
+}
+
+func (s *ActorSession) CancelSchedule(ctx context.Context, scheduleID string) (bool, error) {
+	event, err := s.submitActorOperation(ctx, wire.Command{
+		Kind:       wire.CommandScheduleCancel,
+		ScheduleID: scheduleID,
+	})
+	if err != nil {
+		return false, err
+	}
+	if event.ScheduleOperation != "cancel" || event.Cancelled == nil {
+		return false, HandlerError{Code: "schedule_result_invalid", Message: "native cancel result is incomplete"}
+	}
+	return *event.Cancelled, nil
+}
+
+func (s *ActorSession) GetSchedule(
+	ctx context.Context,
+	scheduleID string,
+) (ScheduledEvent, bool, error) {
+	event, err := s.submitActorOperation(ctx, wire.Command{
+		Kind:       wire.CommandScheduleGet,
+		ScheduleID: scheduleID,
+	})
+	if err != nil {
+		return ScheduledEvent{}, false, err
+	}
+	if event.ScheduleOperation != "get" || len(event.Schedules) > 1 {
+		return ScheduledEvent{}, false, HandlerError{Code: "schedule_result_invalid", Message: "native get result is invalid"}
+	}
+	if len(event.Schedules) == 0 {
+		return ScheduledEvent{}, false, nil
+	}
+	return scheduledEvent(event.Schedules[0]), true, nil
+}
+
+func (s *ActorSession) ListSchedules(ctx context.Context) ([]ScheduledEvent, error) {
+	event, err := s.submitActorOperation(ctx, wire.Command{Kind: wire.CommandScheduleList})
+	if err != nil {
+		return nil, err
+	}
+	if event.ScheduleOperation != "list" {
+		return nil, HandlerError{Code: "schedule_result_invalid", Message: "native list result is invalid"}
+	}
+	schedules := make([]ScheduledEvent, len(event.Schedules))
+	for index, event := range event.Schedules {
+		schedules[index] = scheduledEvent(event)
+	}
+	return schedules, nil
+}
+
+func scheduledEvent(event wire.ScheduledEvent) ScheduledEvent {
+	return ScheduledEvent{
+		ID:     event.ID,
+		Action: event.Action,
+		Args:   cloneBytesOrEmpty(event.Args),
+		RunAt:  event.RunAt,
+	}
+}
+
 // Sleep requests engine-managed eviction after already accepted actor work
 // has drained. Hibernatable gateway WebSockets are detached without a
 // disconnect and restored by core in the next generation.
@@ -432,39 +548,59 @@ func (s *ActorSession) Sleep() error {
 }
 
 func (s *ActorSession) submitActorIntent(command wire.Command) error {
+	_, err := s.submitActorOperation(context.Background(), command)
+	return err
+}
+
+func (s *ActorSession) submitActorOperation(ctx context.Context, command wire.Command) (wire.Event, error) {
+	if s == nil || s.pump == nil {
+		return wire.Event{}, errors.New("actor session is unavailable")
+	}
+	if ctx == nil {
+		return wire.Event{}, errors.New("actor operation context is nil")
+	}
+	if err := ctx.Err(); err != nil {
+		return wire.Event{}, err
+	}
+	if !s.isAccepting() {
+		return wire.Event{}, ErrShuttingDown
+	}
 	result := make(chan wire.Event, 1)
 	operationID := s.pump.addActorIntentWaiter(result)
 	command.OperationID = operationID
 	command.AID = s.identity.aid
 	command.Generation = s.identity.generation
-	if err := s.pump.submitInternal(context.Background(), command); err != nil {
+	if err := s.pump.submitInternal(ctx, command); err != nil {
 		s.pump.removeActorIntentWaiter(operationID)
-		return err
+		return wire.Event{}, err
 	}
 	timer := time.NewTimer(s.pump.intentTimeout)
 	defer timer.Stop()
 	select {
 	case event := <-result:
 		if event.Error != nil {
-			return HandlerError{
+			return wire.Event{}, HandlerError{
 				Code:    event.Error.Code,
 				Message: event.Error.Message,
 				Cause:   *event.Error,
 			}
 		}
-		return nil
+		return event, nil
+	case <-ctx.Done():
+		s.pump.abandonActorIntentWaiter(operationID)
+		return wire.Event{}, ctx.Err()
 	case <-timer.C:
 		s.pump.abandonActorIntentWaiter(operationID)
-		return HandlerError{
+		return wire.Event{}, HandlerError{
 			Code:    "actor_intent_timeout",
 			Message: fmt.Sprintf("actor intent was not acknowledged within %s", s.pump.intentTimeout),
 		}
 	case <-s.done:
 		s.pump.abandonActorIntentWaiter(operationID)
-		return ErrShuttingDown
+		return wire.Event{}, ErrShuttingDown
 	case <-s.pump.done:
 		s.pump.abandonActorIntentWaiter(operationID)
-		return ErrShuttingDown
+		return wire.Event{}, ErrShuttingDown
 	}
 }
 
@@ -1710,7 +1846,7 @@ func (p *Pump) handleInternalEvent(event wire.Event) error {
 			return fmt.Errorf("ActorAlarm for unknown actor %s generation %d", event.AID, event.Generation)
 		}
 		worker.mailbox.put(event)
-	case wire.EventActorIntentResult:
+	case wire.EventActorIntentResult, wire.EventActorScheduleResult:
 		p.intentMu.Lock()
 		result := p.intentPending[event.OperationID]
 		delete(p.intentPending, event.OperationID)

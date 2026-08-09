@@ -344,9 +344,13 @@ pin-specific notes in `docs/FFI-BOUNDARY.md`:
   but core's later envoy queue exposes no buffered-byte gauge.
 - Broadcast uses core subscriptions plus the pin's CBOR actor-connect envelope
   for raw WebSockets. Zero-recipient broadcast is a successful no-op.
-- One durable Go alarm exists per actor. Alarm mutation completion includes a
-  four-second pinned transport settlement; the engine workflow worker polls on
-  a 16-second tick, so alarm delivery is not a low-latency timer guarantee.
+- One compatibility `OnAlarm` alarm exists per actor. Separately,
+  `Context.Schedules` exposes the pinned core's multiple durable one-shot
+  action schedules with independent IDs. Schedule and alarm mutation
+  completion includes a four-second pinned transport settlement; the engine
+  workflow worker polls on a 16-second tick, so delivery is not a low-latency
+  timer guarantee. Core caps pending schedules at 1,000 per actor, and the Go
+  boundary caps a returned list at 32 MiB of record data.
 - A hibernatable WebSocket message holds the native callback until Go returns
   its FIFO acknowledgement, with a 60-second bound. Frames accepted in the
   sleep-intent gap finish on the old generation; later frames wake the new

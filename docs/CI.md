@@ -40,7 +40,7 @@ with `fail-on-cache-miss`, so they never start independent source builds. The
 first run for a new key pays the build cost once; later runs normally verify a
 cache hit in seconds.
 
-Conformance passes `-timeout=25m` explicitly because the complete ABI-8,
+Conformance passes `-timeout=25m` explicitly because the complete ABI-9,
 race-enabled suite can exceed Go's default ten-minute alarm. The job timeout
 leaves ten more minutes for checkout, cache restore, package setup, and log
 upload.

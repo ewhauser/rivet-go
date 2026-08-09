@@ -120,6 +120,18 @@ pub(crate) enum Event {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         error: Option<WireError>,
     },
+    ActorScheduleResult {
+        op_id: u64,
+        operation: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        schedule_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cancelled: Option<bool>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        schedules: Vec<ScheduledEvent>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<WireError>,
+    },
     ActionCall {
         aid: String,
         r#gen: u64,
@@ -263,6 +275,15 @@ pub(crate) struct KvEntry {
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub(crate) struct ScheduledEvent {
+    pub id: String,
+    pub action: String,
+    #[serde(with = "serde_bytes")]
+    pub args: Vec<u8>,
+    pub run_at: i64,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct CommandBatch {
     pub commands: Vec<Command>,
@@ -359,6 +380,46 @@ pub(crate) enum Command {
         alarm_ts: Option<i64>,
     },
     SleepIntent {
+        op_id: u64,
+        aid: String,
+        #[serde(default)]
+        r#gen: u64,
+    },
+    ScheduleAfter {
+        op_id: u64,
+        aid: String,
+        #[serde(default)]
+        r#gen: u64,
+        delay_ms: u64,
+        action: String,
+        #[serde(with = "serde_bytes")]
+        schedule_args: Vec<u8>,
+    },
+    ScheduleAt {
+        op_id: u64,
+        aid: String,
+        #[serde(default)]
+        r#gen: u64,
+        run_at: i64,
+        action: String,
+        #[serde(with = "serde_bytes")]
+        schedule_args: Vec<u8>,
+    },
+    ScheduleCancel {
+        op_id: u64,
+        aid: String,
+        #[serde(default)]
+        r#gen: u64,
+        schedule_id: String,
+    },
+    ScheduleGet {
+        op_id: u64,
+        aid: String,
+        #[serde(default)]
+        r#gen: u64,
+        schedule_id: String,
+    },
+    ScheduleList {
         op_id: u64,
         aid: String,
         #[serde(default)]
@@ -651,6 +712,58 @@ impl CommandBatch {
                         return Err("actor intent op_id must not be zero".to_owned());
                     }
                 }
+                Command::ScheduleAfter {
+                    op_id,
+                    aid,
+                    action,
+                    schedule_args,
+                    ..
+                }
+                | Command::ScheduleAt {
+                    op_id,
+                    aid,
+                    action,
+                    schedule_args,
+                    ..
+                } => {
+                    require_schedule_operation(*op_id, aid)?;
+                    if action.trim().is_empty() {
+                        return Err("scheduled action must not be empty".to_owned());
+                    }
+                    if action == "__rivet_go_alarm" {
+                        return Err("scheduled action name is reserved".to_owned());
+                    }
+                    if action.len() > MAX_BODY_CHUNK || schedule_args.len() > MAX_BODY_CHUNK {
+                        return Err(format!(
+                            "scheduled action and args must not exceed {MAX_BODY_CHUNK} bytes"
+                        ));
+                    }
+                    let args: ciborium::Value = ciborium::from_reader(schedule_args.as_slice())
+                        .map_err(|error| format!("scheduled args must be CBOR: {error}"))?;
+                    if !matches!(args, ciborium::Value::Array(_)) {
+                        return Err("scheduled args must be a CBOR argument array".to_owned());
+                    }
+                }
+                Command::ScheduleCancel {
+                    op_id,
+                    aid,
+                    schedule_id,
+                    ..
+                }
+                | Command::ScheduleGet {
+                    op_id,
+                    aid,
+                    schedule_id,
+                    ..
+                } => {
+                    require_schedule_operation(*op_id, aid)?;
+                    if schedule_id.is_empty() || schedule_id.len() > MAX_BODY_CHUNK {
+                        return Err("schedule_id must be non-empty and at most one MiB".to_owned());
+                    }
+                }
+                Command::ScheduleList { op_id, aid, .. } => {
+                    require_schedule_operation(*op_id, aid)?;
+                }
                 Command::KvGet { kv_id, aid, .. }
                 | Command::KvPut { kv_id, aid, .. }
                 | Command::KvDelete { kv_id, aid, .. } => {
@@ -733,6 +846,11 @@ fn require_sqlite_request(request_id: u64, aid: &str, deadline_ms: u32) -> Resul
         return Err("sqlite request deadline_ms must be greater than zero".to_owned());
     }
     Ok(())
+}
+
+fn require_schedule_operation(op_id: u64, aid: &str) -> Result<(), String> {
+    require_aid(aid)?;
+    require_correlation("schedule", op_id)
 }
 
 fn require_sql(sql: &str, args: &[SqliteValue]) -> Result<(), String> {
@@ -889,6 +1007,12 @@ mod tests {
         exclude_conn: Option<&'static str>,
         alarm_ts: Option<i64>,
         op_id: u64,
+        action: &'static str,
+        #[serde(with = "optional_bytes")]
+        schedule_args: Option<Vec<u8>>,
+        schedule_id: &'static str,
+        delay_ms: u64,
+        run_at: i64,
         request_id: u64,
         sql: &'static str,
         args: Vec<SqliteValue>,
@@ -937,6 +1061,11 @@ mod tests {
             exclude_conn: None,
             alarm_ts: None,
             op_id: 0,
+            action: "",
+            schedule_args: None,
+            schedule_id: "",
+            delay_ms: 0,
+            run_at: 0,
             request_id: 0,
             sql: "",
             args: Vec::new(),
@@ -1116,6 +1245,27 @@ mod tests {
             &actor_intent_result
                 .encode()
                 .expect("encode actor intent result event"),
+        );
+
+        let schedule_result = EventBatch {
+            seq: 20,
+            events: vec![Event::ActorScheduleResult {
+                op_id: 61,
+                operation: "list".to_owned(),
+                schedule_id: None,
+                cancelled: None,
+                schedules: vec![ScheduledEvent {
+                    id: "schedule-golden".to_owned(),
+                    action: "remind".to_owned(),
+                    args: vec![0x81, 0x01],
+                    run_at: 1_788_500_000_000,
+                }],
+                error: None,
+            }],
+        };
+        write_golden(
+            "event_actor_schedule_result.msgpack",
+            &schedule_result.encode().expect("encode schedule result"),
         );
 
         let action_call = EventBatch {
@@ -1442,6 +1592,45 @@ mod tests {
             .expect("Rust command decoder accepts the full Go M7 command shape");
         assert_eq!(decoded.commands.len(), 5);
         write_golden("command_m7.msgpack", &command_m7);
+
+        let mut schedule_after = golden_command("schedule_after");
+        schedule_after.r#gen = 9;
+        schedule_after.op_id = 61;
+        schedule_after.delay_ms = 1_500;
+        schedule_after.action = "remind";
+        schedule_after.schedule_args = Some(vec![0x81, 0x01]);
+        let mut schedule_at = golden_command("schedule_at");
+        schedule_at.r#gen = 9;
+        schedule_at.op_id = 62;
+        schedule_at.run_at = 1_788_500_000_000;
+        schedule_at.action = "remind";
+        schedule_at.schedule_args = Some(vec![0x81, 0x02]);
+        let mut schedule_cancel = golden_command("schedule_cancel");
+        schedule_cancel.r#gen = 9;
+        schedule_cancel.op_id = 63;
+        schedule_cancel.schedule_id = "schedule-golden";
+        let mut schedule_get = golden_command("schedule_get");
+        schedule_get.r#gen = 9;
+        schedule_get.op_id = 64;
+        schedule_get.schedule_id = "schedule-golden";
+        let mut schedule_list = golden_command("schedule_list");
+        schedule_list.r#gen = 9;
+        schedule_list.op_id = 65;
+        let command_m9 = rmp_serde::to_vec_named(&GoldenCommandBatch {
+            commands: vec![
+                schedule_after,
+                schedule_at,
+                schedule_cancel,
+                schedule_get,
+                schedule_list,
+            ],
+        })
+        .expect("encode M9 command batch");
+        let decoded = CommandBatch::decode(&command_m9)
+            .expect("Rust command decoder accepts the full Go M9 command shape");
+        decoded.validate().expect("M9 command batch is valid");
+        assert_eq!(decoded.commands.len(), 5);
+        write_golden("command_m9.msgpack", &command_m9);
     }
 
     #[test]
@@ -1498,6 +1687,59 @@ mod tests {
             }],
         };
         assert!(batch.validate().is_err());
+    }
+
+    #[test]
+    fn schedule_command_validation_requires_registered_shape() {
+        let valid = Command::ScheduleAfter {
+            op_id: 1,
+            aid: "actor".to_owned(),
+            r#gen: 2,
+            delay_ms: 100,
+            action: "run".to_owned(),
+            schedule_args: vec![0x81, 0x01],
+        };
+        CommandBatch {
+            commands: vec![valid.clone()],
+        }
+        .validate()
+        .expect("valid schedule command");
+
+        let invalid = [
+            Command::ScheduleAfter {
+                op_id: 0,
+                aid: "actor".to_owned(),
+                r#gen: 2,
+                delay_ms: 100,
+                action: "run".to_owned(),
+                schedule_args: vec![0x81, 0x01],
+            },
+            Command::ScheduleAfter {
+                op_id: 1,
+                aid: "actor".to_owned(),
+                r#gen: 2,
+                delay_ms: 100,
+                action: "__rivet_go_alarm".to_owned(),
+                schedule_args: vec![0x81, 0x01],
+            },
+            Command::ScheduleAfter {
+                op_id: 1,
+                aid: "actor".to_owned(),
+                r#gen: 2,
+                delay_ms: 100,
+                action: "run".to_owned(),
+                schedule_args: vec![0x01],
+            },
+        ];
+        for command in invalid {
+            assert!(
+                CommandBatch {
+                    commands: vec![command]
+                }
+                .validate()
+                .is_err()
+            );
+        }
     }
 
     #[test]

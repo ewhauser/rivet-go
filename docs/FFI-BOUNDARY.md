@@ -105,6 +105,7 @@ instance ID, `gen` = generation; both assigned by core.
 | `ActorStop` | aid, gen, reason (stop cmd / sleep intent / drain) | `ActorStopResult { aid, gen }` after handler cleanup |
 | `ActorAlarm` | aid, gen, alarm_ts | `AlarmHandled { aid, gen }` |
 | `ActorIntentResult` | op_id, error? | completes the matching `SetAlarm` or `SleepIntent` admission |
+| `ActorScheduleResult` | op_id, operation, schedule_id?, cancelled?, schedules[], error? | completes the matching one-shot schedule create, cancel, get, or list operation |
 | `ActionCall` | aid, gen, call_id, action name, timeout_ms, args (raw bytes: JSON/CBOR per client encoding), conn_id | `ActionResult { call_id, output / error }` |
 | `HttpRequest` | aid, req_id, method, path, headers, body?, stream flag | `HttpResponseStart` (+ chunks) |
 | `HttpRequestChunk` | req_id, body, finish | — (feeds request body reader) |
@@ -130,6 +131,9 @@ instance ID, `gen` = generation; both assigned by core.
 | `KvGet` / `KvList` / `KvPut` / `KvDelete` | kv_id, aid, op payload | `KvResult` |
 | `SetAlarm` | op_id, aid, gen, alarm_ts? (null clears) | `ActorIntentResult` after the core schedule operation succeeds or fails |
 | `SleepIntent` | op_id, aid, gen | `ActorIntentResult` after exact-generation admission; eventual `ActorStop` reports eviction |
+| `ScheduleAfter` / `ScheduleAt` | op_id, aid, gen, action, CBOR argument array, duration or absolute timestamp | `ActorScheduleResult` with a stable schedule ID |
+| `ScheduleCancel` / `ScheduleGet` | op_id, aid, gen, schedule ID | `ActorScheduleResult` with a boolean or zero/one pending record |
+| `ScheduleList` | op_id, aid, gen | `ActorScheduleResult` with pending records in run order |
 | `StopIntent` | aid | eventual `ActorStop` |
 | `SqliteExec` / `SqliteQuery` | request_id, aid, gen, deadline_ms, SQL, typed args, lease_key? | one or more ordered `SqliteResult` events |
 | `SqliteBegin` | request_id, aid, gen, deadline_ms, lease_key, timeout_ms | `SqliteResult` |
@@ -784,5 +788,21 @@ vbare hello, `ServerFrame`/`ResponsePayload` variants, structured socket error
 metadata, column strings, row/value lists, and optional last-insert ID from the
 vendored BARE schema. ABI 8 adds only the bounded string-to-boolean
 `actor_databases` manifest map; it adds no command, event, blob, nested
-container, or native allocation ownership surface. No fuzz or deliberately
-malformed-input test was added.
+container, or native allocation ownership surface. ABI 9 adds five bounded
+schedule commands and `ActorScheduleResult`. A pending record contains an ID,
+action, CBOR argument array, and millisecond timestamp. Individual strings and
+argument blobs retain the one MiB scanner limit, lists contain at most 1,000
+records, and Rust rejects aggregate returned record data above 32 MiB before
+encoding an event.
+
+ABI 9 delegates schedule storage and wake delivery to the pinned core's
+`ActorContext::after`, `at`, `cancel_schedule`, `get_scheduled_event`, and
+`list_scheduled_events` methods. Mutations are exact-generation operations and
+remain in the actor work gate until core has committed the SQLite schedule and
+the existing four-second signal-settlement window has elapsed. A following
+`SleepIntent` therefore cannot overtake an accepted schedule mutation.
+Scheduled work arrives from core as the ordinary `ActorEvent::Action` path;
+the Go adapter applies the same deadline, panic isolation, structured error,
+and automatic state-save rules as a client-dispatched action. The reserved
+`__rivet_go_alarm` row is excluded from public get/list results, so the
+replaceable `OnAlarm` compatibility API remains independent.
