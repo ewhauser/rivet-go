@@ -51,6 +51,11 @@ RkSubmitResult rk_runner_submit(RkRunner* r, const uint8_t* batch, uintptr_t len
 RkSubmitResult rk_runner_shutdown(RkRunner* r, uint32_t deadline_ms);
 ```
 
+The pinned core uses a process-global envoy registration. Go therefore permits
+only one live `RkRunner` wrapper per process: a second `NewRunner` call fails
+before entering native code, and the process lease is released when the first
+wrapper closes (including finalizer cleanup).
+
 Result structs follow the gomonty convention — `{ payload: RkBytes, err: RkError* }`
 with `rk_error_json()` / `rk_error_free()` accessors. Every extern fn body is
 wrapped in `catch_unwind`; a Rust panic becomes an `internal_panic` error, never

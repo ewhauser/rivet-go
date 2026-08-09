@@ -270,6 +270,11 @@ clients outside a runner.
 returning. Services that already manage process signals can use
 `Registry.Serve` with their own context.
 
+Only one registry may serve at a time in a process. The pinned native runtime
+uses a process-global engine registration, so starting another registry before
+the first one finishes returns an error instead of silently sharing the first
+registry's actor manifest and lifecycle.
+
 ## Documentation
 
 - [Operations](docs/OPERATIONS.md): deployment, shutdown, SQLite, logging,
