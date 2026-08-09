@@ -909,6 +909,66 @@ func TestPortedRunnableExamples(t *testing.T) {
 		stopExampleCleanly(t, engine.endpoint, runnerName, process)
 	})
 
+	t.Run("ai-agent", func(t *testing.T) {
+		runnerName := fmt.Sprintf("ai-agent-example-%d", time.Now().UnixNano())
+		process := startExample(t, buildExample(t, "ai-agent"),
+			"-endpoint", engine.endpoint,
+			"-runner-name", runnerName,
+		)
+		waitForRunner(t, engine.endpoint, runnerName, true)
+		actorRecord := createActor(t, engine.endpoint, "ai-agent", runnerName, "restart", nil, nil)
+		client, err := rivet.NewClient(rivet.ClientConfig{
+			Endpoint: engine.endpoint, RunnerName: runnerName, Token: "dev",
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		actor, err := client.Get(context.Background(), actorRecord.ActorID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		type promptRequest struct {
+			ID      string `json:"id"`
+			Content string `json:"content"`
+		}
+		type agentMessage struct {
+			RequestID string `json:"requestId"`
+			Role      string `json:"role"`
+			Content   string `json:"content"`
+		}
+		type promptResult struct {
+			RequestID string `json:"requestId"`
+			Content   string `json:"content"`
+		}
+		created, err := rivet.Call[promptRequest](context.Background(), actor, "sendMessage", promptRequest{
+			Content: "hello from the action",
+		})
+		if err != nil || created.ID == "" || created.Content != "hello from the action" {
+			t.Fatalf("enqueue agent prompt = %#v, %v", created, err)
+		}
+		eventually(t, 10*time.Second, func() (bool, error) {
+			messages, callErr := rivet.Call[[]agentMessage](context.Background(), actor, "getMessages", struct{}{})
+			if callErr != nil {
+				return false, callErr
+			}
+			return len(messages) == 2 && messages[0].Role == "user" &&
+				messages[1].Role == "assistant" && messages[1].Content == "Echo: hello from the action", nil
+		})
+		waited, err := actor.Queue().SendAndWait(context.Background(), "prompts", promptRequest{
+			ID: "conformance-direct", Content: "hello from the queue",
+		}, 10*time.Second)
+		if err != nil || waited.Status != rivet.ActorQueueCompleted {
+			t.Fatalf("direct agent queue = %#v, %v", waited, err)
+		}
+		var reply promptResult
+		if err := waited.DecodeResponse(&reply); err != nil || reply.RequestID != "conformance-direct" ||
+			reply.Content != "Echo: hello from the queue" {
+			t.Fatalf("direct agent reply = %#v, %v", reply, err)
+		}
+
+		stopExampleCleanly(t, engine.endpoint, runnerName, process)
+	})
+
 	t.Run("cursors", func(t *testing.T) {
 		runnerName := fmt.Sprintf("cursors-example-%d", time.Now().UnixNano())
 		process := startExample(t, buildExample(t, "cursors"),

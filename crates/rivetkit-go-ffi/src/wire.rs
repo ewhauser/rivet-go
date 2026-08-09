@@ -134,6 +134,20 @@ pub(crate) enum Event {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         error: Option<WireError>,
     },
+    ActorQueueResult {
+        op_id: u64,
+        queue_operation: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message: Option<QueueMessage>,
+        #[serde(
+            default,
+            with = "optional_bytes",
+            skip_serializing_if = "Option::is_none"
+        )]
+        response: Option<Vec<u8>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<WireError>,
+    },
     ConnectionPreflight {
         aid: String,
         r#gen: u64,
@@ -319,6 +333,16 @@ pub(crate) struct ScheduledEvent {
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub(crate) struct QueueMessage {
+    pub id: u64,
+    pub name: String,
+    #[serde(with = "serde_bytes")]
+    pub body: Vec<u8>,
+    pub created_at: i64,
+    pub completable: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct CommandBatch {
     pub commands: Vec<Command>,
@@ -332,10 +356,19 @@ pub(crate) enum Command {
         #[serde(default)]
         r#gen: u64,
         ok: bool,
+        #[serde(default)]
+        run: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         error: Option<WireError>,
     },
     ActorStopResult {
+        aid: String,
+        #[serde(default)]
+        r#gen: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<WireError>,
+    },
+    ActorRunResult {
         aid: String,
         #[serde(default)]
         r#gen: u64,
@@ -469,6 +502,71 @@ pub(crate) enum Command {
         #[serde(default)]
         r#gen: u64,
     },
+    QueueSend {
+        op_id: u64,
+        aid: String,
+        #[serde(default)]
+        r#gen: u64,
+        name: String,
+        #[serde(with = "serde_bytes")]
+        body: Vec<u8>,
+    },
+    QueueEnqueueWait {
+        op_id: u64,
+        aid: String,
+        #[serde(default)]
+        r#gen: u64,
+        name: String,
+        #[serde(with = "serde_bytes")]
+        body: Vec<u8>,
+        queue_timeout_ms: Option<u64>,
+    },
+    QueueNext {
+        op_id: u64,
+        aid: String,
+        #[serde(default)]
+        r#gen: u64,
+        #[serde(default)]
+        names: Vec<String>,
+        queue_timeout_ms: Option<u64>,
+        completable: bool,
+    },
+    QueueComplete {
+        op_id: u64,
+        aid: String,
+        #[serde(default)]
+        r#gen: u64,
+        message_id: u64,
+        #[serde(default, with = "optional_bytes")]
+        response: Option<Vec<u8>>,
+    },
+    QueueRetry {
+        op_id: u64,
+        aid: String,
+        #[serde(default)]
+        r#gen: u64,
+        message_id: u64,
+    },
+    QueueCancel {
+        aid: String,
+        #[serde(default)]
+        r#gen: u64,
+        target_op_id: u64,
+    },
+    ManagedWorkBegin {
+        op_id: u64,
+        aid: String,
+        #[serde(default)]
+        r#gen: u64,
+        work_id: u64,
+        work_kind: String,
+    },
+    ManagedWorkEnd {
+        aid: String,
+        #[serde(default)]
+        r#gen: u64,
+        work_id: u64,
+    },
     SaveState {
         aid: String,
         #[serde(default)]
@@ -598,7 +696,13 @@ impl CommandBatch {
         const MAX_HTTP_HEADERS: usize = 256;
         for command in &self.commands {
             match command {
-                Command::ActorStartResult { aid, ok, error, .. } => {
+                Command::ActorStartResult {
+                    aid,
+                    ok,
+                    run,
+                    error,
+                    ..
+                } => {
                     require_aid(aid)?;
                     if *ok == error.is_some() {
                         return Err(
@@ -606,9 +710,18 @@ impl CommandBatch {
                                 .to_owned(),
                         );
                     }
+                    if !*ok && *run {
+                        return Err(
+                            "actor_start_result cannot start Run after startup failure".to_owned()
+                        );
+                    }
                     require_wire_error(error.as_ref())?;
                 }
                 Command::ActorStopResult { aid, error, .. } => {
+                    require_aid(aid)?;
+                    require_wire_error(error.as_ref())?;
+                }
+                Command::ActorRunResult { aid, error, .. } => {
                     require_aid(aid)?;
                     require_wire_error(error.as_ref())?;
                 }
@@ -830,6 +943,98 @@ impl CommandBatch {
                 Command::ScheduleList { op_id, aid, .. } => {
                     require_schedule_operation(*op_id, aid)?;
                 }
+                Command::QueueSend {
+                    op_id,
+                    aid,
+                    name,
+                    body,
+                    ..
+                }
+                | Command::QueueEnqueueWait {
+                    op_id,
+                    aid,
+                    name,
+                    body,
+                    ..
+                } => {
+                    require_queue_operation(*op_id, aid)?;
+                    require_queue_name(name)?;
+                    if body.len() > MAX_BODY_CHUNK {
+                        return Err(format!(
+                            "queue body exceeds boundary maximum {MAX_BODY_CHUNK} bytes"
+                        ));
+                    }
+                }
+                Command::QueueNext {
+                    op_id, aid, names, ..
+                } => {
+                    require_queue_operation(*op_id, aid)?;
+                    if names.len() > 1_024 {
+                        return Err("queue next names exceed boundary maximum 1024".to_owned());
+                    }
+                    for name in names {
+                        require_queue_name(name)?;
+                    }
+                }
+                Command::QueueComplete {
+                    op_id,
+                    aid,
+                    message_id,
+                    response,
+                    ..
+                } => {
+                    require_queue_operation(*op_id, aid)?;
+                    if *message_id == 0 {
+                        return Err("queue complete message_id must not be zero".to_owned());
+                    }
+                    if response
+                        .as_ref()
+                        .is_some_and(|response| response.len() > MAX_BODY_CHUNK)
+                    {
+                        return Err(format!(
+                            "queue response exceeds boundary maximum {MAX_BODY_CHUNK} bytes"
+                        ));
+                    }
+                }
+                Command::QueueRetry {
+                    op_id,
+                    aid,
+                    message_id,
+                    ..
+                } => {
+                    require_queue_operation(*op_id, aid)?;
+                    if *message_id == 0 {
+                        return Err("queue retry message_id must not be zero".to_owned());
+                    }
+                }
+                Command::QueueCancel {
+                    aid, target_op_id, ..
+                } => {
+                    require_aid(aid)?;
+                    require_correlation("queue cancel", *target_op_id)?;
+                }
+                Command::ManagedWorkBegin {
+                    op_id,
+                    aid,
+                    work_id,
+                    work_kind,
+                    ..
+                } => {
+                    require_correlation("managed work", *op_id)?;
+                    require_aid(aid)?;
+                    if *work_id == 0 {
+                        return Err("managed work ID must not be zero".to_owned());
+                    }
+                    if !matches!(work_kind.as_str(), "wait_until" | "keep_awake") {
+                        return Err("managed work kind is invalid".to_owned());
+                    }
+                }
+                Command::ManagedWorkEnd { aid, work_id, .. } => {
+                    require_aid(aid)?;
+                    if *work_id == 0 {
+                        return Err("managed work ID must not be zero".to_owned());
+                    }
+                }
                 Command::KvGet { kv_id, aid, .. }
                 | Command::KvPut { kv_id, aid, .. }
                 | Command::KvDelete { kv_id, aid, .. } => {
@@ -910,6 +1115,18 @@ fn require_connection_state(state: Option<&[u8]>) -> Result<(), String> {
         return Err(format!(
             "connection state exceeds boundary maximum {MAX_BODY_CHUNK} bytes"
         ));
+    }
+    Ok(())
+}
+
+fn require_queue_operation(op_id: u64, aid: &str) -> Result<(), String> {
+    require_aid(aid)?;
+    require_correlation("queue", op_id)
+}
+
+fn require_queue_name(name: &str) -> Result<(), String> {
+    if name.trim().is_empty() || name.len() > MAX_BODY_CHUNK {
+        return Err("queue name must be non-empty and at most one MiB".to_owned());
     }
     Ok(())
 }
@@ -1045,6 +1262,7 @@ mod tests {
         aid: &'static str,
         r#gen: u64,
         ok: bool,
+        run: bool,
         error: Option<WireError>,
         #[serde(with = "optional_bytes")]
         state: Option<Vec<u8>>,
@@ -1085,6 +1303,7 @@ mod tests {
         alarm_ts: Option<i64>,
         op_id: u64,
         action: &'static str,
+        name: &'static str,
         #[serde(with = "optional_bytes")]
         schedule_args: Option<Vec<u8>>,
         schedule_id: &'static str,
@@ -1096,6 +1315,15 @@ mod tests {
         lease_key: Option<&'static str>,
         deadline_ms: u32,
         timeout_ms: u64,
+        queue_timeout_ms: Option<u64>,
+        names: Vec<String>,
+        completable: bool,
+        message_id: u64,
+        #[serde(with = "optional_bytes")]
+        response: Option<Vec<u8>>,
+        target_op_id: u64,
+        work_id: u64,
+        work_kind: &'static str,
     }
 
     #[derive(Serialize)]
@@ -1109,6 +1337,7 @@ mod tests {
             aid: "actor-golden",
             r#gen: 0,
             ok: false,
+            run: false,
             error: None,
             state: None,
             kv_id: 0,
@@ -1140,6 +1369,7 @@ mod tests {
             alarm_ts: None,
             op_id: 0,
             action: "",
+            name: "",
             schedule_args: None,
             schedule_id: "",
             delay_ms: 0,
@@ -1150,6 +1380,14 @@ mod tests {
             lease_key: None,
             deadline_ms: 0,
             timeout_ms: 0,
+            queue_timeout_ms: None,
+            names: Vec::new(),
+            completable: false,
+            message_id: 0,
+            response: None,
+            target_op_id: 0,
+            work_id: 0,
+            work_kind: "",
         }
     }
 
@@ -1359,6 +1597,27 @@ mod tests {
         write_golden(
             "event_actor_schedule_result.msgpack",
             &schedule_result.encode().expect("encode schedule result"),
+        );
+
+        let queue_result = EventBatch {
+            seq: 24,
+            events: vec![Event::ActorQueueResult {
+                op_id: 81,
+                queue_operation: "next".to_owned(),
+                message: Some(QueueMessage {
+                    id: 9,
+                    name: "message".to_owned(),
+                    body: vec![0xa1, 0x61, 0x78, 0x01],
+                    created_at: 1_788_500_000_000,
+                    completable: true,
+                }),
+                response: None,
+                error: None,
+            }],
+        };
+        write_golden(
+            "event_actor_queue_result.msgpack",
+            &queue_result.encode().expect("encode queue result"),
         );
 
         let action_call = EventBatch {
@@ -1794,6 +2053,64 @@ mod tests {
         decoded.validate().expect("M10 command batch is valid");
         assert_eq!(decoded.commands.len(), 2);
         write_golden("command_m10.msgpack", &command_m10);
+
+        let mut run_result = golden_command("actor_run_result");
+        run_result.r#gen = 11;
+        let mut queue_send = golden_command("queue_send");
+        queue_send.r#gen = 11;
+        queue_send.op_id = 81;
+        queue_send.name = "message";
+        queue_send.body = Some(vec![0xa1, 0x61, 0x78, 0x01]);
+        let mut queue_wait = golden_command("queue_enqueue_wait");
+        queue_wait.r#gen = 11;
+        queue_wait.op_id = 82;
+        queue_wait.name = "message";
+        queue_wait.body = Some(vec![0xf6]);
+        queue_wait.queue_timeout_ms = Some(5_000);
+        let mut queue_next = golden_command("queue_next");
+        queue_next.r#gen = 11;
+        queue_next.op_id = 83;
+        queue_next.names = vec!["message".to_owned()];
+        queue_next.completable = true;
+        let mut queue_complete = golden_command("queue_complete");
+        queue_complete.r#gen = 11;
+        queue_complete.op_id = 84;
+        queue_complete.message_id = 9;
+        queue_complete.response = Some(vec![0xf5]);
+        let mut queue_retry = golden_command("queue_retry");
+        queue_retry.r#gen = 11;
+        queue_retry.op_id = 85;
+        queue_retry.message_id = 9;
+        let mut queue_cancel = golden_command("queue_cancel");
+        queue_cancel.r#gen = 11;
+        queue_cancel.target_op_id = 83;
+        let mut wait_until = golden_command("managed_work_begin");
+        wait_until.r#gen = 11;
+        wait_until.op_id = 86;
+        wait_until.work_id = 1;
+        wait_until.work_kind = "wait_until";
+        let mut work_end = golden_command("managed_work_end");
+        work_end.r#gen = 11;
+        work_end.work_id = 1;
+        let command_m11 = rmp_serde::to_vec_named(&GoldenCommandBatch {
+            commands: vec![
+                run_result,
+                queue_send,
+                queue_wait,
+                queue_next,
+                queue_complete,
+                queue_retry,
+                queue_cancel,
+                wait_until,
+                work_end,
+            ],
+        })
+        .expect("encode M11 command batch");
+        let decoded = CommandBatch::decode(&command_m11)
+            .expect("Rust command decoder accepts the full Go M11 command shape");
+        decoded.validate().expect("M11 command batch is valid");
+        assert_eq!(decoded.commands.len(), 9);
+        write_golden("command_m11.msgpack", &command_m11);
     }
 
     #[test]
@@ -1846,10 +2163,22 @@ mod tests {
                 aid: "actor".to_owned(),
                 r#gen: 1,
                 ok: true,
+                run: false,
                 error: Some(WireError::new("unexpected", "both result arms")),
             }],
         };
         assert!(batch.validate().is_err());
+
+        let failed_run = CommandBatch {
+            commands: vec![Command::ActorStartResult {
+                aid: "actor".to_owned(),
+                r#gen: 1,
+                ok: false,
+                run: true,
+                error: Some(WireError::new("start_failed", "failed")),
+            }],
+        };
+        assert!(failed_run.validate().is_err());
     }
 
     #[test]

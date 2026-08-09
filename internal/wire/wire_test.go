@@ -67,6 +67,7 @@ func TestRustEventBatchGoldens(t *testing.T) {
 		{"event_actor_alarm.msgpack", EventActorAlarm, 17},
 		{"event_actor_intent_result.msgpack", EventActorIntentResult, 18},
 		{"event_actor_schedule_result.msgpack", EventActorScheduleResult, 20},
+		{"event_actor_queue_result.msgpack", EventActorQueueResult, 24},
 		{"event_connection_preflight.msgpack", EventConnectionPreflight, 21},
 		{"event_connection_open.msgpack", EventConnectionOpen, 22},
 		{"event_connection_close.msgpack", EventConnectionClose, 23},
@@ -110,7 +111,51 @@ func TestRustEventBatchGoldens(t *testing.T) {
 				(batch.Events[0].Connection == nil || batch.Events[0].Connection.ID != "conn-golden") {
 				t.Fatalf("connection lifecycle golden = %#v", batch.Events[0])
 			}
+			if test.kind == EventActorQueueResult &&
+				(batch.Events[0].QueueOperation != "next" || batch.Events[0].QueueMessage == nil ||
+					!batch.Events[0].QueueMessage.Completable) {
+				t.Fatalf("queue result golden = %#v", batch.Events[0])
+			}
 		})
+	}
+}
+
+func TestRustM11CommandBatchGolden(t *testing.T) {
+	data := golden(t, "command_m11.msgpack")
+	var batch CommandBatch
+	if err := decode(data, &batch); err != nil {
+		t.Fatal(err)
+	}
+	want := []CommandKind{
+		CommandActorRunResult,
+		CommandQueueSend,
+		CommandQueueEnqueueWait,
+		CommandQueueNext,
+		CommandQueueComplete,
+		CommandQueueRetry,
+		CommandQueueCancel,
+		CommandManagedWorkBegin,
+		CommandManagedWorkEnd,
+	}
+	if len(batch.Commands) != len(want) {
+		t.Fatalf("command count = %d, want %d", len(batch.Commands), len(want))
+	}
+	for index, kind := range want {
+		if batch.Commands[index].Kind != kind {
+			t.Fatalf("command %d kind = %q, want %q", index, batch.Commands[index].Kind, kind)
+		}
+	}
+	if batch.Commands[1].Name != "message" || batch.Commands[3].Names[0] != "message" ||
+		!batch.Commands[3].Completable || batch.Commands[4].MessageID != 9 ||
+		batch.Commands[7].WorkKind != "wait_until" {
+		t.Fatalf("M11 queue and managed-work commands = %#v", batch.Commands)
+	}
+	encoded, err := EncodeCommandBatch(batch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(encoded, data) {
+		t.Fatal("Go CommandBatch encoding differs from the Rust-generated M11 golden")
 	}
 }
 

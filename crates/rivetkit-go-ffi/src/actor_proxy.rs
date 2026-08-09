@@ -12,14 +12,18 @@ use rivetkit_core::actor::ShutdownKind;
 use rivetkit_core::actor::schedule::ScheduledEventInfo;
 use rivetkit_core::{
     ActionDefinition, ActorConfig, ActorContext, ActorEvent, ActorFactory, ActorStart, BindParam,
-    CanHibernateWebSocket, ColumnValue, ConnHandle, CoreRegistry, ExecuteResult, ListOpts,
-    Response, SqliteTransaction, StateDelta, WebSocket, WsMessage, format_actor_key,
+    CanHibernateWebSocket, ColumnValue, ConnHandle, CoreRegistry, EnqueueAndWaitOpts,
+    ExecuteResult, KeepAwakeRegion, ListOpts, QueueMessage as CoreQueueMessage, QueueNextOpts,
+    QueueSendResult, QueueSendStatus, Response, SqliteTransaction, StateDelta, WebSocket,
+    WsMessage, format_actor_key,
 };
 use serde::{Deserialize, Serialize};
+use tokio_util::sync::CancellationToken;
 
 use crate::correlation::{CorrelationError, CorrelationTable};
 use crate::wire::{
-    Command, Connection as WireConnection, Event, KvEntry, ScheduledEvent, SqliteValue, WireError,
+    Command, Connection as WireConnection, Event, KvEntry, QueueMessage as WireQueueMessage,
+    ScheduledEvent, SqliteValue, WireError,
 };
 
 const LIFECYCLE_RESULT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -70,6 +74,29 @@ struct ConnectionIdentity {
     connection_id: String,
 }
 
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+struct QueueWaitIdentity {
+    actor: ActorIdentity,
+    operation_id: u64,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+struct QueueMessageIdentity {
+    actor: ActorIdentity,
+    message_id: u64,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+struct ManagedWorkIdentity {
+    actor: ActorIdentity,
+    work_id: u64,
+}
+
+enum ManagedWorkHandle {
+    WaitUntil(tokio::sync::oneshot::Sender<()>),
+    KeepAwake(KeepAwakeRegion),
+}
+
 impl ActorIdentity {
     fn new(aid: impl Into<String>, generation: u64) -> Self {
         Self {
@@ -113,6 +140,8 @@ struct ActiveActor {
     state_version: Arc<AtomicU64>,
     operations: ActorOperations,
     alarm_updates: ActorAlarmUpdates,
+    run_active: Arc<AtomicBool>,
+    lifecycle_stopping: Arc<AtomicBool>,
 }
 
 #[derive(Clone, Default)]
@@ -433,6 +462,9 @@ pub(crate) struct ActorProxy {
     runner_draining: Arc<AtomicBool>,
     sqlite_transport: Arc<Mutex<String>>,
     sqlite_transactions: Arc<Mutex<HashMap<SqliteLeaseIdentity, SqliteTransaction>>>,
+    queue_waits: Arc<Mutex<HashMap<QueueWaitIdentity, CancellationToken>>>,
+    queue_messages: Arc<Mutex<HashMap<QueueMessageIdentity, CoreQueueMessage>>>,
+    managed_work: Arc<Mutex<HashMap<ManagedWorkIdentity, ManagedWorkHandle>>>,
 }
 
 impl ActorProxy {
@@ -453,6 +485,9 @@ impl ActorProxy {
             runner_draining: Arc::new(AtomicBool::new(false)),
             sqlite_transport: Arc::new(Mutex::new(String::new())),
             sqlite_transactions: Arc::new(Mutex::new(HashMap::new())),
+            queue_waits: Arc::new(Mutex::new(HashMap::new())),
+            queue_messages: Arc::new(Mutex::new(HashMap::new())),
+            managed_work: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -516,16 +551,37 @@ impl ActorProxy {
                 aid,
                 r#gen: generation,
                 ok: _,
+                run,
                 error,
             } => {
+                let identity = ActorIdentity::new(aid.clone(), generation);
+                if error.is_none()
+                    && run
+                    && let Some(actor) = self.actor_exact(&identity)
+                    && !actor.run_active.swap(true, Ordering::AcqRel)
+                {
+                    actor.ctx.begin_run_handler();
+                }
                 self.pending.resolve(
                     &LifecycleKey {
-                        actor: ActorIdentity::new(aid, generation),
+                        actor: identity,
                         kind: LifecycleKind::Start,
                     },
                     LifecycleResolution { error },
                     &self.correlations,
                 );
+            }
+            Command::ActorRunResult {
+                aid,
+                r#gen: generation,
+                error: _,
+            } => {
+                let identity = ActorIdentity::new(aid, generation);
+                if let Some(actor) = self.actor_exact(&identity) {
+                    if actor.run_active.swap(false, Ordering::AcqRel) {
+                        actor.ctx.end_run_handler();
+                    }
+                }
             }
             Command::ActorStopResult {
                 aid,
@@ -699,6 +755,73 @@ impl ActorProxy {
                 aid,
                 r#gen: generation,
             } => self.dispatch_schedule_list(op_id, aid, generation),
+            Command::QueueSend {
+                op_id,
+                aid,
+                r#gen: generation,
+                name,
+                body,
+            } => self.dispatch_queue_send(op_id, aid, generation, name, body),
+            Command::QueueEnqueueWait {
+                op_id,
+                aid,
+                r#gen: generation,
+                name,
+                body,
+                queue_timeout_ms,
+            } => self.dispatch_queue_enqueue_wait(
+                op_id,
+                aid,
+                generation,
+                name,
+                body,
+                queue_timeout_ms,
+            ),
+            Command::QueueNext {
+                op_id,
+                aid,
+                r#gen: generation,
+                names,
+                queue_timeout_ms,
+                completable,
+            } => self.dispatch_queue_next(
+                op_id,
+                aid,
+                generation,
+                names,
+                queue_timeout_ms,
+                completable,
+            ),
+            Command::QueueComplete {
+                op_id,
+                aid,
+                r#gen: generation,
+                message_id,
+                response,
+            } => self.dispatch_queue_complete(op_id, aid, generation, message_id, response),
+            Command::QueueRetry {
+                op_id,
+                aid,
+                r#gen: generation,
+                message_id,
+            } => self.dispatch_queue_retry(op_id, aid, generation, message_id),
+            Command::QueueCancel {
+                aid,
+                r#gen: generation,
+                target_op_id,
+            } => self.cancel_queue_wait(aid, generation, target_op_id),
+            Command::ManagedWorkBegin {
+                op_id,
+                aid,
+                r#gen: generation,
+                work_id,
+                work_kind,
+            } => self.begin_managed_work(op_id, aid, generation, work_id, work_kind),
+            Command::ManagedWorkEnd {
+                aid,
+                r#gen: generation,
+                work_id,
+            } => self.end_managed_work(aid, generation, work_id),
             Command::SaveState {
                 aid,
                 r#gen: generation,
@@ -889,6 +1012,8 @@ impl ActorProxy {
                     state_version: Arc::new(AtomicU64::new(0)),
                     operations: ActorOperations::default(),
                     alarm_updates: ActorAlarmUpdates::default(),
+                    run_active: Arc::new(AtomicBool::new(false)),
+                    lifecycle_stopping: Arc::new(AtomicBool::new(false)),
                 },
             );
         let actor_connect_ids = self
@@ -969,6 +1094,9 @@ impl ActorProxy {
             .lock()
             .expect("stop intent table poisoned")
             .remove(&identity);
+        let run_was_active = self
+            .actor_exact(&identity)
+            .is_some_and(|actor| actor.run_active.swap(false, Ordering::AcqRel));
         self.actors
             .lock()
             .expect("active actor table poisoned")
@@ -987,6 +1115,33 @@ impl ActorProxy {
             .lock()
             .expect("SQLite transaction table poisoned")
             .retain(|key, _| key.actor != identity);
+        let queue_waits: Vec<CancellationToken> = {
+            let mut waits = self.queue_waits.lock().expect("queue wait table poisoned");
+            let mut cancelled = Vec::new();
+            waits.retain(|key, signal| {
+                if key.actor == identity {
+                    cancelled.push(signal.clone());
+                    false
+                } else {
+                    true
+                }
+            });
+            cancelled
+        };
+        for signal in queue_waits {
+            signal.cancel();
+        }
+        self.queue_messages
+            .lock()
+            .expect("queue message table poisoned")
+            .retain(|key, _| key.actor != identity);
+        self.managed_work
+            .lock()
+            .expect("managed work table poisoned")
+            .retain(|key, _| key.actor != identity);
+        if run_was_active {
+            ctx.end_run_handler();
+        }
         result.map(|_| ())
     }
 
@@ -1045,6 +1200,9 @@ impl ActorProxy {
                     reply.send(Ok(Vec::new()));
                 }
                 ActorEvent::RunGracefulCleanup { reason, reply } => {
+                    if let Some(actor) = self.actor_exact(identity) {
+                        actor.lifecycle_stopping.store(true, Ordering::Release);
+                    }
                     let stop_reason = self.actor_stop_reason(identity, reason);
                     slept = matches!(reason, ShutdownKind::Sleep);
                     let shutdown_deadline = ctx.shutdown_deadline_token();
@@ -1138,8 +1296,56 @@ impl ActorProxy {
                         }
                     }
                 }
-                ActorEvent::QueueSend { reply, .. } => {
-                    reply.send(Err(anyhow!("queue requests are outside the Go boundary")));
+                ActorEvent::QueueSend {
+                    name,
+                    body,
+                    wait,
+                    timeout_ms,
+                    reply,
+                    ..
+                } => {
+                    if wait {
+                        match ctx
+                            .enqueue_and_wait(
+                                &name,
+                                &body,
+                                EnqueueAndWaitOpts {
+                                    timeout: timeout_ms.map(Duration::from_millis),
+                                    signal: Some(ctx.actor_abort_signal()),
+                                },
+                            )
+                            .await
+                        {
+                            Ok(Some(response)) => reply.send(Ok(QueueSendResult {
+                                status: QueueSendStatus::Completed,
+                                response: Some(response),
+                            })),
+                            Ok(None) => reply.send(Ok(QueueSendResult {
+                                status: QueueSendStatus::Completed,
+                                response: None,
+                            })),
+                            Err(error) => {
+                                let structured = RivetError::extract(&error);
+                                if structured.group() == "queue" && structured.code() == "timed_out"
+                                {
+                                    reply.send(Ok(QueueSendResult {
+                                        status: QueueSendStatus::TimedOut,
+                                        response: None,
+                                    }));
+                                } else {
+                                    reply.send(Err(error));
+                                }
+                            }
+                        }
+                    } else {
+                        match ctx.send(&name, &body).await {
+                            Ok(_) => reply.send(Ok(QueueSendResult {
+                                status: QueueSendStatus::Completed,
+                                response: None,
+                            })),
+                            Err(error) => reply.send(Err(error)),
+                        }
+                    }
                 }
                 ActorEvent::ConnectionPreflight {
                     conn,
@@ -1468,6 +1674,7 @@ impl ActorProxy {
             Command::KvDelete { kv_id, aid, key } => self.kv_delete(kv_id, aid, key).await,
             Command::ActorStartResult { .. }
             | Command::ActorStopResult { .. }
+            | Command::ActorRunResult { .. }
             | Command::AlarmHandled { .. }
             | Command::ActionResult { .. }
             | Command::ConnectionResult { .. }
@@ -1486,6 +1693,14 @@ impl ActorProxy {
             | Command::ScheduleCancel { .. }
             | Command::ScheduleGet { .. }
             | Command::ScheduleList { .. }
+            | Command::QueueSend { .. }
+            | Command::QueueEnqueueWait { .. }
+            | Command::QueueNext { .. }
+            | Command::QueueComplete { .. }
+            | Command::QueueRetry { .. }
+            | Command::QueueCancel { .. }
+            | Command::ManagedWorkBegin { .. }
+            | Command::ManagedWorkEnd { .. }
             | Command::SqliteExec { .. }
             | Command::SqliteQuery { .. }
             | Command::SqliteBegin { .. }
@@ -2001,6 +2216,408 @@ impl ActorProxy {
                 ),
                 Err(error) => proxy.emit_schedule_error(op_id, "list", &error),
             }
+        });
+    }
+
+    fn dispatch_queue_send(
+        &self,
+        op_id: u64,
+        aid: String,
+        generation: u64,
+        name: String,
+        body: Vec<u8>,
+    ) {
+        let Some((actor, operation)) = self.begin_queue_operation(op_id, &aid, generation, "send")
+        else {
+            return;
+        };
+        let proxy = self.clone();
+        tokio::spawn(async move {
+            let _operation = operation;
+            match actor.ctx.send(&name, &body).await {
+                Ok(message) => {
+                    proxy.emit_queue_result(op_id, "send", Some(queue_message(&message)), None)
+                }
+                Err(error) => proxy.emit_queue_error(op_id, "send", &error),
+            }
+        });
+    }
+
+    fn dispatch_queue_enqueue_wait(
+        &self,
+        op_id: u64,
+        aid: String,
+        generation: u64,
+        name: String,
+        body: Vec<u8>,
+        timeout_ms: Option<u64>,
+    ) {
+        let Some((actor, operation)) =
+            self.begin_queue_operation(op_id, &aid, generation, "enqueue_wait")
+        else {
+            return;
+        };
+        let identity = actor.identity.clone();
+        let signal = CancellationToken::new();
+        self.queue_waits
+            .lock()
+            .expect("queue wait table poisoned")
+            .insert(
+                QueueWaitIdentity {
+                    actor: identity.clone(),
+                    operation_id: op_id,
+                },
+                signal.clone(),
+            );
+        let proxy = self.clone();
+        tokio::spawn(async move {
+            let _operation = operation;
+            let result = actor
+                .ctx
+                .enqueue_and_wait(
+                    &name,
+                    &body,
+                    EnqueueAndWaitOpts {
+                        timeout: timeout_ms.map(Duration::from_millis),
+                        signal: Some(signal),
+                    },
+                )
+                .await;
+            proxy.remove_queue_wait(&identity, op_id);
+            match result {
+                Ok(response) => proxy.emit_queue_result(op_id, "enqueue_wait", None, response),
+                Err(error) => proxy.emit_queue_error(op_id, "enqueue_wait", &error),
+            }
+        });
+    }
+
+    fn dispatch_queue_next(
+        &self,
+        op_id: u64,
+        aid: String,
+        generation: u64,
+        names: Vec<String>,
+        timeout_ms: Option<u64>,
+        completable: bool,
+    ) {
+        let Some((actor, operation)) = self.begin_queue_operation(op_id, &aid, generation, "next")
+        else {
+            return;
+        };
+        // Core tracks a blocking receive as an active queue wait, which is
+        // intentionally compatible with actor sleep. Keeping the proxy's generic
+        // operation fence held here would make Sleep wait for Next while Next waits
+        // for Sleep to abort it.
+        drop(operation);
+        let identity = actor.identity.clone();
+        let signal = CancellationToken::new();
+        self.queue_waits
+            .lock()
+            .expect("queue wait table poisoned")
+            .insert(
+                QueueWaitIdentity {
+                    actor: identity.clone(),
+                    operation_id: op_id,
+                },
+                signal.clone(),
+            );
+        let proxy = self.clone();
+        tokio::spawn(async move {
+            let result = actor
+                .ctx
+                .next(QueueNextOpts {
+                    names: (!names.is_empty()).then_some(names),
+                    timeout: timeout_ms.map(Duration::from_millis),
+                    signal: Some(signal),
+                    completable,
+                })
+                .await;
+            proxy.remove_queue_wait(&identity, op_id);
+            match result {
+                Ok(message) => {
+                    if let Some(message) = message.as_ref()
+                        && message.is_completable()
+                    {
+                        proxy
+                            .queue_messages
+                            .lock()
+                            .expect("queue message table poisoned")
+                            .insert(
+                                QueueMessageIdentity {
+                                    actor: identity,
+                                    message_id: message.id,
+                                },
+                                message.clone(),
+                            );
+                    }
+                    proxy.emit_queue_result(
+                        op_id,
+                        "next",
+                        message.as_ref().map(queue_message),
+                        None,
+                    );
+                }
+                Err(error) => proxy.emit_queue_error(op_id, "next", &error),
+            }
+        });
+    }
+
+    fn dispatch_queue_complete(
+        &self,
+        op_id: u64,
+        aid: String,
+        generation: u64,
+        message_id: u64,
+        response: Option<Vec<u8>>,
+    ) {
+        let Some((_actor, operation)) =
+            self.begin_queue_operation(op_id, &aid, generation, "complete")
+        else {
+            return;
+        };
+        let identity = ActorIdentity::new(aid, generation);
+        let key = QueueMessageIdentity {
+            actor: identity,
+            message_id,
+        };
+        let message = self
+            .queue_messages
+            .lock()
+            .expect("queue message table poisoned")
+            .remove(&key);
+        let Some(message) = message else {
+            self.emit_queue_wire_error(
+                op_id,
+                "complete",
+                WireError::new(
+                    "queue_message_unavailable",
+                    format!("queue message {message_id} is not pending completion"),
+                ),
+            );
+            return;
+        };
+        let proxy = self.clone();
+        tokio::spawn(async move {
+            let _operation = operation;
+            let retry_message = message.clone();
+            match message.complete(response).await {
+                Ok(()) => proxy.emit_queue_result(op_id, "complete", None, None),
+                Err(error) => {
+                    if proxy.actor_exact(&key.actor).is_some() {
+                        proxy
+                            .queue_messages
+                            .lock()
+                            .expect("queue message table poisoned")
+                            .insert(key, retry_message);
+                    }
+                    proxy.emit_queue_error(op_id, "complete", &error);
+                }
+            }
+        });
+    }
+
+    fn dispatch_queue_retry(&self, op_id: u64, aid: String, generation: u64, message_id: u64) {
+        let Some((_actor, _operation)) =
+            self.begin_queue_operation(op_id, &aid, generation, "retry")
+        else {
+            return;
+        };
+        let message = self
+            .queue_messages
+            .lock()
+            .expect("queue message table poisoned")
+            .remove(&QueueMessageIdentity {
+                actor: ActorIdentity::new(aid, generation),
+                message_id,
+            });
+        let Some(message) = message else {
+            self.emit_queue_wire_error(
+                op_id,
+                "retry",
+                WireError::new(
+                    "queue_message_unavailable",
+                    format!("queue message {message_id} is not pending retry"),
+                ),
+            );
+            return;
+        };
+        drop(message);
+        self.emit_queue_result(op_id, "retry", None, None);
+    }
+
+    fn cancel_queue_wait(&self, aid: String, generation: u64, operation_id: u64) {
+        if let Some(signal) = self
+            .queue_waits
+            .lock()
+            .expect("queue wait table poisoned")
+            .get(&QueueWaitIdentity {
+                actor: ActorIdentity::new(aid, generation),
+                operation_id,
+            })
+            .cloned()
+        {
+            signal.cancel();
+        }
+    }
+
+    fn remove_queue_wait(&self, identity: &ActorIdentity, operation_id: u64) {
+        self.queue_waits
+            .lock()
+            .expect("queue wait table poisoned")
+            .remove(&QueueWaitIdentity {
+                actor: identity.clone(),
+                operation_id,
+            });
+    }
+
+    fn begin_managed_work(
+        &self,
+        op_id: u64,
+        aid: String,
+        generation: u64,
+        work_id: u64,
+        work_kind: String,
+    ) {
+        let identity = ActorIdentity::new(aid, generation);
+        let Some(actor) = self.actor_exact(&identity) else {
+            self.emit_actor_intent_result(
+                op_id,
+                Err(WireError::new(
+                    "actor_generation_stale",
+                    format!(
+                        "actor {} generation {} is not active",
+                        identity.aid, identity.generation
+                    ),
+                )),
+            );
+            return;
+        };
+        let key = ManagedWorkIdentity {
+            actor: identity,
+            work_id,
+        };
+        let handle = match work_kind.as_str() {
+            "wait_until" => {
+                let (sender, receiver) = tokio::sync::oneshot::channel();
+                actor.ctx.wait_until(async move {
+                    let _ = receiver.await;
+                });
+                ManagedWorkHandle::WaitUntil(sender)
+            }
+            "keep_awake" => ManagedWorkHandle::KeepAwake(actor.ctx.keep_awake_region()),
+            _ => {
+                self.emit_actor_intent_result(
+                    op_id,
+                    Err(WireError::new(
+                        "managed_work_kind_invalid",
+                        format!("unknown managed work kind {work_kind:?}"),
+                    )),
+                );
+                return;
+            }
+        };
+        let mut managed_work = self
+            .managed_work
+            .lock()
+            .expect("managed work table poisoned");
+        if managed_work.contains_key(&key) {
+            self.emit_actor_intent_result(
+                op_id,
+                Err(WireError::new(
+                    "managed_work_duplicate",
+                    format!("managed work {work_id} is already registered"),
+                )),
+            );
+            return;
+        }
+        managed_work.insert(key, handle);
+        drop(managed_work);
+        self.emit_actor_intent_result(op_id, Ok(()));
+    }
+
+    fn end_managed_work(&self, aid: String, generation: u64, work_id: u64) {
+        let handle = self
+            .managed_work
+            .lock()
+            .expect("managed work table poisoned")
+            .remove(&ManagedWorkIdentity {
+                actor: ActorIdentity::new(aid, generation),
+                work_id,
+            });
+        match handle {
+            Some(ManagedWorkHandle::WaitUntil(sender)) => {
+                let _ = sender.send(());
+            }
+            Some(ManagedWorkHandle::KeepAwake(region)) => drop(region),
+            None => {}
+        }
+    }
+
+    fn begin_queue_operation(
+        &self,
+        op_id: u64,
+        aid: &str,
+        generation: u64,
+        operation: &str,
+    ) -> Option<(ActiveActor, ActorOperationGuard)> {
+        let identity = ActorIdentity::new(aid, generation);
+        let Some(actor) = self.actor_exact(&identity) else {
+            self.emit_queue_wire_error(
+                op_id,
+                operation,
+                WireError::new(
+                    "actor_generation_stale",
+                    format!("actor {aid} generation {generation} is not active"),
+                ),
+            );
+            return None;
+        };
+        let Some(operation_guard) = actor.operations.begin() else {
+            self.emit_queue_wire_error(
+                op_id,
+                operation,
+                WireError::new(
+                    "actor_stopping",
+                    format!("actor {aid} generation {generation} is stopping"),
+                ),
+            );
+            return None;
+        };
+        Some((actor, operation_guard))
+    }
+
+    fn emit_queue_result(
+        &self,
+        op_id: u64,
+        operation: &str,
+        message: Option<WireQueueMessage>,
+        response: Option<Vec<u8>>,
+    ) {
+        let _ = self.events.send(Event::ActorQueueResult {
+            op_id,
+            queue_operation: operation.to_owned(),
+            message,
+            response,
+            error: None,
+        });
+    }
+
+    fn emit_queue_error(&self, op_id: u64, operation: &str, error: &anyhow::Error) {
+        let structured = RivetError::extract(error);
+        self.emit_queue_wire_error(
+            op_id,
+            operation,
+            WireError::new(structured.code(), structured.message()),
+        );
+    }
+
+    fn emit_queue_wire_error(&self, op_id: u64, operation: &str, error: WireError) {
+        let _ = self.events.send(Event::ActorQueueResult {
+            op_id,
+            queue_operation: operation.to_owned(),
+            message: None,
+            response: None,
+            error: Some(error),
         });
     }
 
@@ -3298,6 +3915,16 @@ fn scheduled_event(event: ScheduledEventInfo) -> ScheduledEvent {
         action: event.action,
         args: event.args,
         run_at: event.run_at,
+    }
+}
+
+fn queue_message(message: &CoreQueueMessage) -> WireQueueMessage {
+    WireQueueMessage {
+        id: message.id,
+        name: message.name.clone(),
+        body: message.body.clone(),
+        created_at: message.created_at,
+        completable: message.is_completable(),
     }
 }
 

@@ -35,7 +35,12 @@ type Actor[T any] struct {
 	OnStart         func(*Context[T]) error
 	OnStop          func(*Context[T]) error
 	OnAlarm         func(*Context[T]) error
-	Actions         Actions[T]
+	// Run is generation-owned background execution. It runs once per wake,
+	// cooperates with actor serialization through RunContext.Queue and
+	// RunContext.KeepAwake, and must return when ctx is cancelled. An error is
+	// logged and ends Run for the current generation without crashing the actor.
+	Run     func(context.Context, *RunContext[T]) error
+	Actions Actions[T]
 	// OnFetch handles buffered HTTP requests from the pinned core. Response
 	// headers lock on the first WriteHeader or Write, concurrent Write calls are
 	// serialized, and writes after OnFetch returns fail. Header must not be
@@ -60,13 +65,20 @@ type Context[T any] struct {
 	db                  *DB
 	kv                  *KV
 	schedules           *ActionSchedules
+	queue               *Queue
 	state               T
+	turnMu              sync.Mutex
 	saveMu              sync.Mutex
 	connectionsMu       sync.Mutex
 	connections         map[string]*Connection
 	pendingConnections  map[string]*Connection
 	currentConnectionMu sync.RWMutex
 	currentConnection   *Connection
+	managedCtx          context.Context
+	managedCancel       context.CancelFunc
+	managedMu           sync.Mutex
+	managedStopping     bool
+	managedWG           sync.WaitGroup
 }
 
 func (c *Context[T]) State() *T {
@@ -170,6 +182,15 @@ func (c *Context[T]) Schedules() *ActionSchedules {
 	return c.schedules
 }
 
+// Queue returns this actor generation's durable queue. Blocking waits called
+// from an actor handler yield the actor turn so Actor.Run can consume messages.
+func (c *Context[T]) Queue() *Queue {
+	if c == nil {
+		return nil
+	}
+	return c.queue
+}
+
 // Schedule replaces this actor's one durable alarm. The engine wakes a
 // sleeping actor before invoking OnAlarm.
 func (c *Context[T]) Schedule(at time.Time) error {
@@ -269,7 +290,7 @@ func (a *actorAdapter[T]) database() bool {
 }
 
 func (a *actorAdapter[T]) Start(
-	_ context.Context,
+	ctx context.Context,
 	session *pump.ActorSession,
 	event wire.Event,
 ) (any, error) {
@@ -281,21 +302,26 @@ func (a *actorAdapter[T]) Start(
 	if err != nil {
 		return nil, err
 	}
+	managedCtx, managedCancel := context.WithCancel(ctx)
 	actorContext := &Context[T]{
 		session:            session,
 		client:             a.clientForActor(session.AID()),
 		db:                 db,
 		kv:                 newKV(session),
 		schedules:          newActionSchedules(session, a.definition.Actions),
+		queue:              newQueue(session),
 		state:              state,
 		connections:        make(map[string]*Connection),
 		pendingConnections: make(map[string]*Connection),
+		managedCtx:         managedCtx,
+		managedCancel:      managedCancel,
 	}
 	for _, snapshot := range event.Connections {
 		connection := newActorConnection(session, snapshot)
 		if snapshot.ActorConnect && a.definition.ConnectionState != nil {
 			connectionState, decodeErr := a.definition.ConnectionState.decode(snapshot.State)
 			if decodeErr != nil {
+				actorContext.managedCancel()
 				_ = actorContext.db.close()
 				return nil, fmt.Errorf("restore connection %q state: %w", snapshot.ID, decodeErr)
 			}
@@ -305,11 +331,40 @@ func (a *actorAdapter[T]) Start(
 	}
 	if a.definition.OnStart != nil {
 		if err := a.definition.OnStart(actorContext); err != nil {
+			actorContext.managedCancel()
 			_ = actorContext.db.close()
 			return nil, err
 		}
 	}
+	actorContext.queue = actorContext.queue.forRun(actorContext.turnMu.Unlock, actorContext.turnMu.Lock)
 	return actorContext, nil
+}
+
+func (a *actorAdapter[T]) Run(
+	ctx context.Context,
+	_ *pump.ActorSession,
+	state any,
+) error {
+	actorContext, ok := state.(*Context[T])
+	if !ok || actorContext == nil {
+		return errors.New("typed actor context is unavailable during Run")
+	}
+	if a.definition.Run == nil {
+		return nil
+	}
+	actorContext.turnMu.Lock()
+	defer actorContext.turnMu.Unlock()
+	runContext := &RunContext[T]{Context: actorContext}
+	runContext.queue = actorContext.queue
+	err := a.definition.Run(ctx, runContext)
+	if errors.Is(err, ErrActorAborted) || errors.Is(err, context.Canceled) {
+		return nil
+	}
+	return err
+}
+
+func (a *actorAdapter[T]) RunEnabled() bool {
+	return a != nil && a.definition.Run != nil
 }
 
 func (a *actorAdapter[T]) Stop(
@@ -322,14 +377,22 @@ func (a *actorAdapter[T]) Stop(
 	if !ok || actorContext == nil {
 		return errors.New("typed actor context is unavailable during stop")
 	}
-	if a.definition.OnStop == nil {
-		return actorContext.db.close()
+	actorContext.turnMu.Lock()
+	defer actorContext.turnMu.Unlock()
+	var stopErr error
+	if a.definition.OnStop != nil {
+		stopErr = a.definition.OnStop(actorContext)
 	}
-	if err := a.definition.OnStop(actorContext); err != nil {
-		_ = actorContext.db.close()
+	if err := actorContext.drainManaged(); err != nil {
+		actorContext.managedCancel()
 		return err
 	}
-	return actorContext.db.close()
+	actorContext.managedCancel()
+	closeErr := actorContext.db.close()
+	if stopErr != nil {
+		return stopErr
+	}
+	return closeErr
 }
 
 func (a *actorAdapter[T]) Action(
@@ -342,6 +405,8 @@ func (a *actorAdapter[T]) Action(
 	if !ok || actorContext == nil {
 		return nil, errors.New("typed actor context is unavailable during action")
 	}
+	actorContext.turnMu.Lock()
+	defer actorContext.turnMu.Unlock()
 	action := a.definition.Actions[event.Action]
 	if action == nil {
 		return nil, pump.HandlerError{
@@ -395,6 +460,8 @@ func (a *actorAdapter[T]) Alarm(
 	if !ok || actorContext == nil {
 		return errors.New("typed actor context is unavailable during alarm")
 	}
+	actorContext.turnMu.Lock()
+	defer actorContext.turnMu.Unlock()
 	if a.definition.OnAlarm == nil {
 		return pump.HandlerError{Code: "callback_not_found", Message: "actor has no OnAlarm handler"}
 	}
@@ -420,6 +487,8 @@ func (a *actorAdapter[T]) Fetch(
 	if !ok || actorContext == nil {
 		return errors.New("typed actor context is unavailable during fetch")
 	}
+	actorContext.turnMu.Lock()
+	defer actorContext.turnMu.Unlock()
 	if a.definition.OnFetch == nil {
 		return pump.HandlerError{Code: "callback_not_found", Message: "actor has no OnFetch handler"}
 	}
@@ -459,6 +528,8 @@ func (a *actorAdapter[T]) ConnectionPreflight(
 	if !ok || actorContext == nil {
 		return nil, errors.New("typed actor context is unavailable during connection preflight")
 	}
+	actorContext.turnMu.Lock()
+	defer actorContext.turnMu.Unlock()
 	if event.Connection == nil {
 		return nil, errors.New("connection preflight snapshot is unavailable")
 	}
@@ -499,6 +570,8 @@ func (a *actorAdapter[T]) ConnectionOpen(
 	if !ok || actorContext == nil {
 		return nil, errors.New("typed actor context is unavailable during connection open")
 	}
+	actorContext.turnMu.Lock()
+	defer actorContext.turnMu.Unlock()
 	if event.Connection == nil {
 		return nil, errors.New("connection open snapshot is unavailable")
 	}
@@ -541,6 +614,8 @@ func (a *actorAdapter[T]) ConnectionClose(
 	if !ok || actorContext == nil {
 		return nil, errors.New("typed actor context is unavailable during connection close")
 	}
+	actorContext.turnMu.Lock()
+	defer actorContext.turnMu.Unlock()
 	if event.Connection == nil {
 		return nil, errors.New("connection close snapshot is unavailable")
 	}
@@ -576,6 +651,8 @@ func (a *actorAdapter[T]) ConnectionState(
 	if !ok || actorContext == nil {
 		return nil, false, errors.New("typed actor context is unavailable while encoding connection state")
 	}
+	actorContext.turnMu.Lock()
+	defer actorContext.turnMu.Unlock()
 	actorContext.connectionsMu.Lock()
 	connection := actorContext.connections[connectionID]
 	if connection == nil {
@@ -619,6 +696,8 @@ func (a *actorAdapter[T]) WebSocketOpen(
 	if !ok || actorContext == nil {
 		return errors.New("typed actor context is unavailable during OnConnect")
 	}
+	actorContext.turnMu.Lock()
+	defer actorContext.turnMu.Unlock()
 	actorContext.connectionsMu.Lock()
 	connection := actorContext.connections[event.WSID]
 	if connection == nil {
@@ -654,6 +733,8 @@ func (a *actorAdapter[T]) WebSocketMessage(
 	if !ok || actorContext == nil {
 		return errors.New("typed actor context is unavailable during OnMessage")
 	}
+	actorContext.turnMu.Lock()
+	defer actorContext.turnMu.Unlock()
 	actorContext.connectionsMu.Lock()
 	connection := actorContext.connections[event.WSID]
 	actorContext.connectionsMu.Unlock()
@@ -680,6 +761,8 @@ func (a *actorAdapter[T]) WebSocketClose(
 	if !ok || actorContext == nil {
 		return errors.New("typed actor context is unavailable during OnDisconnect")
 	}
+	actorContext.turnMu.Lock()
+	defer actorContext.turnMu.Unlock()
 	actorContext.connectionsMu.Lock()
 	connection := actorContext.connections[event.WSID]
 	delete(actorContext.connections, event.WSID)

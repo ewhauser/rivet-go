@@ -78,6 +78,7 @@ successful action is persisted automatically.
 The SDK also supports:
 
 - lifecycle hooks, durable alarms, and typed one-shot action schedules
+- durable queues and generation-owned background work
 - external and actor-scoped clients for actor creation, resolution, and actions
 - raw HTTP handlers
 - raw WebSocket handlers and broadcast
@@ -208,6 +209,9 @@ The response is:
   actors coordinating through actor-scoped clients
 - [Collaborative cursors](examples/cursors): ActorConnect caller context,
   typed per-connection state, presence events, and hibernation-safe cursors
+- [Durable AI agent](examples/ai-agent): durable prompt processing, explicit
+  retry/completion, lifecycle-managed model work, and a replaceable provider
+  interface
 
 ## RivetKit feature compatibility
 
@@ -220,7 +224,7 @@ is still missing.
 | RivetKit feature | Status | Go behavior |
 |---|---|---|
 | Typed actor state and actions | Supported | Actions are typed, serialized per actor, and persist the complete state after success. HTTP and WebSocket handlers call `Save` explicitly. |
-| Lifecycle hooks | Partial | `OnStart`, `OnStop`, and `OnAlarm` are available. There are no distinct create, wake, sleep, destroy, state-change, or background-run hooks. |
+| Lifecycle hooks | Partial | `OnStart`, `OnStop`, `OnAlarm`, and generation-owned `Run` are available. There are no distinct create, wake, sleep, destroy, or state-change hooks. |
 | Actor input and identity | Partial | Context exposes raw creation input, actor ID, generation, actor name, and the engine-formatted key. Individual key segments, creation time, and region are not public. |
 | Actor-to-actor and external action clients | Supported | Concurrency-safe clients expose `Get`, `GetByKey`, `GetOrCreate`, `Create`, regional creation, exact creation input, typed/raw action calls, structured errors, cancellation, and actor-scoped clients with direct self-call rejection. |
 | ActorConnect and WebSocket clients | Partial | Actors support ActorConnect caller context, parameters, lifecycle hooks, state, enumeration, broadcast, and hibernation. The Go client does not yet expose the ActorConnect protocol, subscriptions, client events, or reconnect. Raw gateway WebSocket handlers remain supported. |
@@ -234,9 +238,9 @@ is still missing.
 | Cron schedules | Not implemented | Recurring cron expressions must be modeled by scheduling the next one-shot action. |
 | Actor KV | Supported | The byte-oriented `KV` handle supports get, list, put, and delete. It is retained for RivetKit compatibility; prefer typed state or SQLite for new actors. |
 | Per-actor SQLite | Supported | Opt-in raw SQL, typed values, queries, transactions, isolation, sleep/wake, and durability are covered. Result limits are documented in [Operations](docs/OPERATIONS.md). |
-| Durable queues | Not implemented | Queue sends, consumers, completion, retries, and priority patterns are outside the current Go boundary. |
+| Durable queues | Supported | Actor queues support typed CBOR send, filtered blocking receive, immediate poll, completable messages, explicit completion responses and retry, cancellation, sleep/wake, and stable capacity/size errors. External actor handles expose JSON `Send` and `SendAndWait`. |
 | Durable workflows | Not implemented | Workflow definitions, replay, steps, rollback, and history are not exposed. |
-| Actor-scoped background work | Not implemented | Go has no lifecycle-integrated equivalent of `run`, `keepAwake`, or `waitUntil`; unmanaged goroutines cannot extend actor lifetime safely. |
+| Actor-scoped background work | Supported | `Actor.Run` restarts with each generation and serializes actor-state access while queue waits and `RunContext.KeepAwake` yield the actor turn. `Context.KeepAwake` and restricted detached `WaitUntil` work are registered with core and drained during shutdown. |
 | Actor destruction | Not implemented | Actors can sleep but cannot request their own destruction through the Go context. |
 | Dynamic actors | Not implemented | Loading actor definitions from generated or user-provided source is not supported. |
 | Custom inspector tabs | Not implemented | The inspector/devtools extension protocol and actor-supplied tab assets are not exposed. |
