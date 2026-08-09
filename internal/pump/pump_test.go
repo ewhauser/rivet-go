@@ -359,6 +359,43 @@ func TestDispatchesRunnerStoppedBeforeClosingSubscription(t *testing.T) {
 	}
 }
 
+func TestCancelUnblocksAnUnbufferedSubscriber(t *testing.T) {
+	p := New(newFakeRunner())
+	subscription := p.Subscribe(0)
+	dispatched := make(chan bool, 1)
+	go func() {
+		dispatched <- p.dispatch(wire.Event{Kind: wire.EventRunnerConnected})
+	}()
+
+	select {
+	case <-dispatched:
+		t.Fatal("unbuffered dispatch completed without a receiver")
+	case <-time.After(20 * time.Millisecond):
+	}
+
+	cancelled := make(chan struct{})
+	go func() {
+		subscription.Cancel()
+		close(cancelled)
+	}()
+	select {
+	case <-cancelled:
+	case <-time.After(time.Second):
+		t.Fatal("subscription cancellation blocked behind dispatch")
+	}
+	select {
+	case delivered := <-dispatched:
+		if !delivered {
+			t.Fatal("cancelled subscriber stopped pump dispatch")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("dispatch did not unblock after subscription cancellation")
+	}
+	if _, open := <-subscription.Events; open {
+		t.Fatal("subscription events remained open after cancellation")
+	}
+}
+
 func TestNonGracefulDrainReturnsAnError(t *testing.T) {
 	defer goleak.VerifyNone(t)
 	runner := newFakeRunner()
