@@ -5,6 +5,30 @@ import (
 	"testing"
 )
 
+func TestYieldActorTurnClearsAndRestoresCurrentConnection(t *testing.T) {
+	actorContext := &Context[struct{}]{}
+	connection := &Connection{id: "caller"}
+	actorContext.currentConnection = connection
+	actorContext.turnMu.Lock()
+
+	resumeTurn := actorContext.yieldTurn()
+	observed := make(chan *Connection, 1)
+	go func() {
+		actorContext.turnMu.Lock()
+		observed <- actorContext.CurrentConnection()
+		actorContext.turnMu.Unlock()
+	}()
+	if current := <-observed; current != nil {
+		t.Fatalf("yielded actor turn exposed current connection %q", current.ID())
+	}
+
+	resumeTurn()
+	if current := actorContext.CurrentConnection(); current != connection {
+		t.Fatalf("resumed actor turn current connection = %#v, want %#v", current, connection)
+	}
+	actorContext.turnMu.Unlock()
+}
+
 func TestActorAdapterRunEnabledOnlyWhenConfigured(t *testing.T) {
 	withoutRun := &actorAdapter[struct{}]{definition: Actor[struct{}]{}}
 	if withoutRun.RunEnabled() {

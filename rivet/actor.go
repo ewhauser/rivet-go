@@ -162,6 +162,23 @@ func (c *Context[T]) CurrentConnection() *Connection {
 	return connection
 }
 
+// yieldTurn temporarily removes action-local caller identity while another
+// serialized actor callback owns the turn. The returned function restores the
+// identity only after reacquiring the turn.
+func (c *Context[T]) yieldTurn() func() {
+	c.currentConnectionMu.Lock()
+	current := c.currentConnection
+	c.currentConnection = nil
+	c.currentConnectionMu.Unlock()
+	c.turnMu.Unlock()
+	return func() {
+		c.turnMu.Lock()
+		c.currentConnectionMu.Lock()
+		c.currentConnection = current
+		c.currentConnectionMu.Unlock()
+	}
+}
+
 // DB returns this actor generation's SQLite handle. The handle is safe for
 // concurrent use. Transactions remain generation-local and expire after their
 // lease timeout. Operations return sqlite_transport_not_configured unless the
@@ -405,7 +422,7 @@ func (a *actorAdapter[T]) Start(
 			return nil, err
 		}
 	}
-	actorContext.queue = actorContext.queue.forRun(actorContext.turnMu.Unlock, actorContext.turnMu.Lock)
+	actorContext.queue = actorContext.queue.withTurnYield(actorContext.yieldTurn)
 	actorContext.lifecycleMu.Lock()
 	actorContext.lifecycleStarted = true
 	actorContext.lifecycleMu.Unlock()
