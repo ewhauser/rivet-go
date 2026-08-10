@@ -795,8 +795,15 @@ LocalNative requires bundled SQLite to be compiled with
 as the pinned upstream workspace. The pinned Depot decoder also collapsed a
 zero-length BLOB to NULL when SQLite reported `SQLITE_BLOB` with a null data
 pointer. The workspace Cargo patch vendors the exact v2.3.10 seven-file Depot
-client and changes only that branch to return an empty blob. This is a local
-pin correction, not a dependency or Rivet version change.
+client with two audited local corrections. The decoder returns an empty blob
+for that zero-length branch. During native database teardown, a failed or
+timed-out bounded final flush marks that connection's main VFS file to skip the
+redundant unbounded `xClose` flush, then still calls `sqlite3_close_v2`; this
+releases the native connection instead of abandoning its pointer. The
+`test-hooks` feature exists only in the FFI crate's dev dependency so the Rust
+regression can force both final-flush outcomes and verify the main-file close
+callback and native close result. These are local pin corrections, not a
+dependency or Rivet version change.
 
 ### Engine replacement recovery
 

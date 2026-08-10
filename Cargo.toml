@@ -4,8 +4,8 @@ exclude = ["crates/rivet-depot-client-pinned"]
 resolver = "2"
 
 [patch."https://github.com/rivet-dev/rivet"]
-# Pinned v2.3.10 source with the zero-length BLOB decoder correction recorded
-# in docs/FFI-BOUNDARY.md. No dependency version or upstream pin changes.
+# Pinned v2.3.10 Depot source with the audited local corrections recorded in
+# docs/FFI-BOUNDARY.md. No dependency version or upstream pin changes.
 rivet-depot-client = { path = "crates/rivet-depot-client-pinned" }
 
 [profile.release]

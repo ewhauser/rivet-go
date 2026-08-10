@@ -1730,11 +1730,14 @@ name = "rivetkit-go-ffi"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "ciborium",
  "crossbeam-channel",
+ "libsqlite3-sys",
  "proptest",
  "reqwest",
  "rivet-depot-client",
+ "rivet-envoy-protocol",
  "rivet-error",
  "rivetkit-core",
  "rmp-serde",

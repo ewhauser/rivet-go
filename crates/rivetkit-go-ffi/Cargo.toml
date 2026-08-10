@@ -34,5 +34,9 @@ rivet-error = { git = "https://github.com/rivet-dev/rivet", tag = "v2.3.10" }
 rivet-depot-client = { git = "https://github.com/rivet-dev/rivet", tag = "v2.3.10" }
 
 [dev-dependencies]
+async-trait = "0.1"
+libsqlite3-sys = { version = "0.30", features = ["bundled"] }
 proptest = "1"
+rivet-depot-client = { git = "https://github.com/rivet-dev/rivet", tag = "v2.3.10", features = ["test-hooks"] }
+rivet-envoy-protocol = { git = "https://github.com/rivet-dev/rivet", tag = "v2.3.10" }
 tempfile = "3"
