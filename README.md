@@ -299,7 +299,7 @@ cargo test --workspace
 Run the complete race-enabled conformance suite:
 
 ```sh
-go test -race -count=1 ./...
+go test -race -count=1 -timeout=25m ./...
 ```
 
 ## License
