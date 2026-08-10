@@ -47,6 +47,11 @@ const (
 	maxArtifactBytes = 64 << 20
 )
 
+// Capture the standard transport during package initialization so artifact
+// downloads do not depend on, or close idle connections from, an application's
+// later replacement of http.DefaultTransport.
+var artifactTransportTemplate = http.DefaultTransport.(*http.Transport).Clone()
+
 type nativeArtifact struct {
 	dir      string
 	filename string
@@ -178,7 +183,9 @@ func storeVerifiedLibrary(libraryBytes []byte, digest, cacheRoot, filename strin
 }
 
 func downloadArtifact(url string) ([]byte, error) {
-	client := &http.Client{Timeout: 5 * time.Minute}
+	transport := artifactTransportTemplate.Clone()
+	client := &http.Client{Timeout: 5 * time.Minute, Transport: transport}
+	defer transport.CloseIdleConnections()
 	response, err := client.Get(url)
 	if err != nil {
 		return nil, fmt.Errorf("download native library %s: %w", url, err)
