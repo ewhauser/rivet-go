@@ -1,6 +1,7 @@
 package sqlitesocket
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"errors"
@@ -16,6 +17,17 @@ type observedWriteConn struct {
 	net.Conn
 	started chan struct{}
 	once    sync.Once
+}
+
+type observedReadConn struct {
+	net.Conn
+	started chan struct{}
+	once    sync.Once
+}
+
+func (c *observedReadConn) Read(data []byte) (int, error) {
+	c.once.Do(func() { close(c.started) })
+	return c.Conn.Read(data)
 }
 
 func (c *observedWriteConn) Write(data []byte) (int, error) {
@@ -85,6 +97,60 @@ func TestHelloNegotiatesLocalFrameCeiling(t *testing.T) {
 	}
 	if got != maxSupportedFrame {
 		t.Fatalf("negotiated maxFrameBytes = %d, want %d", got, maxSupportedFrame)
+	}
+}
+
+func TestHandshakeReadHonorsCancellationWithoutDeadline(t *testing.T) {
+	baseline := goleak.IgnoreCurrent()
+	clientConn, endpointConn := net.Pipe()
+	observed := &observedReadConn{Conn: clientConn, started: make(chan struct{})}
+	t.Cleanup(func() {
+		_ = clientConn.Close()
+		_ = endpointConn.Close()
+		goleak.VerifyNone(t, baseline)
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() {
+		_, err := readFrameContext(ctx, observed, defaultMaxFrame)
+		result <- err
+	}()
+	select {
+	case <-observed.started:
+	case <-time.After(time.Second):
+		t.Fatal("handshake did not start its read")
+	}
+	cancel()
+	select {
+	case err := <-result:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("handshake read error = %v, want context.Canceled", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("handshake read ignored context cancellation")
+	}
+
+	payload := []byte{1, 2, 3}
+	writeResult := make(chan error, 1)
+	go func() {
+		var header [4]byte
+		binary.BigEndian.PutUint32(header[:], uint32(len(payload)))
+		if err := writeAll(endpointConn, header[:]); err != nil {
+			writeResult <- err
+			return
+		}
+		writeResult <- writeAll(endpointConn, payload)
+	}()
+	got, err := readFrame(clientConn, defaultMaxFrame)
+	if err != nil {
+		t.Fatalf("read after canceled handshake: %v", err)
+	}
+	if !bytes.Equal(got, payload) {
+		t.Fatalf("payload after canceled handshake = %v, want %v", got, payload)
+	}
+	if err := <-writeResult; err != nil {
+		t.Fatalf("write after canceled handshake: %v", err)
 	}
 }
 
