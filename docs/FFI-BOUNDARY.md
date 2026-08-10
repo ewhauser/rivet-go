@@ -134,7 +134,7 @@ instance ID, `gen` = generation; both assigned by core.
 | `HttpResponseChunk` | req_id, body, finish | — |
 | `WsSend` | ws_id, data, binary | — |
 | `WsCloseCmd` | ws_id, code?, reason?, hibernate | — |
-| `Broadcast` | aid, event name, payload, exclude_conn? | — |
+| `Broadcast` | aid, gen, event name, payload, exclude_conn? | — |
 | `SaveState` | aid, gen, state bytes | `StatePersisted` |
 | `KvGet` / `KvList` / `KvPut` / `KvDelete` | kv_id, aid, gen, op payload | `KvResult` |
 | `SetAlarm` | op_id, aid, gen, alarm_ts? (null clears) | `ActorIntentResult` after the core schedule operation succeeds or fails |

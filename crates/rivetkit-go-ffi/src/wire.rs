@@ -441,6 +441,8 @@ pub(crate) enum Command {
     },
     Broadcast {
         aid: String,
+        #[serde(default)]
+        r#gen: u64,
         event: String,
         #[serde(with = "serde_bytes")]
         payload: Vec<u8>,
@@ -880,6 +882,7 @@ impl CommandBatch {
                 }
                 Command::Broadcast {
                     aid,
+                    r#gen: _,
                     event,
                     payload,
                     exclude_conn,
@@ -1936,6 +1939,7 @@ mod tests {
         ws_close_cmd.reason = Some("done");
         ws_close_cmd.hibernate = true;
         let mut broadcast = golden_command("broadcast");
+        broadcast.r#gen = 7;
         broadcast.event = "countChanged";
         broadcast.payload = Some(vec![0x81, 0x18, 0x2a]);
         broadcast.exclude_conn = Some("ws-excluded");

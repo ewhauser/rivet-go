@@ -2505,6 +2505,25 @@ func TestActionDeadlineIsPropagatedAndActorRecovers(t *testing.T) {
 	}
 }
 
+func TestBroadcastRejectsStoppedGeneration(t *testing.T) {
+	runner := newFakeRunner()
+	session := &ActorSession{
+		pump:     New(runner),
+		identity: actorIdentity{aid: "stale-aid", generation: 1},
+		done:     make(chan struct{}),
+	}
+
+	err := session.Broadcast(context.Background(), "updated", []byte("stale"), nil)
+	if !errors.Is(err, ErrShuttingDown) {
+		t.Fatalf("Broadcast error = %v, want %v", err, ErrShuttingDown)
+	}
+	select {
+	case command := <-runner.submitted:
+		t.Fatalf("stopped generation submitted %#v", command)
+	default:
+	}
+}
+
 func TestWebSocketEventsAreActorOrderedAndCommandsDoNotUsePoller(t *testing.T) {
 	defer goleak.VerifyNone(t)
 	runner := newFakeRunner()
@@ -2560,7 +2579,8 @@ func TestWebSocketEventsAreActorOrderedAndCommandsDoNotUsePoller(t *testing.T) {
 		t.Fatalf("message observation = %q", got)
 	}
 	commands := []wire.Command{nextCommand(t, runner), nextCommand(t, runner), nextCommand(t, runner)}
-	if commands[0].Kind != wire.CommandBroadcast || commands[0].Event != "updated" {
+	if commands[0].Kind != wire.CommandBroadcast || commands[0].Event != "updated" ||
+		commands[0].AID != "socket-aid" || commands[0].Generation != 1 {
 		t.Fatalf("broadcast command = %#v", commands[0])
 	}
 	if commands[1].Kind != wire.CommandWSSend || commands[1].WSID != "ws-b" {

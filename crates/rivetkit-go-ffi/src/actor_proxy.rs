@@ -735,10 +735,16 @@ impl ActorProxy {
             }
             Command::Broadcast {
                 aid,
+                r#gen: generation,
                 event,
                 payload,
                 exclude_conn,
-            } => self.broadcast(&aid, &event, payload, exclude_conn.as_deref()),
+            } => self.broadcast(
+                &ActorIdentity::new(aid, generation),
+                &event,
+                payload,
+                exclude_conn.as_deref(),
+            ),
             Command::StopIntent { aid } => {
                 if let Some(actor) = self.actor_current(&aid) {
                     self.stop_intents
@@ -3471,8 +3477,14 @@ impl ActorProxy {
         // a fresh WebSocket transport when the actor wakes.
     }
 
-    fn broadcast(&self, aid: &str, event: &str, payload: Vec<u8>, exclude_conn: Option<&str>) {
-        if let Some(actor) = self.actor_current(aid) {
+    fn broadcast(
+        &self,
+        identity: &ActorIdentity,
+        event: &str,
+        payload: Vec<u8>,
+        exclude_conn: Option<&str>,
+    ) {
+        if let Some(actor) = self.actor_exact(identity) {
             actor.ctx.broadcast(event, &payload);
         }
 
@@ -3486,7 +3498,7 @@ impl ActorProxy {
             .expect("WebSocket table poisoned")
             .iter()
             .filter(|(ws_id, active)| {
-                active.actor.aid == aid && exclude_conn != Some(ws_id.as_str())
+                active.actor == *identity && exclude_conn != Some(ws_id.as_str())
             })
             .map(|(ws_id, _)| ws_id.clone())
             .collect::<Vec<_>>();
@@ -4694,19 +4706,24 @@ mod tests {
             .try_send(WsOutbound::Send(WsMessage::Text("blocked".to_owned())))
             .expect("fill slow WebSocket queue");
         let (fast_tx, mut fast_rx) = tokio::sync::mpsc::channel(1);
-        let websocket = |outbound| ActiveWebSocket {
-            actor: identity.clone(),
+        let (new_generation_tx, mut new_generation_rx) = tokio::sync::mpsc::channel(1);
+        let websocket = |actor, outbound| ActiveWebSocket {
+            actor,
             can_hibernate: false,
             ws: WebSocket::new(),
             outbound,
             acknowledgements: None,
         };
         proxy.websockets.lock().expect("WebSocket table").extend([
-            ("slow".to_owned(), websocket(slow_tx)),
-            ("fast".to_owned(), websocket(fast_tx)),
+            ("slow".to_owned(), websocket(identity.clone(), slow_tx)),
+            ("fast".to_owned(), websocket(identity.clone(), fast_tx)),
+            (
+                "new-generation".to_owned(),
+                websocket(ActorIdentity::new("actor", 2), new_generation_tx),
+            ),
         ]);
 
-        proxy.broadcast("actor", "updated", vec![0x81, 0x01], None);
+        proxy.broadcast(&identity, "updated", vec![0x81, 0x01], None);
 
         assert!(
             !proxy
@@ -4731,6 +4748,10 @@ mod tests {
                 reason: Some("outbound_backpressure".to_owned()),
             })
         );
+        assert!(matches!(
+            new_generation_rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
         drop(slow_rx);
     }
 
