@@ -1674,7 +1674,7 @@ func TestSleepWaitsForMidflightActionAndHibernatesWebSocket(t *testing.T) {
 		t.Fatalf("start command = %#v", command)
 	}
 	runner.emit(wire.Event{
-		Kind: wire.EventWSOpen, AID: "sleeper-aid", WSID: "ws-hibernate",
+		Kind: wire.EventWSOpen, AID: "sleeper-aid", Generation: 4, WSID: "ws-hibernate",
 		Path: "/chat", CanHibernate: true,
 	})
 	if command := nextCommand(t, runner); command.Kind != wire.CommandWSOpenResult {
@@ -2638,6 +2638,54 @@ func TestBroadcastRejectsStoppedGeneration(t *testing.T) {
 	}
 }
 
+func TestWebSocketOpenRoutesToExactActorGeneration(t *testing.T) {
+	defer goleak.VerifyNone(t)
+	runner := newFakeRunner()
+	opened := make(chan uint64, 1)
+	handler := dispatchHandler{
+		wsOpen: func(_ context.Context, session *ActorSession, _ wire.Event, _ any) error {
+			opened <- session.Generation()
+			return nil
+		},
+	}
+	p := NewWithHandlers(runner, map[string]ActorHandler{"socket": handler})
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() { result <- p.Run(ctx) }()
+	waitPumpStarted(t, p)
+
+	for _, generation := range []uint64{1, 2} {
+		runner.emit(wire.Event{
+			Kind: wire.EventActorStart, AID: "restarted-aid", Generation: generation, Name: "socket",
+		})
+		if command := nextCommand(t, runner); command.Kind != wire.CommandActorStartResult ||
+			command.Generation != generation {
+			t.Fatalf("generation %d start command = %#v", generation, command)
+		}
+	}
+
+	runner.emit(wire.Event{
+		Kind: wire.EventWSOpen, AID: "restarted-aid", Generation: 1, WSID: "old-generation-ws", Path: "/chat",
+	})
+	if generation := <-opened; generation != 1 {
+		t.Fatalf("WebSocket opened on generation %d, want 1", generation)
+	}
+	if command := nextCommand(t, runner); command.Kind != wire.CommandWSOpenResult || !command.Accept {
+		t.Fatalf("open result = %#v", command)
+	}
+	p.wsMu.Lock()
+	owner := p.websockets["old-generation-ws"]
+	p.wsMu.Unlock()
+	if owner.identity.generation != 1 {
+		t.Fatalf("WebSocket owner generation = %d, want 1", owner.identity.generation)
+	}
+
+	cancel()
+	if err := <-result; err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+}
+
 func TestWebSocketEventsAreActorOrderedAndCommandsDoNotUsePoller(t *testing.T) {
 	defer goleak.VerifyNone(t)
 	runner := newFakeRunner()
@@ -2670,8 +2718,8 @@ func TestWebSocketEventsAreActorOrderedAndCommandsDoNotUsePoller(t *testing.T) {
 		t.Fatalf("start command = %#v", command)
 	}
 	runner.emit(
-		wire.Event{Kind: wire.EventWSOpen, AID: "socket-aid", WSID: "ws-a", Path: "/chat", CanHibernate: true},
-		wire.Event{Kind: wire.EventWSOpen, AID: "socket-aid", WSID: "ws-b", Path: "/chat", CanHibernate: true},
+		wire.Event{Kind: wire.EventWSOpen, AID: "socket-aid", Generation: 1, WSID: "ws-a", Path: "/chat", CanHibernate: true},
+		wire.Event{Kind: wire.EventWSOpen, AID: "socket-aid", Generation: 1, WSID: "ws-b", Path: "/chat", CanHibernate: true},
 	)
 	for _, wsID := range []string{"ws-a", "ws-b"} {
 		if got := <-seen; got != "open:"+wsID {
@@ -2753,7 +2801,7 @@ func TestNonHibernatingWebSocketMessageSkipsBoundaryAcknowledgement(t *testing.T
 		t.Fatalf("start command = %#v", command)
 	}
 	runner.emit(wire.Event{
-		Kind: wire.EventWSOpen, AID: "default-aid", WSID: "default-ws", Path: "/chat",
+		Kind: wire.EventWSOpen, AID: "default-aid", Generation: 1, WSID: "default-ws", Path: "/chat",
 	})
 	if command := nextCommand(t, runner); command.Kind != wire.CommandWSOpenResult {
 		t.Fatalf("open command = %#v", command)
@@ -2803,7 +2851,7 @@ func TestWebSocketHandlerPanicRequestsActorErrorStopAndPeerSurvives(t *testing.T
 	)
 	nextCommand(t, runner)
 	nextCommand(t, runner)
-	runner.emit(wire.Event{Kind: wire.EventWSOpen, AID: "panic-aid", WSID: "ws-panic", Path: "/", CanHibernate: true})
+	runner.emit(wire.Event{Kind: wire.EventWSOpen, AID: "panic-aid", Generation: 1, WSID: "ws-panic", Path: "/", CanHibernate: true})
 	nextCommand(t, runner)
 	runner.emit(wire.Event{Kind: wire.EventWSMessage, WSID: "ws-panic", Data: []byte("boom"), MessageIndex: 1})
 	first := nextCommand(t, runner)
@@ -2853,7 +2901,7 @@ func TestWebSocketIDCanBeReusedAfterCloseWithoutStaleCorrelation(t *testing.T) {
 	nextCommand(t, runner)
 	code := uint16(1000)
 	for attempt := range 2 {
-		runner.emit(wire.Event{Kind: wire.EventWSOpen, AID: "socket-aid", WSID: "reused", Path: "/", CanHibernate: true})
+		runner.emit(wire.Event{Kind: wire.EventWSOpen, AID: "socket-aid", Generation: 1, WSID: "reused", Path: "/", CanHibernate: true})
 		if got := <-seen; got != "open:reused" {
 			t.Fatalf("attempt %d open observation = %q", attempt, got)
 		}
@@ -3283,7 +3331,7 @@ func TestPollerNeverBlocksOnBusyActorMailbox(t *testing.T) {
 	if command := nextCommand(t, runner); command.Kind != wire.CommandActorStartResult {
 		t.Fatalf("start command = %#v", command)
 	}
-	runner.emit(wire.Event{Kind: wire.EventWSOpen, AID: "busy-aid", WSID: "ws-busy", Path: "/chat"})
+	runner.emit(wire.Event{Kind: wire.EventWSOpen, AID: "busy-aid", Generation: 1, WSID: "ws-busy", Path: "/chat"})
 	if command := nextCommand(t, runner); command.Kind != wire.CommandWSOpenResult || !command.Accept {
 		t.Fatalf("open result = %#v", command)
 	}

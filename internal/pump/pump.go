@@ -2218,9 +2218,9 @@ func (p *Pump) handleInternalEvent(event wire.Event) error {
 		state.cancel(abortErr)
 		state.body.abort(abortErr)
 	case wire.EventWSOpen:
-		worker := p.currentActor(event.AID)
+		worker := p.actor(event.AID, event.Generation)
 		if worker == nil {
-			return fmt.Errorf("WsOpen for unknown actor %s", event.AID)
+			return fmt.Errorf("WsOpen for unknown actor %s generation %d", event.AID, event.Generation)
 		}
 		p.wsMu.Lock()
 		if _, exists := p.websockets[event.WSID]; exists {
@@ -2865,20 +2865,6 @@ func (p *Pump) actor(aid string, generation uint64) *actorWorker {
 	p.actorsMu.Lock()
 	defer p.actorsMu.Unlock()
 	return p.actors[actorIdentity{aid: aid, generation: generation}]
-}
-
-func (p *Pump) currentActor(aid string) *actorWorker {
-	p.actorsMu.Lock()
-	defer p.actorsMu.Unlock()
-	var current *actorWorker
-	var generation uint64
-	for identity, worker := range p.actors {
-		if identity.aid == aid && (current == nil || identity.generation > generation) {
-			current = worker
-			generation = identity.generation
-		}
-	}
-	return current
 }
 
 func (p *Pump) websocketActor(wsID string) *actorWorker {

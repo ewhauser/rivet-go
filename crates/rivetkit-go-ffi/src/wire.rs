@@ -198,6 +198,7 @@ pub(crate) enum Event {
     },
     WsOpen {
         aid: String,
+        r#gen: u64,
         ws_id: String,
         path: String,
         headers: BTreeMap<String, String>,
@@ -1755,6 +1756,7 @@ mod tests {
             seq: 14,
             events: vec![Event::WsOpen {
                 aid: "actor-golden".to_owned(),
+                r#gen: 7,
                 ws_id: "ws-golden".to_owned(),
                 path: "/chat?room=golden".to_owned(),
                 headers: BTreeMap::from([("x-test".to_owned(), "one".to_owned())]),

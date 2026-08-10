@@ -3202,6 +3202,7 @@ impl ActorProxy {
             .events
             .send(Event::WsOpen {
                 aid: identity.aid.clone(),
+                r#gen: identity.generation,
                 ws_id: ws_id.clone(),
                 path,
                 headers,
