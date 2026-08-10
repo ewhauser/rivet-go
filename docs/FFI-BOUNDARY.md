@@ -862,9 +862,12 @@ names and values retain the one MiB boundary maximum; snapshots allow at most
 an exact actor generation and nonempty connection ID; correlated results require
 a positive operation ID and present state on success. Present-empty state
 remains distinct from an absent result arm. Go validates action output and
-connection state before command submission, returning `action_result_too_large`
-or `connection_state_too_large` for the current operation instead of allowing
-an invalid command batch to stop the shared runner.
+connection state before command submission. For ActorConnect actions,
+connection-state encoding also precedes the action's implicit actor-state save,
+so a rejected connection state cannot partially commit actor state. Validation
+returns `action_result_too_large` or `connection_state_too_large` for the
+current operation instead of allowing an invalid command batch to stop the
+shared runner.
 
 ## M11 durable queues and managed actor work — 2026-08-09
 

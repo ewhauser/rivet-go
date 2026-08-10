@@ -86,8 +86,16 @@ type ActorHandler interface {
 	Stop(context.Context, *ActorSession, wire.Event, any) error
 }
 
+// ActionResult is the complete successful response produced by an actor
+// action. ConnectionState is populated for ActorConnect callers so adapters
+// can validate that state before implicitly persisting actor state.
+type ActionResult struct {
+	Output          []byte
+	ConnectionState *[]byte
+}
+
 type actorActionHandler interface {
-	Action(context.Context, *ActorSession, wire.Event, any) ([]byte, error)
+	Action(context.Context, *ActorSession, wire.Event, any) (ActionResult, error)
 }
 
 type actorRunHandler interface {
@@ -2352,19 +2360,19 @@ func (w *actorWorker) run(start wire.Event) {
 		case wire.EventActionCall:
 			actionTimeout := time.Duration(event.ActionTimeoutMS) * time.Millisecond
 			actionContext, cancelAction := context.WithTimeout(w.ctx, actionTimeout)
-			output, actionError := invokeAction(actionContext, w.handler, w.session, event, state)
+			actionResult, actionError := invokeAction(actionContext, w.handler, w.session, event, state)
 			w.pump.recordHandlerPanic(actionError, "action "+event.Action, w.session)
 			cancelAction()
-			if actionError == nil && output == nil {
-				output = []byte{}
+			if actionError == nil && actionResult.Output == nil {
+				actionResult.Output = []byte{}
 			}
-			var connectionState *[]byte
+			connectionState := actionResult.ConnectionState
 			_, tracksConnectionState := w.handler.(actorConnectionHandler)
-			if actionError == nil && event.ConnID != nil && tracksConnectionState {
+			if actionError == nil && connectionState == nil && event.ConnID != nil && tracksConnectionState {
 				encoded, tracked, stateError := invokeConnectionState(w.ctx, w.handler, w.session, *event.ConnID, state)
 				if stateError != nil {
 					actionError = stateError
-					output = nil
+					actionResult.Output = nil
 				} else if tracked {
 					connectionState = byteSlicePointer(encoded)
 				}
@@ -2372,7 +2380,7 @@ func (w *actorWorker) run(start wire.Event) {
 			if err := w.pump.submitInternal(w.ctx, wire.Command{
 				Kind:            wire.CommandActionResult,
 				CallID:          event.CallID,
-				Output:          output,
+				Output:          actionResult.Output,
 				ConnectionState: connectionState,
 				Error:           actionError,
 			}); err != nil {
@@ -2605,10 +2613,10 @@ func invokeAction(
 	session *ActorSession,
 	event wire.Event,
 	state any,
-) (output []byte, actionError *wire.WireError) {
+) (result ActionResult, actionError *wire.WireError) {
 	defer func() {
 		if recovered := recover(); recovered != nil {
-			output = nil
+			result = ActionResult{}
 			actionError = &wire.WireError{
 				Code:    "handler_panic",
 				Message: fmt.Sprintf("action %q panicked: %v", event.Action, recovered),
@@ -2617,16 +2625,20 @@ func invokeAction(
 	}()
 	actionHandler, ok := handler.(actorActionHandler)
 	if !ok {
-		return nil, &wire.WireError{
+		return ActionResult{}, &wire.WireError{
 			Code:    "action_not_found",
 			Message: fmt.Sprintf("action %q is not registered", event.Action),
 		}
 	}
-	output, err := actionHandler.Action(ctx, session, event, state)
+	result, err := actionHandler.Action(ctx, session, event, state)
 	if err != nil {
-		return nil, handlerWireError("action "+event.Action, err)
+		return ActionResult{}, handlerWireError("action "+event.Action, err)
 	}
-	return cloneBytes(output), nil
+	result.Output = cloneBytes(result.Output)
+	if result.ConnectionState != nil {
+		result.ConnectionState = byteSlicePointer(*result.ConnectionState)
+	}
+	return result, nil
 }
 
 func invokeRun(

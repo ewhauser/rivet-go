@@ -25,6 +25,10 @@ type sizedConnectionState struct {
 	Size int
 }
 
+type actionAtomicityState struct {
+	Count int
+}
+
 func (s sizedConnectionState) MarshalBinary() ([]byte, error) {
 	return bytes.Repeat([]byte{'s'}, s.Size), nil
 }
@@ -260,6 +264,62 @@ func TestConnectionStateSizeLimit(t *testing.T) {
 			t.Fatalf("oversized open left tracked connections: active=%#v pending=%#v", actorContext.connections, actorContext.pendingConnections)
 		}
 	})
+}
+
+func TestActorConnectActionValidatesConnectionStateBeforePersisting(t *testing.T) {
+	adapter := &actorAdapter[actionAtomicityState]{definition: Actor[actionAtomicityState]{
+		ConnectionState: NewConnectionState(func(
+			*Context[actionAtomicityState], *Connection,
+		) (sizedConnectionState, error) {
+			return sizedConnectionState{Size: 1}, nil
+		}),
+		Actions: Actions[actionAtomicityState]{
+			"overflow": Action(func(
+				actor *Context[actionAtomicityState], _ struct{},
+			) (int, error) {
+				actor.State().Count++
+				connection := actor.CurrentConnection()
+				connectionState, err := GetConnectionState[sizedConnectionState](connection)
+				if err != nil {
+					return 0, err
+				}
+				connectionState.Size = maxConnectionStateBytes + 1
+				return actor.State().Count, nil
+			}),
+		},
+	}}
+	actorContext := newConnectionTestContext[actionAtomicityState]()
+	snapshot := wire.Connection{ID: "action-overflow", ActorConnect: true}
+	preflight, err := adapter.ConnectionPreflight(context.Background(), nil, wire.Event{
+		Kind: wire.EventConnectionPreflight, Connection: &snapshot,
+	}, actorContext)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot.State = preflight
+	if _, err := adapter.ConnectionOpen(context.Background(), nil, wire.Event{
+		Kind: wire.EventConnectionOpen, Connection: &snapshot,
+	}, actorContext); err != nil {
+		t.Fatal(err)
+	}
+	args, err := cbor.Marshal([]any{struct{}{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := adapter.Action(context.Background(), nil, wire.Event{
+		Kind: wire.EventActionCall, Action: "overflow", Args: args, ConnID: &snapshot.ID,
+	}, actorContext)
+	var structured pump.HandlerError
+	if !errors.As(err, &structured) || structured.Code != "connection_state_too_large" {
+		t.Fatalf("action error = %#v, want connection_state_too_large HandlerError", err)
+	}
+	if result.Output != nil || result.ConnectionState != nil {
+		t.Fatalf("failed action result = %#v, want empty", result)
+	}
+	if actorContext.State().Count != 1 {
+		t.Fatalf("action was not invoked before connection-state validation: state=%#v", actorContext.State())
+	}
 }
 
 func decodeJSONState[T any](data []byte, target *T) error {

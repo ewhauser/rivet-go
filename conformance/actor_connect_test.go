@@ -1,6 +1,7 @@
 package conformance
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -33,6 +34,39 @@ type actorConnectMessage struct {
 	eventArgs []cbor.RawMessage
 	errorCode string
 	errorText string
+}
+
+type actorConnectAtomicState struct {
+	Count int `json:"count"`
+}
+
+func (s actorConnectAtomicState) MarshalBinary() ([]byte, error) {
+	return []byte{byte(s.Count)}, nil
+}
+
+func (s *actorConnectAtomicState) UnmarshalBinary(data []byte) error {
+	if len(data) == 0 {
+		s.Count = 0
+		return nil
+	}
+	if len(data) != 1 {
+		return fmt.Errorf("actor state length = %d, want 1", len(data))
+	}
+	s.Count = int(data[0])
+	return nil
+}
+
+type actorConnectOversizedState struct {
+	Size int
+}
+
+func (s actorConnectOversizedState) MarshalBinary() ([]byte, error) {
+	return bytes.Repeat([]byte{'s'}, s.Size), nil
+}
+
+func (s *actorConnectOversizedState) UnmarshalBinary(data []byte) error {
+	s.Size = len(data)
+	return nil
 }
 
 func openActorConnect(
@@ -137,6 +171,39 @@ func actorConnectCall[T any](
 				t.Fatalf("ActorConnect error ID = %d, want %d", message.actionID, actionID)
 			}
 			t.Fatalf("ActorConnect %s failed: %s: %s", action, message.errorCode, message.errorText)
+		default:
+			t.Fatalf("unexpected ActorConnect message while calling %s: %#v", action, message)
+		}
+	}
+}
+
+func actorConnectCallError(
+	t *testing.T,
+	client *actorConnectClient,
+	action string,
+	args ...any,
+) actorConnectMessage {
+	t.Helper()
+	actionID := client.nextActionID
+	client.nextActionID++
+	client.write(t, map[string]any{
+		"body": map[string]any{
+			"tag": "ActionRequest",
+			"val": map[string]any{"id": actionID, "name": action, "args": args},
+		},
+	})
+	for {
+		message := client.read(t)
+		switch message.tag {
+		case "Event":
+			client.events = append(client.events, message)
+		case "Error":
+			if message.actionID != actionID {
+				t.Fatalf("ActorConnect error ID = %d, want %d", message.actionID, actionID)
+			}
+			return message
+		case "ActionResponse":
+			t.Fatalf("ActorConnect %s unexpectedly succeeded: %#v", action, message)
 		default:
 			t.Fatalf("unexpected ActorConnect message while calling %s: %#v", action, message)
 		}
@@ -267,6 +334,139 @@ func (c *actorConnectClient) close() {
 	)
 	_ = c.conn.Close()
 	c.conn = nil
+}
+
+func TestActorConnectRejectedStateDoesNotPersistActorMutation(t *testing.T) {
+	if testing.Short() {
+		t.Skip("real-engine conformance is disabled by -short")
+	}
+	engineBinary, err := acquireEngine(context.Background())
+	if err != nil {
+		t.Fatalf("obtain Rivet engine %s: %v\n%s", engineTag, err, engineRemediation())
+	}
+	engine := startEngine(t, engineBinary)
+
+	type observation struct {
+		actorID    string
+		generation uint64
+		count      int
+	}
+	started := make(chan observation, 4)
+	stopped := make(chan observation, 2)
+	registry := rivet.NewRegistry()
+	if err := rivet.Register(registry, "actor-connect-atomic", rivet.Actor[actorConnectAtomicState]{
+		OnStart: func(ctx *rivet.Context[actorConnectAtomicState]) error {
+			started <- observation{
+				actorID: ctx.ActorID(), generation: ctx.Generation(), count: ctx.State().Count,
+			}
+			return nil
+		},
+		OnStop: func(ctx *rivet.Context[actorConnectAtomicState]) error {
+			stopped <- observation{
+				actorID: ctx.ActorID(), generation: ctx.Generation(), count: ctx.State().Count,
+			}
+			return nil
+		},
+		ConnectionState: rivet.NewConnectionState(func(
+			*rivet.Context[actorConnectAtomicState], *rivet.Connection,
+		) (actorConnectOversizedState, error) {
+			return actorConnectOversizedState{Size: 1}, nil
+		}),
+		Actions: rivet.Actions[actorConnectAtomicState]{
+			"overflow": rivet.Action(func(
+				ctx *rivet.Context[actorConnectAtomicState], _ struct{},
+			) (int, error) {
+				ctx.State().Count++
+				connectionState, stateErr := rivet.GetConnectionState[actorConnectOversizedState](
+					ctx.CurrentConnection(),
+				)
+				if stateErr != nil {
+					return 0, stateErr
+				}
+				connectionState.Size = (1 << 20) + 1
+				return ctx.State().Count, nil
+			}),
+			"get": rivet.Action(func(
+				ctx *rivet.Context[actorConnectAtomicState], _ struct{},
+			) (int, error) {
+				return ctx.State().Count, nil
+			}),
+		},
+	}); err != nil {
+		t.Fatalf("register ActorConnect atomicity actor: %v", err)
+	}
+	runnerName := fmt.Sprintf("rivet-go-actor-connect-atomic-%d", time.Now().UnixNano())
+	served := startRegistry(t, engine, runnerName, registry)
+	actor := createActor(t, engine.endpoint, "actor-connect-atomic", runnerName, "restart", nil, nil)
+
+	var first observation
+	select {
+	case first = <-started:
+	case <-time.After(30 * time.Second):
+		t.Fatal("ActorConnect atomicity actor did not start")
+	}
+	waitForActor(t, engine.endpoint, actor.ActorID, false, func(actor actorRecord) bool {
+		return actor.ConnectableTS != nil && actor.DestroyTS == nil
+	})
+	client := openActorConnect(t, engine.endpoint, actor.ActorID, struct{}{})
+	failure := actorConnectCallError(t, client, "overflow", struct{}{})
+	if failure.errorCode != "connection_state_too_large" {
+		t.Fatalf("ActorConnect overflow error = %#v, want connection_state_too_large", failure)
+	}
+
+	engine.kill(t)
+	select {
+	case stoppedActor := <-stopped:
+		if stoppedActor.actorID != actor.ActorID || stoppedActor.generation != first.generation ||
+			stoppedActor.count != 1 {
+			t.Fatalf("pre-restart ActorConnect atomicity stop = %#v, first = %#v", stoppedActor, first)
+		}
+	case err := <-served.result:
+		served.stopOnce.Do(func() {
+			served.cancel()
+			served.stopErr = err
+		})
+		t.Fatalf("runner exited while the engine was stopped: %v", err)
+	case <-time.After(disconnectLivenessWindow + 10*time.Second):
+		t.Fatal("ActorConnect atomicity actor did not stop after engine loss")
+	}
+
+	engine.start(t)
+	waitForActor(t, engine.endpoint, actor.ActorID, true, func(actor actorRecord) bool {
+		return actor.ConnectableTS == nil && len(actor.Error) != 0
+	})
+	wakeResult := wakeActor(engine.endpoint, actor.ActorID, rehydrateWindow)
+	var rehydrated observation
+	select {
+	case rehydrated = <-started:
+	case err := <-served.result:
+		served.stopOnce.Do(func() {
+			served.cancel()
+			served.stopErr = err
+		})
+		t.Fatalf("runner exited before ActorConnect atomicity rehydration: %v", err)
+	case <-time.After(rehydrateWindow):
+		t.Fatal("ActorConnect atomicity actor was not rehydrated after engine restart")
+	}
+	if rehydrated.actorID != actor.ActorID || rehydrated.count != 0 ||
+		rehydrated.generation <= first.generation {
+		t.Fatalf("rehydrated ActorConnect atomicity actor = %#v, first = %#v", rehydrated, first)
+	}
+	select {
+	case wakeErr := <-wakeResult:
+		if wakeErr != nil {
+			t.Fatalf("gateway wake request: %v", wakeErr)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("gateway wake request did not complete")
+	}
+	assertActionOutput(
+		t,
+		gatewayAction(t, engine.endpoint, actor.ActorID, "get", []any{struct{}{}}, 10*time.Second),
+		http.StatusOK,
+		0,
+	)
+	deleteActor(t, engine.endpoint, actor.ActorID)
 }
 
 func TestActorConnectConnectionContextPersistsAcrossSleep(t *testing.T) {

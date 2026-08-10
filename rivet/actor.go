@@ -510,16 +510,16 @@ func (a *actorAdapter[T]) Action(
 	_ *pump.ActorSession,
 	event wire.Event,
 	state any,
-) ([]byte, error) {
+) (pump.ActionResult, error) {
 	actorContext, ok := state.(*Context[T])
 	if !ok || actorContext == nil {
-		return nil, errors.New("typed actor context is unavailable during action")
+		return pump.ActionResult{}, errors.New("typed actor context is unavailable during action")
 	}
 	actorContext.turnMu.Lock()
 	defer actorContext.turnMu.Unlock()
 	action := a.definition.Actions[event.Action]
 	if action == nil {
-		return nil, pump.HandlerError{
+		return pump.ActionResult{}, pump.HandlerError{
 			Code:    "action_not_found",
 			Message: fmt.Sprintf("action %q is not registered", event.Action),
 		}
@@ -530,7 +530,7 @@ func (a *actorAdapter[T]) Action(
 		current = actorContext.connections[*event.ConnID]
 		actorContext.connectionsMu.Unlock()
 		if current == nil {
-			return nil, pump.HandlerError{
+			return pump.ActionResult{}, pump.HandlerError{
 				Code:    "connection_not_found",
 				Message: fmt.Sprintf("calling connection %q is not active", *event.ConnID),
 			}
@@ -549,17 +549,25 @@ func (a *actorAdapter[T]) Action(
 	}()
 	output, err := action.invoke(ctx, actorContext, event.Args)
 	if err != nil {
-		return nil, err
+		return pump.ActionResult{}, err
+	}
+	var connectionState *[]byte
+	if current != nil {
+		encoded, encodeErr := a.encodeConnectionState(current)
+		if encodeErr != nil {
+			return pump.ActionResult{}, encodeErr
+		}
+		connectionState = &encoded
 	}
 	if !actorContext.destructionRequested() {
 		if err := actorContext.Save(ctx); err != nil {
-			return nil, pump.HandlerError{
+			return pump.ActionResult{}, pump.HandlerError{
 				Code:    "action_state_persist_failed",
 				Message: err.Error(),
 			}
 		}
 	}
-	return output, nil
+	return pump.ActionResult{Output: output, ConnectionState: connectionState}, nil
 }
 
 func (a *actorAdapter[T]) Alarm(
