@@ -734,7 +734,9 @@ u16 embedded version in little-endian order. The outer frame is a big-endian
 u32 length. BARE fixed-width values are little-endian; variants and collection
 lengths use unsigned varints. The 10-second hello must return version 1 and a
 positive `maxFrameBytes`; the client honors the smaller of that value and
-core's 32 MiB default.
+core's 32 MiB default. Handshake writes and reads actively expire their socket
+deadline when the dial context is canceled, including cancelable contexts that
+do not carry a deadline, and clear that deadline before normal I/O begins.
 
 Requests use nonzero u32 IDs with a correlation table, context-aware serialized
 writer, and reader goroutine. Waiting for the writer and writing the frame both

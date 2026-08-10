@@ -48,17 +48,11 @@ func Dial(ctx context.Context, path string) (*Client, error) {
 		pending:  make(map[uint32]chan response),
 		closed:   make(chan struct{}),
 	}
-	if deadline, ok := ctx.Deadline(); ok {
-		if err := conn.SetDeadline(deadline); err != nil {
-			_ = conn.Close()
-			return nil, fmt.Errorf("set Actor Runtime Socket handshake deadline: %w", err)
-		}
-	}
 	if _, err := client.writeFrame(ctx, encodeHello()); err != nil {
 		_ = conn.Close()
 		return nil, fmt.Errorf("write Actor Runtime Socket hello: %w", err)
 	}
-	payload, err := readFrame(conn, defaultMaxFrame)
+	payload, err := readFrameContext(ctx, conn, defaultMaxFrame)
 	if err != nil {
 		_ = conn.Close()
 		return nil, fmt.Errorf("read Actor Runtime Socket hello: %w", err)
@@ -67,10 +61,6 @@ func Dial(ctx context.Context, path string) (*Client, error) {
 	if err != nil {
 		_ = conn.Close()
 		return nil, err
-	}
-	if err := conn.SetDeadline(time.Time{}); err != nil {
-		_ = conn.Close()
-		return nil, fmt.Errorf("clear Actor Runtime Socket handshake deadline: %w", err)
 	}
 	go client.readLoop()
 	return client, nil
@@ -280,6 +270,38 @@ func readFrame(reader io.Reader, maxFrame uint32) ([]byte, error) {
 	}
 	payload := make([]byte, int(length))
 	if _, err := io.ReadFull(reader, payload); err != nil {
+		return nil, err
+	}
+	return payload, nil
+}
+
+func readFrameContext(ctx context.Context, conn net.Conn, maxFrame uint32) (payload []byte, resultErr error) {
+	deadline := time.Time{}
+	if value, ok := ctx.Deadline(); ok {
+		deadline = value
+	}
+	if err := conn.SetReadDeadline(deadline); err != nil {
+		return nil, fmt.Errorf("set Actor Runtime Socket read deadline: %w", err)
+	}
+	cancelDone := make(chan struct{})
+	stopCancel := context.AfterFunc(ctx, func() {
+		_ = conn.SetReadDeadline(time.Now())
+		close(cancelDone)
+	})
+	defer func() {
+		if !stopCancel() {
+			<-cancelDone
+		}
+		if err := conn.SetReadDeadline(time.Time{}); resultErr == nil && err != nil {
+			resultErr = fmt.Errorf("clear Actor Runtime Socket read deadline: %w", err)
+		}
+	}()
+
+	payload, err := readFrame(conn, maxFrame)
+	if err != nil {
+		if contextErr := ctx.Err(); contextErr != nil {
+			return nil, contextErr
+		}
 		return nil, err
 	}
 	return payload, nil
