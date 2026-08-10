@@ -20,7 +20,11 @@ type typedConnectionStateConfig[T, C any] struct {
 
 // NewConnectionState configures an actor-defined initializer for typed
 // per-connection state. The initializer runs during core connection preflight,
-// before the connection becomes visible through Context.Connections.
+// before the connection becomes visible through Context.Connections. The
+// initializer's Connection is a callback-scoped snapshot and is closed after
+// the callback. State is serialized between preflight and admission; custom
+// binary state must support both encoding.BinaryMarshaler and
+// encoding.BinaryUnmarshaler.
 func NewConnectionState[T, C any](
 	initializer func(*Context[T], *Connection) (C, error),
 ) ConnectionStateConfig[T] {

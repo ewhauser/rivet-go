@@ -80,7 +80,6 @@ type Context[T any] struct {
 	saveMu              sync.Mutex
 	connectionsMu       sync.Mutex
 	connections         map[string]*Connection
-	pendingConnections  map[string]*Connection
 	currentConnectionMu sync.RWMutex
 	currentConnection   *Connection
 	lifecycleMu         sync.Mutex
@@ -423,17 +422,16 @@ func (a *actorAdapter[T]) Start(
 	}
 	managedCtx, managedCancel := context.WithCancel(ctx)
 	actorContext := &Context[T]{
-		session:            session,
-		client:             a.clientForActor(session.AID()),
-		db:                 db,
-		kv:                 newKV(session),
-		schedules:          newActionSchedules(session, a.definition.Actions),
-		queue:              newQueue(session),
-		state:              state,
-		connections:        make(map[string]*Connection),
-		pendingConnections: make(map[string]*Connection),
-		managedCtx:         managedCtx,
-		managedCancel:      managedCancel,
+		session:       session,
+		client:        a.clientForActor(session.AID()),
+		db:            db,
+		kv:            newKV(session),
+		schedules:     newActionSchedules(session, a.definition.Actions),
+		queue:         newQueue(session),
+		state:         state,
+		connections:   make(map[string]*Connection),
+		managedCtx:    managedCtx,
+		managedCancel: managedCancel,
 	}
 	startComplete := false
 	defer func() {
@@ -697,6 +695,7 @@ func (a *actorAdapter[T]) ConnectionPreflight(
 		return nil, errors.New("connection preflight snapshot is unavailable")
 	}
 	connection := newActorConnection(session, *event.Connection)
+	defer connection.markClosed()
 	if connection.actorConnect && a.definition.ConnectionState != nil {
 		connectionState, err := a.definition.ConnectionState.initialize(actorContext, connection)
 		if err != nil {
@@ -714,11 +713,6 @@ func (a *actorAdapter[T]) ConnectionPreflight(
 		actorContext.connectionsMu.Unlock()
 		return nil, pump.HandlerError{Code: "connection_duplicate", Message: "connection is already active"}
 	}
-	if _, exists := actorContext.pendingConnections[connection.ID()]; exists {
-		actorContext.connectionsMu.Unlock()
-		return nil, pump.HandlerError{Code: "connection_duplicate", Message: "connection preflight is already pending"}
-	}
-	actorContext.pendingConnections[connection.ID()] = connection
 	actorContext.connectionsMu.Unlock()
 	return encoded, nil
 }
@@ -738,19 +732,18 @@ func (a *actorAdapter[T]) ConnectionOpen(
 	if event.Connection == nil {
 		return nil, errors.New("connection open snapshot is unavailable")
 	}
-	actorContext.connectionsMu.Lock()
-	connection := actorContext.pendingConnections[event.Connection.ID]
-	delete(actorContext.pendingConnections, event.Connection.ID)
-	if connection == nil {
-		connection = newActorConnection(session, *event.Connection)
-		if connection.actorConnect && a.definition.ConnectionState != nil {
-			connectionState, err := a.definition.ConnectionState.decode(event.Connection.State)
-			if err != nil {
-				actorContext.connectionsMu.Unlock()
-				return nil, err
-			}
-			connection.state = connectionState
+	connection := newActorConnection(session, *event.Connection)
+	if connection.actorConnect && a.definition.ConnectionState != nil {
+		connectionState, err := a.definition.ConnectionState.decode(event.Connection.State)
+		if err != nil {
+			return nil, err
 		}
+		connection.state = connectionState
+	}
+	actorContext.connectionsMu.Lock()
+	if _, exists := actorContext.connections[connection.ID()]; exists {
+		actorContext.connectionsMu.Unlock()
+		return nil, pump.HandlerError{Code: "connection_duplicate", Message: "connection is already active"}
 	}
 	actorContext.connections[connection.ID()] = connection
 	actorContext.connectionsMu.Unlock()
@@ -793,7 +786,6 @@ func (a *actorAdapter[T]) ConnectionClose(
 	actorContext.connectionsMu.Lock()
 	connection := actorContext.connections[event.Connection.ID]
 	delete(actorContext.connections, event.Connection.ID)
-	delete(actorContext.pendingConnections, event.Connection.ID)
 	actorContext.connectionsMu.Unlock()
 	if connection == nil {
 		connection = newActorConnection(actorContext.session, *event.Connection)
@@ -826,9 +818,6 @@ func (a *actorAdapter[T]) ConnectionState(
 	defer actorContext.turnMu.Unlock()
 	actorContext.connectionsMu.Lock()
 	connection := actorContext.connections[connectionID]
-	if connection == nil {
-		connection = actorContext.pendingConnections[connectionID]
-	}
 	actorContext.connectionsMu.Unlock()
 	if connection == nil {
 		return nil, false, nil
@@ -983,10 +972,6 @@ func (a *actorAdapter[T]) CloseWebSockets(
 		if connection.rawWebSocket {
 			connections = append(connections, connection)
 		}
-	}
-	for id, connection := range actorContext.pendingConnections {
-		delete(actorContext.pendingConnections, id)
-		connection.setClose(nil, reason)
 	}
 	actorContext.connectionsMu.Unlock()
 	if reason == "sleep" {
