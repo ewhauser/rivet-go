@@ -1,4 +1,5 @@
 /target/
+/crates/rivet-depot-client-pinned/Cargo.lock
 /.rivet-go/
 /bench/.bin/
 /bench/results/

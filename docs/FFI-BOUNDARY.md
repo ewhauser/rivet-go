@@ -812,6 +812,14 @@ regression can force both final-flush outcomes and verify the main-file close
 callback and native close result. These are local pin corrections, not a
 dependency or Rivet version change.
 
+The standalone Depot manifest declares the Tokio runtime, sync, and time
+capabilities used by its source instead of relying on feature unification from
+the FFI consumer. Its library test target remains disabled because upstream's
+inline VFS suite depends on engine-workspace-only fixtures that are not part of
+this vendored package; the corresponding dangling test-module declaration is
+omitted. CI checks the standalone manifest with all targets so both packaging
+constraints remain enforced.
+
 ### Engine replacement recovery
 
 At this pin, a LocalNative database actor left live across abrupt standalone

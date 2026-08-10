@@ -173,6 +173,11 @@ jobs:
         with:
           cache-on-failure: true
 
+      - name: Check pinned Depot crate standalone
+        env:
+          CARGO_TARGET_DIR: ${{ github.workspace }}/target
+        run: cargo check --manifest-path crates/rivet-depot-client-pinned/Cargo.toml --all-targets
+
       - name: Install cargo-deny and cargo-about
         run: |
           cargo install cargo-deny --version 0.20.2 --locked

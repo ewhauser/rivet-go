@@ -3529,7 +3529,3 @@ pub fn verify_batch_atomic_writes(
 
 	Ok(())
 }
-
-#[cfg(test)]
-#[path = "../tests/inline/vfs.rs"]
-mod tests;

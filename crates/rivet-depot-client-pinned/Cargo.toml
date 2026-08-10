@@ -28,7 +28,7 @@ anyhow = "1.0.82"
 async-trait = "0.1"
 crossbeam-channel = "0.5"
 libsqlite3-sys = { version = "0.30", features = ["bundled"] }
-tokio = "1"
+tokio = { version = "1", features = ["rt", "sync", "time"] }
 tracing = "0.1"
 getrandom = "0.2"
 rivet-envoy-protocol = { git = "https://github.com/rivet-dev/rivet", tag = "v2.3.10" }
