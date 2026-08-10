@@ -2353,6 +2353,66 @@ func TestKVCommandsCarryExactActorGeneration(t *testing.T) {
 	}
 }
 
+func TestPreCanceledKVMutationsDoNotSubmit(t *testing.T) {
+	defer goleak.VerifyNone(t)
+	runner := newFakeRunner()
+	sessionReady := make(chan *ActorSession, 1)
+	p := NewWithHandlers(runner, map[string]ActorHandler{
+		"kv": lifecycleHandler{start: func(_ context.Context, session *ActorSession, _ wire.Event) (any, error) {
+			sessionReady <- session
+			return nil, nil
+		}},
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	runResult := make(chan error, 1)
+	go func() { runResult <- p.Run(ctx) }()
+	waitPumpStarted(t, p)
+	runner.emit(wire.Event{
+		Kind:       wire.EventActorStart,
+		AID:        "actor-kv-canceled",
+		Generation: 1,
+		Name:       "kv",
+	})
+	if command := nextCommand(t, runner); command.Kind != wire.CommandActorStartResult || !command.OK {
+		t.Fatalf("start command kind/status = %q/%t", command.Kind, command.OK)
+	}
+	session := <-sessionReady
+
+	cancelled, cancelOperation := context.WithCancel(context.Background())
+	cancelOperation()
+	if err := session.KVPut(cancelled, []byte("key"), []byte("value")); !errors.Is(err, context.Canceled) {
+		t.Fatalf("KVPut error = %v, want context.Canceled", err)
+	}
+	if err := session.KVDelete(cancelled, []byte("key")); !errors.Is(err, context.Canceled) {
+		t.Fatalf("KVDelete error = %v, want context.Canceled", err)
+	}
+	select {
+	case command := <-runner.submitted:
+		t.Fatalf("pre-canceled KV mutation submitted command %#v", command)
+	default:
+	}
+	p.kvMu.Lock()
+	pending := len(p.kvPending)
+	p.kvMu.Unlock()
+	if pending != 0 {
+		t.Fatalf("pre-canceled KV mutation allocated %d waiters", pending)
+	}
+
+	runner.emit(wire.Event{
+		Kind:       wire.EventActorStop,
+		AID:        "actor-kv-canceled",
+		Generation: 1,
+		Reason:     "destroy",
+	})
+	if command := nextCommand(t, runner); command.Kind != wire.CommandActorStopResult {
+		t.Fatalf("stop command kind = %q", command.Kind)
+	}
+	cancel()
+	if err := <-runResult; err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+}
+
 func TestKVIDSkipsZeroAndReusesOnlyCompletedID(t *testing.T) {
 	runner := newFakeRunner()
 	sessionReady := make(chan *ActorSession, 1)
