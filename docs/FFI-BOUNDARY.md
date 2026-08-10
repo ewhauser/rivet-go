@@ -271,6 +271,8 @@ shape. At `v2.3.10`, a destroy already requested through the management API
 still completes as destroyed even when the graceful-cleanup hook fails, so the
 engine-visible assertion is the stopped/destroyed actor plus continued runner
 health. The precise `handler_panic` arm is asserted at the FFI command boundary.
+Before that result is emitted, Go drains admitted managed work, cancels the
+generation context, and closes its database even when `OnStop` panics.
 The same structured-error convention applies to `ActorStartResult`, whose
 startup failure is retained by the engine as the actor error.
 

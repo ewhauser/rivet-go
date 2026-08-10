@@ -66,6 +66,54 @@ func TestActorAdapterStopClosesDatabaseWhenOnStopFails(t *testing.T) {
 	}
 }
 
+func TestActorAdapterStopCleansUpWhenOnStopPanics(t *testing.T) {
+	backend := &lifecycleSQLiteBackend{closed: make(chan struct{})}
+	managedCtx, managedCancel := context.WithCancel(context.Background())
+	managedRelease := make(chan struct{})
+	managedFinished := make(chan struct{})
+	actorContext := &Context[struct{}]{
+		db:            makeDB(backend),
+		managedCtx:    managedCtx,
+		managedCancel: managedCancel,
+	}
+	actorContext.managedWG.Add(1)
+	go func() {
+		defer actorContext.managedWG.Done()
+		defer close(managedFinished)
+		<-managedRelease
+	}()
+	adapter := &actorAdapter[struct{}]{definition: Actor[struct{}]{
+		OnStop: func(*Context[struct{}]) error {
+			close(managedRelease)
+			panic("on-stop panic")
+		},
+	}}
+
+	recovered := func() (panicValue any) {
+		defer func() { panicValue = recover() }()
+		_ = adapter.Stop(context.Background(), nil, wire.Event{}, actorContext)
+		return nil
+	}()
+	if recovered != "on-stop panic" {
+		t.Fatalf("Stop panic = %#v, want on-stop panic", recovered)
+	}
+	select {
+	case <-managedFinished:
+	default:
+		t.Fatal("managed work was not drained")
+	}
+	select {
+	case <-backend.closed:
+	default:
+		t.Fatal("database was not closed")
+	}
+	select {
+	case <-managedCtx.Done():
+	default:
+		t.Fatal("managed context was not cancelled")
+	}
+}
+
 func TestActorAdapterStopFencesManagedWorkBeforeOnStop(t *testing.T) {
 	backend := &lifecycleSQLiteBackend{closed: make(chan struct{})}
 	managedCtx, managedCancel := context.WithCancel(context.Background())

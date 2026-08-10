@@ -476,7 +476,7 @@ func (a *actorAdapter[T]) Stop(
 	_ *pump.ActorSession,
 	_ wire.Event,
 	state any,
-) error {
+) (stopErr error) {
 	actorContext, ok := state.(*Context[T])
 	if !ok || actorContext == nil {
 		return errors.New("typed actor context is unavailable during stop")
@@ -487,12 +487,16 @@ func (a *actorAdapter[T]) Stop(
 	actorContext.stopManagedAdmission()
 	actorContext.turnMu.Lock()
 	defer actorContext.turnMu.Unlock()
-	var stopErr error
+	defer func() {
+		drainErr := actorContext.drainManaged()
+		stopErr = completeActorStop(
+			stopErr, drainErr, actorContext.managedCancel, actorContext.db.close,
+		)
+	}()
 	if a.definition.OnStop != nil {
 		stopErr = a.definition.OnStop(actorContext)
 	}
-	drainErr := actorContext.drainManaged()
-	return completeActorStop(stopErr, drainErr, actorContext.managedCancel, actorContext.db.close)
+	return stopErr
 }
 
 func completeActorStop(
