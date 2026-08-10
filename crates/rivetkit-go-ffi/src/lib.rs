@@ -650,6 +650,28 @@ mod tests {
         assert_eq!(count.rows, vec![vec![ColumnValue::Integer(0)]]);
     }
 
+    #[test]
+    fn sqlite_single_statement_accepts_trailing_comments() {
+        let db = MemoryDb::open();
+        for sql in [
+            "SELECT 1; -- trailing comment",
+            "SELECT 1; /* trailing ; SELECT 2 */",
+            "SELECT 1; /* first */ -- second\n",
+            "SELECT 1; /* unterminated trailing comment",
+        ] {
+            let result = execute_single_statement(db.as_ptr(), sql, None)
+                .expect("trailing comments should not count as another statement");
+            assert_eq!(result.rows, vec![vec![ColumnValue::Integer(1)]], "{sql}");
+        }
+
+        execute_single_statement(
+            db.as_ptr(),
+            "SELECT 1; /* trailing comment */ SELECT 2;",
+            None,
+        )
+        .expect_err("a statement after a trailing comment should fail");
+    }
+
     fn assert_parameter_count_error(error: &anyhow::Error, expected: usize, received: usize) {
         let typed = error.downcast_ref::<SqliteStatementError>().unwrap();
         assert_eq!(typed.code, SQLITE_RANGE);
