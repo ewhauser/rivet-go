@@ -488,14 +488,22 @@ pub unsafe extern "C" fn rk_windows_test_panic(out: *mut RkSubmitResult) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::CString;
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
     use anyhow::Result;
+    use depot_client::query::{
+        BindParam, ColumnValue, SqliteStatementError, exec_statements, execute_single_statement,
+        execute_statement, query_statement,
+    };
     use depot_client::vfs::{
         SqliteTransport, SqliteTransportHandle, SqliteVfs, VfsConfig, open_connection,
     };
-    use libsqlite3_sys::{SQLITE_OPEN_CREATE, SQLITE_OPEN_READWRITE};
+    use libsqlite3_sys::{
+        SQLITE_OK, SQLITE_OPEN_CREATE, SQLITE_OPEN_READWRITE, SQLITE_RANGE, sqlite3, sqlite3_close,
+        sqlite3_open,
+    };
     use rivet_envoy_protocol as protocol;
 
     #[derive(Clone, Copy)]
@@ -506,6 +514,31 @@ mod tests {
 
     struct FinalFlushTransport {
         behavior: FinalFlushBehavior,
+    }
+
+    struct MemoryDb(*mut sqlite3);
+
+    impl MemoryDb {
+        fn open() -> Self {
+            let name = CString::new(":memory:").expect("valid SQLite name");
+            let mut db = ptr::null_mut();
+            // SAFETY: name is a live NUL-terminated string and db is writable.
+            let rc = unsafe { sqlite3_open(name.as_ptr(), &mut db) };
+            assert_eq!(rc, SQLITE_OK);
+            Self(db)
+        }
+
+        fn as_ptr(&self) -> *mut sqlite3 {
+            self.0
+        }
+    }
+
+    impl Drop for MemoryDb {
+        fn drop(&mut self) {
+            // SAFETY: this test owns the live SQLite connection.
+            let rc = unsafe { sqlite3_close(self.0) };
+            assert_eq!(rc, SQLITE_OK);
+        }
     }
 
     #[async_trait::async_trait]
@@ -568,6 +601,63 @@ mod tests {
     #[test]
     fn pinned_core_probe_executes_upstream_code() {
         assert!(core_pin_probe());
+    }
+
+    #[test]
+    fn sqlite_execution_requires_exact_parameter_count() {
+        let db = MemoryDb::open();
+        let cases = [
+            ("SELECT ?, ?;", Some(&[BindParam::Integer(1)][..]), 2, 1),
+            ("SELECT ?;", None, 1, 0),
+            (
+                "SELECT ?;",
+                Some(&[BindParam::Integer(1), BindParam::Integer(2)][..]),
+                1,
+                2,
+            ),
+        ];
+
+        for (sql, params, expected, received) in cases {
+            let err = execute_single_statement(db.as_ptr(), sql, params)
+                .expect_err("mismatched parameter count should fail");
+            assert_parameter_count_error(&err, expected, received);
+        }
+
+        let err = execute_statement(db.as_ptr(), "SELECT ?, ?;", None)
+            .expect_err("legacy execute path should reject missing parameters");
+        assert_parameter_count_error(&err, 2, 0);
+        let err = query_statement(db.as_ptr(), "SELECT ?, ?;", Some(&[BindParam::Integer(1)]))
+            .expect_err("legacy query path should reject missing parameters");
+        assert_parameter_count_error(&err, 2, 1);
+
+        exec_statements(
+            db.as_ptr(),
+            "CREATE TABLE exact_args(a INTEGER, b INTEGER);",
+        )
+        .expect("create test table");
+        execute_single_statement(
+            db.as_ptr(),
+            "INSERT INTO exact_args VALUES (?, ?);",
+            Some(&[BindParam::Integer(1)]),
+        )
+        .expect_err("missing insert parameter should fail before execution");
+        let count = execute_single_statement(
+            db.as_ptr(),
+            "SELECT COUNT(*) AS count FROM exact_args;",
+            None,
+        )
+        .expect("query test table");
+        assert_eq!(count.rows, vec![vec![ColumnValue::Integer(0)]]);
+    }
+
+    fn assert_parameter_count_error(error: &anyhow::Error, expected: usize, received: usize) {
+        let typed = error.downcast_ref::<SqliteStatementError>().unwrap();
+        assert_eq!(typed.code, SQLITE_RANGE);
+        assert_eq!(typed.statement_index, 0);
+        assert_eq!(
+            typed.message,
+            format!("sqlite statement expects {expected} parameters, received {received}")
+        );
     }
 
     #[test]

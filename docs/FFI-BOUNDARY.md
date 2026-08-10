@@ -750,7 +750,10 @@ close makes core expire every active lease. Public parameterized `Exec` uses
 the schema's `SqliteQuery` request because `SqliteExec` accepts only a script
 and returns neither `changes` nor `lastInsertRowid`. The shared public API is
 single-statement for both `Exec` and `Query`; multi-statement input returns
-`sqlite_error` with statement index zero before either statement executes.
+`sqlite_error` with statement index zero before either statement executes. The
+embedded executor also requires the argument count to exactly match SQLite's
+parsed parameter count, so omitted placeholders cannot execute as implicit
+`NULL` values.
 
 Socket responses are not chunked by the upstream protocol. Columns and all
 rows, including encoding overhead, must fit one negotiated frame. The client
