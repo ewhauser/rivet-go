@@ -88,6 +88,24 @@ struct QueueMessageIdentity {
     message_id: u64,
 }
 
+fn mutate_actor_scoped_state_if_live<K, V, S>(
+    live: &Mutex<HashMap<K, V>>,
+    key: &K,
+    state: &Mutex<S>,
+    mutate: impl FnOnce(&mut S),
+) -> bool
+where
+    K: Eq + std::hash::Hash,
+{
+    let live = live.lock().expect("actor admission table poisoned");
+    if !live.contains_key(key) {
+        return false;
+    }
+    mutate(&mut state.lock().expect("actor-scoped state table poisoned"));
+    drop(live);
+    true
+}
+
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
 struct ManagedWorkIdentity {
     actor: ActorIdentity,
@@ -1186,10 +1204,7 @@ impl ActorProxy {
         for signal in queue_waits {
             signal.cancel();
         }
-        self.queue_messages
-            .lock()
-            .expect("queue message table poisoned")
-            .retain(|key, _| key.actor != identity);
+        self.remove_queue_messages(&identity);
         self.managed_work
             .lock()
             .expect("managed work table poisoned")
@@ -2459,17 +2474,7 @@ impl ActorProxy {
                     if let Some(message) = message.as_ref()
                         && message.is_completable()
                     {
-                        proxy
-                            .queue_messages
-                            .lock()
-                            .expect("queue message table poisoned")
-                            .insert(
-                                QueueMessageIdentity {
-                                    actor: identity,
-                                    message_id: message.id,
-                                },
-                                message.clone(),
-                            );
+                        proxy.retain_queue_message_if_actor_active(&identity, message.clone());
                     }
                     proxy.emit_queue_result(
                         op_id,
@@ -2524,13 +2529,7 @@ impl ActorProxy {
             match message.complete(response).await {
                 Ok(()) => proxy.emit_queue_result(op_id, "complete", None, None),
                 Err(error) => {
-                    if proxy.actor_exact(&key.actor).is_some() {
-                        proxy
-                            .queue_messages
-                            .lock()
-                            .expect("queue message table poisoned")
-                            .insert(key, retry_message);
-                    }
+                    proxy.retain_queue_message_if_actor_active(&key.actor, retry_message);
                     proxy.emit_queue_error(op_id, "complete", &error);
                 }
             }
@@ -2589,6 +2588,38 @@ impl ActorProxy {
                 actor: identity.clone(),
                 operation_id,
             });
+    }
+
+    fn retain_queue_message_if_actor_active(
+        &self,
+        identity: &ActorIdentity,
+        message: CoreQueueMessage,
+    ) -> bool {
+        // Actor teardown removes the actor before clearing retained messages.
+        // Keep that removal serialized with admission so a queue task cannot
+        // reinsert a late completable message after its generation was cleaned.
+        let message_id = message.id;
+        mutate_actor_scoped_state_if_live(
+            &self.actors,
+            identity,
+            &self.queue_messages,
+            move |queue_messages| {
+                queue_messages.insert(
+                    QueueMessageIdentity {
+                        actor: identity.clone(),
+                        message_id,
+                    },
+                    message,
+                );
+            },
+        )
+    }
+
+    fn remove_queue_messages(&self, identity: &ActorIdentity) {
+        self.queue_messages
+            .lock()
+            .expect("queue message table poisoned")
+            .retain(|key, _| key.actor != *identity);
     }
 
     fn begin_managed_work(
@@ -4198,11 +4229,64 @@ async fn websocket_outbound_loop(
 
 #[cfg(test)]
 mod tests {
-    use std::time::Instant;
-
-    use crossbeam_channel::bounded;
+    use std::{
+        sync::TryLockError,
+        time::{Duration, Instant},
+    };
 
     use super::*;
+    use crossbeam_channel::bounded;
+
+    #[test]
+    fn actor_scoped_state_admission_cannot_outlive_cleanup() {
+        let live = Arc::new(Mutex::new(HashMap::from([(1_u64, ())])));
+        let state = Arc::new(Mutex::new(Vec::new()));
+        // Force queue admission to pause after it has observed the live actor.
+        // Cleanup must wait for that admission, then remove the inserted message.
+        let state_guard = state.lock().expect("actor-scoped state");
+        let insertion_live = live.clone();
+        let insertion_state = state.clone();
+        let insertion = std::thread::spawn(move || {
+            mutate_actor_scoped_state_if_live(&insertion_live, &1, &insertion_state, |state| {
+                state.push("message")
+            })
+        });
+        let lock_deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            match live.try_lock() {
+                Err(TryLockError::WouldBlock) => break,
+                Err(TryLockError::Poisoned(_)) => panic!("actor admission table poisoned"),
+                Ok(live_guard) => {
+                    drop(live_guard);
+                    assert!(
+                        Instant::now() < lock_deadline,
+                        "queue insertion did not enter actor admission"
+                    );
+                    std::thread::yield_now();
+                }
+            }
+        }
+        let cleanup_live = live.clone();
+        let cleanup_state = state.clone();
+        let cleanup = std::thread::spawn(move || {
+            cleanup_live
+                .lock()
+                .expect("actor admission table")
+                .remove(&1);
+            cleanup_state.lock().expect("actor-scoped state").clear();
+        });
+        drop(state_guard);
+
+        assert!(insertion.join().expect("queue insertion task"));
+        cleanup.join().expect("actor cleanup task");
+        assert!(!mutate_actor_scoped_state_if_live(
+            &live,
+            &1,
+            &state,
+            |state| state.push("late message")
+        ));
+        assert!(state.lock().expect("actor-scoped state").is_empty());
+    }
 
     #[test]
     fn sqlite_results_over_one_batch_are_chunked_in_order() {
