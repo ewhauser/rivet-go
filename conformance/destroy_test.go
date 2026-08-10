@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/ewhauser/rivet-go/rivet"
+	"github.com/gorilla/websocket"
 )
 
 type destroyActionResult struct {
@@ -34,6 +35,7 @@ func TestContextDestroyOwnsGenerationTeardown(t *testing.T) {
 	workStarted := make(chan struct{})
 	workRelease := make(chan struct{})
 	workDone := make(chan struct{})
+	echoed := make(chan error, 1)
 	var workReleaseOnce sync.Once
 	releaseWork := func() { workReleaseOnce.Do(func() { close(workRelease) }) }
 	t.Cleanup(releaseWork)
@@ -102,6 +104,9 @@ func TestContextDestroyOwnsGenerationTeardown(t *testing.T) {
 			}),
 		},
 		OnConnect: func(*rivet.Context[struct{}], *rivet.Connection) error { return nil },
+		OnMessage: func(_ *rivet.Context[struct{}], connection *rivet.Connection, message rivet.Message) {
+			echoed <- connection.Send(message.Data)
+		},
 	})
 	if err != nil {
 		t.Fatalf("register destroy actor: %v", err)
@@ -118,6 +123,16 @@ func TestContextDestroyOwnsGenerationTeardown(t *testing.T) {
 		t.Fatalf("OnStart Destroy = %v, want ErrActorStarting", err)
 	}
 	client := openGatewayWebSocket(t, engine.endpoint, actor.ActorID, "destroy", true)
+	client.write(t, websocket.TextMessage, []byte("destroy-ready"))
+	select {
+	case err := <-echoed:
+		if err != nil {
+			t.Fatalf("echo WebSocket readiness probe: %v", err)
+		}
+	case <-time.After(websocketTestTimeout):
+		t.Fatal("WebSocket readiness probe did not reach the actor")
+	}
+	waitTextFrame(t, client, "destroy-ready")
 	result := decodeActionOutput[destroyActionResult](t, gatewayAction(
 		t, engine.endpoint, actor.ActorID, "destroy", []any{struct{}{}}, websocketTestTimeout,
 	), http.StatusOK)
