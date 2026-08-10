@@ -7,13 +7,13 @@ use std::ptr;
 use anyhow::{Result, anyhow};
 pub use depot_client_types::{BindParam, ColumnValue, ExecResult, ExecuteResult, QueryResult};
 use libsqlite3_sys::{
-	SQLITE_BLOB, SQLITE_DONE, SQLITE_FLOAT, SQLITE_INTEGER, SQLITE_NULL, SQLITE_OK, SQLITE_ROW,
-	SQLITE_TEXT, SQLITE_TRANSIENT, sqlite3, sqlite3_bind_blob, sqlite3_bind_double,
-	sqlite3_bind_int64, sqlite3_bind_null, sqlite3_bind_text, sqlite3_changes, sqlite3_column_blob,
-	sqlite3_column_bytes, sqlite3_column_count, sqlite3_column_double, sqlite3_column_int64,
-	sqlite3_column_name, sqlite3_column_text, sqlite3_column_type, sqlite3_errmsg,
-	sqlite3_extended_errcode, sqlite3_finalize, sqlite3_last_insert_rowid, sqlite3_prepare_v2,
-	sqlite3_step,
+	SQLITE_BLOB, SQLITE_DONE, SQLITE_FLOAT, SQLITE_INTEGER, SQLITE_NULL, SQLITE_OK, SQLITE_RANGE,
+	SQLITE_ROW, SQLITE_TEXT, SQLITE_TRANSIENT, sqlite3, sqlite3_bind_blob, sqlite3_bind_double,
+	sqlite3_bind_int64, sqlite3_bind_null, sqlite3_bind_parameter_count, sqlite3_bind_text,
+	sqlite3_changes, sqlite3_column_blob, sqlite3_column_bytes, sqlite3_column_count,
+	sqlite3_column_double, sqlite3_column_int64, sqlite3_column_name, sqlite3_column_text,
+	sqlite3_column_type, sqlite3_errmsg, sqlite3_extended_errcode, sqlite3_finalize,
+	sqlite3_last_insert_rowid, sqlite3_prepare_v2, sqlite3_step,
 };
 
 #[derive(Debug)]
@@ -47,9 +47,7 @@ pub fn execute_statement(
 	}
 
 	let result = (|| {
-		if let Some(params) = params {
-			bind_params(db, stmt, params)?;
-		}
+		bind_params(db, stmt, params.unwrap_or_default())?;
 
 		loop {
 			let step_rc = unsafe { sqlite3_step(stmt) };
@@ -92,9 +90,7 @@ pub fn query_statement(
 	}
 
 	let result = (|| {
-		if let Some(params) = params {
-			bind_params(db, stmt, params)?;
-		}
+		bind_params(db, stmt, params.unwrap_or_default())?;
 
 		let columns = collect_columns(stmt);
 		let mut rows = Vec::new();
@@ -164,9 +160,7 @@ pub fn execute_single_statement(
 	}
 
 	let result = (|| {
-		if let Some(params) = params {
-			bind_params(db, stmt, params)?;
-		}
+		bind_params(db, stmt, params.unwrap_or_default())?;
 
 		let columns = collect_columns(stmt);
 		let mut rows = Vec::new();
@@ -285,6 +279,19 @@ fn bind_params(
 	stmt: *mut libsqlite3_sys::sqlite3_stmt,
 	params: &[BindParam],
 ) -> Result<()> {
+	let expected = unsafe { sqlite3_bind_parameter_count(stmt) } as usize;
+	if params.len() != expected {
+		return Err(SqliteStatementError {
+			code: SQLITE_RANGE,
+			statement_index: 0,
+			message: format!(
+				"sqlite statement expects {expected} parameters, received {}",
+				params.len()
+			),
+		}
+		.into());
+	}
+
 	for (index, param) in params.iter().enumerate() {
 		let bind_index = (index + 1) as i32;
 		let rc = match param {

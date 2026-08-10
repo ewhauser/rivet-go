@@ -114,7 +114,9 @@ lifecycle completion.
 Public `Exec` and `Query` each accept one SQL statement. Both transports reject
 a multi-statement string as `sqlite_error` before any statement runs. Valid
 UTF-8 text may contain embedded NULs; invalid UTF-8 text arguments are rejected.
-SQLite converts bound NaN values to NULL, while infinities remain REAL values.
+The embedded executor rejects missing or surplus arguments before execution;
+the argument count must exactly match SQLite's parsed parameter count. SQLite
+converts bound NaN values to NULL, while infinities remain REAL values.
 Invalid bytes already stored with SQLite TEXT affinity are returned with UTF-8
 replacement by the shared pinned Depot decoder.
 
