@@ -123,8 +123,13 @@ type Engine struct {
 	Port       int
 
 	mu      sync.Mutex
+	process *engineProcess
+}
+
+type engineProcess struct {
 	command *exec.Cmd
-	done    chan error
+	done    chan struct{}
+	waitErr error
 }
 
 // New constructs an engine process definition without starting it.
@@ -156,7 +161,7 @@ func (e *Engine) Start(ctx context.Context) error {
 		return errors.New("engine is nil")
 	}
 	e.mu.Lock()
-	if e.command != nil {
+	if e.process != nil {
 		e.mu.Unlock()
 		return errors.New("engine process is already running")
 	}
@@ -182,23 +187,26 @@ func (e *Engine) Start(ctx context.Context) error {
 		_ = logFile.Close()
 		return fmt.Errorf("start engine %s: %w", e.Binary, err)
 	}
-	done := make(chan error, 1)
-	e.command = command
-	e.done = done
+	process := &engineProcess{
+		command: command,
+		done:    make(chan struct{}),
+	}
+	e.process = process
 	e.mu.Unlock()
 	go func() {
-		done <- command.Wait()
+		process.waitErr = command.Wait()
 		_ = logFile.Close()
+		close(process.done)
 	}()
 
-	if err := e.waitReady(ctx, done); err != nil {
-		_ = e.Kill()
+	if err := e.waitReady(ctx, process); err != nil {
+		_ = e.killProcess(process)
 		return err
 	}
 	return nil
 }
 
-func (e *Engine) waitReady(ctx context.Context, done <-chan error) error {
+func (e *Engine) waitReady(ctx context.Context, process *engineProcess) error {
 	startupCtx, cancel := context.WithTimeout(ctx, startupTimeout)
 	defer cancel()
 	ticker := time.NewTicker(100 * time.Millisecond)
@@ -222,9 +230,9 @@ func (e *Engine) waitReady(ctx context.Context, done <-chan error) error {
 			lastErr = err
 		}
 		select {
-		case processErr := <-done:
-			e.clearProcess(done)
-			return fmt.Errorf("engine exited before health check: %v\nlast engine output:\n%s", processErr, ReadLogTail(e.LogPath))
+		case <-process.done:
+			e.clearProcess(process)
+			return fmt.Errorf("engine exited before health check: %v\nlast engine output:\n%s", process.waitErr, ReadLogTail(e.LogPath))
 		case <-startupCtx.Done():
 			return fmt.Errorf("engine did not become healthy within %s: %v\nlast engine output:\n%s", startupTimeout, lastErr, ReadLogTail(e.LogPath))
 		case <-ticker.C:
@@ -238,19 +246,23 @@ func (e *Engine) Kill() error {
 		return nil
 	}
 	e.mu.Lock()
-	command, done := e.command, e.done
+	process := e.process
 	e.mu.Unlock()
-	if command == nil {
+	if process == nil {
 		return nil
 	}
-	if command.Process != nil {
-		if err := command.Process.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
+	return e.killProcess(process)
+}
+
+func (e *Engine) killProcess(process *engineProcess) error {
+	if process.command.Process != nil {
+		if err := process.command.Process.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
 			return fmt.Errorf("kill engine: %w", err)
 		}
 	}
 	select {
-	case <-done:
-		e.clearProcess(done)
+	case <-process.done:
+		e.clearProcess(process)
 		return nil
 	case <-time.After(5 * time.Second):
 		return errors.New("engine process was not reaped within 5s after kill")
@@ -263,33 +275,32 @@ func (e *Engine) Stop(ctx context.Context) error {
 		return nil
 	}
 	e.mu.Lock()
-	command, done := e.command, e.done
+	process := e.process
 	e.mu.Unlock()
-	if command == nil {
+	if process == nil {
 		return nil
 	}
-	if command.Process != nil {
-		if err := command.Process.Signal(os.Interrupt); err != nil && !errors.Is(err, os.ErrProcessDone) {
+	if process.command.Process != nil {
+		if err := process.command.Process.Signal(os.Interrupt); err != nil && !errors.Is(err, os.ErrProcessDone) {
 			return fmt.Errorf("signal engine: %w", err)
 		}
 	}
 	select {
-	case <-done:
-		e.clearProcess(done)
+	case <-process.done:
+		e.clearProcess(process)
 		return nil
 	case <-ctx.Done():
-		if err := e.Kill(); err != nil {
+		if err := e.killProcess(process); err != nil {
 			return errors.Join(ctx.Err(), err)
 		}
 		return nil
 	}
 }
 
-func (e *Engine) clearProcess(done <-chan error) {
+func (e *Engine) clearProcess(process *engineProcess) {
 	e.mu.Lock()
-	if e.done == done {
-		e.command = nil
-		e.done = nil
+	if e.process == process {
+		e.process = nil
 	}
 	e.mu.Unlock()
 }
