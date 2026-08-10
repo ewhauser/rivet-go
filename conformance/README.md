@@ -208,8 +208,9 @@ sleep-first durability case above is the supported recovery fixture at this
 pin.
 
 The suite is intentionally part of normal `go test ./conformance` and the full
-`go test -race -count=1 ./...` gate. It is not skipped as a long test. No fuzz
-or deliberately malformed socket-input cases live here; the supervisor owns
-that work. The package raises Go's injected 10-minute test timeout to 20
-minutes because the unshortened race-enabled real-engine suite now exceeds the
-default; a larger caller-supplied timeout is preserved.
+`go test -race -count=1 -timeout=25m ./...` gate. It is not skipped as a long
+test. No fuzz or deliberately malformed socket-input cases live here; the
+supervisor owns that work. The explicit timeout is required because the
+unshortened race-enabled real-engine suite can exceed Go's default ten-minute
+alarm. The timeout must be set on `go test` itself; changing `test.timeout`
+from `TestMain` cannot extend the parent command's kill deadline.

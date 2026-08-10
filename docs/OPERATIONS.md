@@ -288,9 +288,9 @@ download dependency.
 4. Run `scripts/build-ffi.sh` for the same six targets again and require a
    clean diff. This is the idempotence check.
 5. Run `cargo test --workspace`, Clippy with warnings denied, `go vet ./...`,
-   `go test -race -count=1 ./...`, the checked-in conformance suite, and the
-   24-hour soak. Preserve the existing corpus for the separately owned fuzz
-   handoff; the upgrade itself does not add malformed-input cases.
+   `go test -race -count=1 -timeout=25m ./...`, the checked-in conformance
+   suite, and the 24-hour soak. Preserve the existing corpus for the separately
+   owned fuzz handoff; the upgrade itself does not add malformed-input cases.
 6. Compare behavior against the prior pin, update every deviation below, and
    set `artifactReleaseTag` in `internal/ffi/acquire.go` to the next release
    tag. Pushing that tag runs `.github/workflows/release.yml`, which rebuilds
