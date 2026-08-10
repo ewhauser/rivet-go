@@ -366,7 +366,8 @@ func TestRustM4CommandBatchGolden(t *testing.T) {
 	if !batch.Commands[3].Hibernate {
 		t.Fatal("WebSocket close golden does not carry the M5 hibernation marker")
 	}
-	if batch.Commands[4].Event != "countChanged" || batch.Commands[4].ExcludeConn == nil {
+	if batch.Commands[4].Generation != 7 || batch.Commands[4].Event != "countChanged" ||
+		batch.Commands[4].ExcludeConn == nil {
 		t.Fatalf("unexpected broadcast command: %#v", batch.Commands[4])
 	}
 	encoded, err := EncodeCommandBatch(batch)

@@ -415,6 +415,12 @@ func (s *ActorSession) Broadcast(
 	payload []byte,
 	excludeConn *string,
 ) error {
+	if s == nil || s.pump == nil {
+		return errors.New("actor session is unavailable")
+	}
+	if !s.isAccepting() {
+		return ErrShuttingDown
+	}
 	if event == "" {
 		return errors.New("broadcast event is empty")
 	}
@@ -424,6 +430,7 @@ func (s *ActorSession) Broadcast(
 	return s.submitWebSocket(ctx, wire.Command{
 		Kind:        wire.CommandBroadcast,
 		AID:         s.AID(),
+		Generation:  s.Generation(),
 		Event:       event,
 		Payload:     cloneBytesOrEmpty(payload),
 		ExcludeConn: excludeConn,
