@@ -1151,6 +1151,9 @@ func (s *ActorSession) kv(ctx context.Context, command wire.Command) (wire.Event
 	if ctx == nil {
 		return wire.Event{}, errors.New("KV context is nil")
 	}
+	if err := ctx.Err(); err != nil {
+		return wire.Event{}, err
+	}
 	if !s.isAccepting() {
 		return wire.Event{}, ErrShuttingDown
 	}

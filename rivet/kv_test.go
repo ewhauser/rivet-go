@@ -123,6 +123,18 @@ func TestKVValidationAndErrors(t *testing.T) {
 	if err := store.Put(nil, []byte("key"), []byte("value")); err == nil {
 		t.Fatal("Put with nil context succeeded")
 	}
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := store.Put(cancelled, []byte("put"), []byte("value")); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Put with canceled context = %v, want context.Canceled", err)
+	}
+	if err := store.Delete(cancelled, []byte("delete")); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Delete with canceled context = %v, want context.Canceled", err)
+	}
+	session := store.session.(*fakeKVSession)
+	if session.putKey != nil || session.deleteKey != nil {
+		t.Fatalf("canceled mutations reached session: put=%q delete=%q", session.putKey, session.deleteKey)
+	}
 	want := errors.New("core rejected operation")
 	store.session = &fakeKVSession{operationErr: want}
 	if err := store.Delete(context.Background(), []byte("key")); !errors.Is(err, want) {

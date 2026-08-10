@@ -112,5 +112,5 @@ func (k *KV) validate(ctx context.Context) error {
 	if ctx == nil {
 		return errors.New("KV context is nil")
 	}
-	return nil
+	return ctx.Err()
 }
