@@ -208,6 +208,10 @@ zero-length `[]byte`, while the adjacent SQL NULL remains nil. The Rust-generate
 wire golden independently contains an empty blob. No additional vendored
 source deviation was found.
 
+A later full-implementation review added the bounded final-flush teardown
+correction documented in `docs/FFI-BOUNDARY.md`; the statement above records
+the vendor diff at the time of the M7 audit.
+
 ## Transport comparison inputs
 
 These are objective inputs for a later selection; this review does not choose

@@ -488,6 +488,51 @@ pub unsafe extern "C" fn rk_windows_test_panic(out: *mut RkSubmitResult) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    use anyhow::Result;
+    use depot_client::vfs::{
+        SqliteTransport, SqliteTransportHandle, SqliteVfs, VfsConfig, open_connection,
+    };
+    use libsqlite3_sys::{SQLITE_OPEN_CREATE, SQLITE_OPEN_READWRITE};
+    use rivet_envoy_protocol as protocol;
+
+    #[derive(Clone, Copy)]
+    enum FinalFlushBehavior {
+        Error,
+        Timeout,
+    }
+
+    struct FinalFlushTransport {
+        behavior: FinalFlushBehavior,
+    }
+
+    #[async_trait::async_trait]
+    impl SqliteTransport for FinalFlushTransport {
+        async fn get_pages(
+            &self,
+            _request: protocol::SqliteGetPagesRequest,
+        ) -> Result<protocol::SqliteGetPagesResponse> {
+            Ok(protocol::SqliteGetPagesResponse::SqliteErrorResponse(
+                protocol::SqliteErrorResponse {
+                    group: "actor".to_owned(),
+                    code: "not_found".to_owned(),
+                    message: "actor does not exist".to_owned(),
+                },
+            ))
+        }
+
+        async fn commit(
+            &self,
+            _request: protocol::SqliteCommitRequest,
+        ) -> Result<protocol::SqliteCommitResponse> {
+            match self.behavior {
+                FinalFlushBehavior::Error => anyhow::bail!("forced final flush failure"),
+                FinalFlushBehavior::Timeout => std::future::pending().await,
+            }
+        }
+    }
 
     fn decode_and_free(error: *mut RkError) -> ErrorPayload {
         assert!(!error.is_null());
@@ -523,5 +568,64 @@ mod tests {
     #[test]
     fn pinned_core_probe_executes_upstream_code() {
         assert!(core_pin_probe());
+    }
+
+    #[test]
+    fn native_database_closes_after_final_flush_error_and_timeout() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_time()
+            .build()
+            .expect("build test runtime");
+
+        for (behavior, suffix) in [
+            (FinalFlushBehavior::Error, "error"),
+            (FinalFlushBehavior::Timeout, "timeout"),
+        ] {
+            let actor_id = format!("final-flush-{suffix}");
+            let vfs_name = format!("final-flush-vfs-{suffix}");
+            let transport: SqliteTransportHandle = Arc::new(FinalFlushTransport { behavior });
+            let config = VfsConfig::default();
+            let vfs = Arc::new(
+                SqliteVfs::register_with_transport(
+                    &vfs_name,
+                    transport,
+                    actor_id.clone(),
+                    runtime.handle().clone(),
+                    config,
+                    None,
+                )
+                .expect("register test VFS"),
+            );
+            let database = open_connection(
+                Arc::clone(&vfs),
+                &actor_id,
+                SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE,
+            )
+            .expect("open test database");
+            vfs.stage_dirty_page_for_test();
+            assert!(
+                database.sqlite_vfs_metrics().write_buffer_dirty_pages > 0,
+                "test setup must leave pages for the final flush"
+            );
+
+            let started = Instant::now();
+            drop(database);
+            assert_eq!(
+                vfs.main_close_count_for_test(),
+                1,
+                "final flush {suffix} must still close the native SQLite file"
+            );
+            assert_eq!(
+                vfs.native_close_rc_for_test(),
+                libsqlite3_sys::SQLITE_OK,
+                "final flush {suffix} must release the native SQLite connection"
+            );
+            if matches!(behavior, FinalFlushBehavior::Timeout) {
+                assert!(
+                    started.elapsed() < Duration::from_secs(2),
+                    "timed-out final flush retried without its boundary"
+                );
+            }
+        }
     }
 }

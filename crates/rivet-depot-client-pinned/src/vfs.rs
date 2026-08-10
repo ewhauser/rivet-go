@@ -8,6 +8,8 @@ use std::ptr;
 use std::slice;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(any(test, feature = "test-hooks"))]
+use std::sync::atomic::AtomicI32;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
@@ -35,6 +37,7 @@ const DEFAULT_RECENT_HINT_PAGE_BUDGET: usize = 128;
 const DEFAULT_RECENT_HINT_RANGE_BUDGET: usize = 16;
 const DEFAULT_PAGE_SIZE: usize = 4096;
 const NATIVE_DATABASE_DROP_FLUSH_TIMEOUT: Duration = Duration::from_millis(250);
+const RIVET_FCNTL_SKIP_CLOSE_FLUSH: c_int = 10_001;
 const MIN_RECENT_SCAN_RANGE_PAGES: u32 = 8;
 const FORWARD_SCAN_SCORE_THRESHOLD: i32 = 6;
 const FORWARD_SCAN_SCORE_MAX: i32 = 12;
@@ -437,6 +440,10 @@ pub struct VfsContext {
 	pub commit_transport_ns: AtomicU64,
 	pub commit_state_update_ns: AtomicU64,
 	pub commit_duration_ns_total: AtomicU64,
+	#[cfg(any(test, feature = "test-hooks"))]
+	main_close_total: AtomicU64,
+	#[cfg(any(test, feature = "test-hooks"))]
+	native_close_rc: AtomicI32,
 	metrics: Option<Arc<dyn SqliteVfsMetrics>>,
 }
 
@@ -582,6 +589,7 @@ struct VfsFile {
 	base: sqlite3_file,
 	ctx: *const VfsContext,
 	aux: *mut AuxFileHandle,
+	skip_close_flush: bool,
 }
 
 #[derive(Default)]
@@ -1217,6 +1225,10 @@ impl VfsContext {
 			commit_transport_ns: AtomicU64::new(0),
 			commit_state_update_ns: AtomicU64::new(0),
 			commit_duration_ns_total: AtomicU64::new(0),
+			#[cfg(any(test, feature = "test-hooks"))]
+			main_close_total: AtomicU64::new(0),
+			#[cfg(any(test, feature = "test-hooks"))]
+			native_close_rc: AtomicI32::new(-1),
 			metrics,
 		})
 	}
@@ -2450,11 +2462,13 @@ unsafe extern "C" fn io_close(p_file: *mut sqlite3_file) -> c_int {
 			Ok(())
 		} else {
 			let ctx = &*file.ctx;
+			#[cfg(any(test, feature = "test-hooks"))]
+			ctx.main_close_total.fetch_add(1, Ordering::Relaxed);
 			let should_flush = {
 				let state = ctx.state.read();
 				state.write_buffer.in_atomic_write || !state.write_buffer.dirty.is_empty()
 			};
-			if should_flush {
+			if should_flush && !file.skip_close_flush {
 				if ctx.state.read().write_buffer.in_atomic_write {
 					ctx.commit_atomic_write().map(|_| ())
 				} else {
@@ -2857,6 +2871,10 @@ unsafe extern "C" fn io_file_control(
 		let ctx = &*file.ctx;
 
 		match op {
+			RIVET_FCNTL_SKIP_CLOSE_FLUSH => {
+				file.skip_close_flush = true;
+				SQLITE_OK
+			}
 			SQLITE_FCNTL_BEGIN_ATOMIC_WRITE => {
 				let mut state = ctx.state.write();
 				state.write_buffer.in_atomic_write = true;
@@ -2965,6 +2983,7 @@ unsafe extern "C" fn vfs_open(
 				base,
 				ctx: ctx as *const VfsContext,
 				aux,
+				skip_close_flush: false,
 			},
 		);
 
@@ -3137,8 +3156,28 @@ impl SqliteVfs {
 		self.ctx.sqlite_vfs_metrics()
 	}
 
-	#[cfg(test)]
-	pub(crate) fn register_with_transport(
+	#[cfg(any(test, feature = "test-hooks"))]
+	pub fn main_close_count_for_test(&self) -> u64 {
+		self.ctx.main_close_total.load(Ordering::Relaxed)
+	}
+
+	#[cfg(any(test, feature = "test-hooks"))]
+	pub fn native_close_rc_for_test(&self) -> c_int {
+		self.ctx.native_close_rc.load(Ordering::Relaxed)
+	}
+
+	#[cfg(any(test, feature = "test-hooks"))]
+	pub fn stage_dirty_page_for_test(&self) {
+		self.ctx
+			.state
+			.write()
+			.write_buffer
+			.dirty
+			.insert(1, empty_db_page());
+	}
+
+	#[cfg(any(test, feature = "test-hooks"))]
+	pub fn register_with_transport(
 		name: &str,
 		transport: SqliteTransportHandle,
 		actor_id: String,
@@ -3314,6 +3353,17 @@ impl NativeDatabase {
 	}
 }
 
+fn skip_native_database_close_flush(db: *mut sqlite3) -> c_int {
+	unsafe {
+		sqlite3_file_control(
+			db,
+			b"main\0".as_ptr().cast(),
+			RIVET_FCNTL_SKIP_CLOSE_FLUSH,
+			ptr::null_mut(),
+		)
+	}
+}
+
 impl Drop for NativeDatabase {
 	fn drop(&mut self) {
 		if !self.db.is_null() {
@@ -3340,19 +3390,31 @@ impl Drop for NativeDatabase {
 							timeout_ms = NATIVE_DATABASE_DROP_FLUSH_TIMEOUT.as_millis(),
 							"timed out flushing sqlite database before close"
 						);
-						self.db = ptr::null_mut();
-						return;
+						let rc = skip_native_database_close_flush(self.db);
+						if rc != SQLITE_OK {
+							tracing::error!(
+								rc,
+								"failed to suppress redundant sqlite close flush after timeout"
+							);
+						}
 					}
 					Err(err) => {
 						handle_non_finalize_commit_error(ctx, &err);
 						tracing::warn!(?err, "failed to flush sqlite database before close");
-						self.db = ptr::null_mut();
-						return;
+						let rc = skip_native_database_close_flush(self.db);
+						if rc != SQLITE_OK {
+							tracing::error!(
+								rc,
+								"failed to suppress redundant sqlite close flush after error"
+							);
+						}
 					}
 				}
 			}
 
 			let rc = unsafe { sqlite3_close_v2(self.db) };
+			#[cfg(any(test, feature = "test-hooks"))]
+			ctx.native_close_rc.store(rc, Ordering::Relaxed);
 			if rc != SQLITE_OK {
 				tracing::warn!(
 					rc,
