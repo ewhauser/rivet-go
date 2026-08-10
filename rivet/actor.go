@@ -412,7 +412,7 @@ func (a *actorAdapter[T]) Start(
 	ctx context.Context,
 	session *pump.ActorSession,
 	event wire.Event,
-) (any, error) {
+) (_ any, startErr error) {
 	state, err := decodeState[T](session.PersistedState())
 	if err != nil {
 		return nil, err
@@ -435,13 +435,18 @@ func (a *actorAdapter[T]) Start(
 		managedCtx:         managedCtx,
 		managedCancel:      managedCancel,
 	}
+	startComplete := false
+	defer func() {
+		if startComplete {
+			return
+		}
+		startErr = errors.Join(startErr, cleanupFailedActorStart(actorContext))
+	}()
 	for _, snapshot := range event.Connections {
 		connection := newActorConnection(session, snapshot)
 		if snapshot.ActorConnect && a.definition.ConnectionState != nil {
 			connectionState, decodeErr := a.definition.ConnectionState.decode(snapshot.State)
 			if decodeErr != nil {
-				actorContext.managedCancel()
-				_ = actorContext.db.close()
 				return nil, fmt.Errorf("restore connection %q state: %w", snapshot.ID, decodeErr)
 			}
 			connection.state = connectionState
@@ -450,8 +455,6 @@ func (a *actorAdapter[T]) Start(
 	}
 	if a.definition.OnStart != nil {
 		if err := a.definition.OnStart(actorContext); err != nil {
-			actorContext.managedCancel()
-			_ = actorContext.db.close()
 			return nil, err
 		}
 	}
@@ -459,7 +462,23 @@ func (a *actorAdapter[T]) Start(
 	actorContext.lifecycleMu.Lock()
 	actorContext.lifecycleStarted = true
 	actorContext.lifecycleMu.Unlock()
+	startComplete = true
 	return actorContext, nil
+}
+
+func cleanupFailedActorStart[T any](actorContext *Context[T]) error {
+	if actorContext == nil {
+		return nil
+	}
+	actorContext.lifecycleMu.Lock()
+	actorContext.lifecycleStopping = true
+	actorContext.lifecycleMu.Unlock()
+	actorContext.stopManagedAdmission()
+	// A generation that failed to start cannot keep detached work alive. Cancel
+	// immediately, then wait for cooperative tasks to release their core guards
+	// before closing the generation-scoped database transport.
+	actorContext.managedCancel()
+	return errors.Join(actorContext.drainManaged(), actorContext.db.close())
 }
 
 func (a *actorAdapter[T]) Run(
