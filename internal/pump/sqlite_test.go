@@ -94,6 +94,92 @@ func TestSQLiteReadCancellationCanAbandonNativeResult(t *testing.T) {
 	})
 }
 
+func TestSQLiteMalformedNonterminalResultDoesNotRetainLiveWaiter(t *testing.T) {
+	runner := newFakeRunner()
+	p := New(runner)
+	pumpCtx, stopPump := context.WithCancel(context.Background())
+	pumpResult := make(chan error, 1)
+	go func() { pumpResult <- p.Run(pumpCtx) }()
+	waitPumpStarted(t, p)
+	t.Cleanup(func() {
+		stopPump()
+		select {
+		case err := <-pumpResult:
+			if err != nil {
+				t.Errorf("Run: %v", err)
+			}
+		case <-time.After(2 * time.Second):
+			t.Error("pump did not stop after malformed SQLite result")
+		}
+	})
+
+	session := &ActorSession{
+		pump:      p,
+		done:      make(chan struct{}),
+		identity:  actorIdentity{aid: "sqlite-aid", generation: 5},
+		accepting: true,
+	}
+	session.lifecycleCond = sync.NewCond(&session.lifecycleMu)
+	firstResult := make(chan error, 1)
+	go func() {
+		_, err := session.SQLiteQuery(context.Background(), "SELECT 1", nil, nil)
+		firstResult <- err
+	}()
+	firstCommand := nextCommand(t, runner)
+	runner.emit(wire.Event{
+		Kind:            wire.EventSQLiteResult,
+		SQLiteRequestID: firstCommand.SQLiteRequestID,
+		ChunkIndex:      1,
+	})
+	if err := <-firstResult; err == nil || err.Error() != "SQLite result chunk index 1 follows 0" {
+		t.Fatalf("malformed result error = %v", err)
+	}
+
+	p.sqliteMu.Lock()
+	waiter, pending := p.sqlitePending[firstCommand.SQLiteRequestID]
+	p.sqliteMu.Unlock()
+	if !pending || waiter != nil {
+		t.Fatalf("malformed result waiter = (%v, %v), want retained tombstone", waiter, pending)
+	}
+
+	lateChunks := make([]wire.Event, 65)
+	for index := range lateChunks {
+		lateChunks[index] = wire.Event{
+			Kind:            wire.EventSQLiteResult,
+			SQLiteRequestID: firstCommand.SQLiteRequestID,
+			ChunkIndex:      uint32(index + 2),
+			Done:            index == len(lateChunks)-1,
+		}
+	}
+	runner.emit(lateChunks...)
+
+	secondResult := make(chan error, 1)
+	go func() {
+		_, err := session.SQLiteQuery(context.Background(), "SELECT 2", nil, nil)
+		secondResult <- err
+	}()
+	secondCommand := nextCommand(t, runner)
+	runner.emit(wire.Event{
+		Kind:            wire.EventSQLiteResult,
+		SQLiteRequestID: secondCommand.SQLiteRequestID,
+		Done:            true,
+	})
+	select {
+	case err := <-secondResult:
+		if err != nil {
+			t.Fatalf("query after malformed result: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("pump wedged on late malformed SQLite chunks")
+	}
+	p.sqliteMu.Lock()
+	_, pending = p.sqlitePending[firstCommand.SQLiteRequestID]
+	p.sqliteMu.Unlock()
+	if pending {
+		t.Fatal("terminal late chunk did not remove malformed result tombstone")
+	}
+}
+
 func TestSQLiteResponseAssemblerPreservesFirstChunkMetadata(t *testing.T) {
 	firstText := "first"
 	secondText := "second"
