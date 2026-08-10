@@ -1283,6 +1283,11 @@ func (s *ActorSession) sqlite(ctx context.Context, command wire.Command) (SQLite
 		s.pump.removeSQLiteWaiter(requestID)
 		return SQLiteResponse{}, err
 	}
+	// Any return before a terminal event must stop late chunks from targeting
+	// the caller's channel. The terminal event removes the waiter first, making
+	// this a no-op on the successful path; otherwise it leaves a tombstone until
+	// native completion so the request ID cannot be reused.
+	defer s.pump.abandonSQLiteWaiter(requestID)
 
 	var assembler sqliteResponseAssembler
 	var cancellationErr error
@@ -1305,15 +1310,12 @@ func (s *ActorSession) sqlite(ctx context.Context, command wire.Command) (SQLite
 			}
 		case <-contextDone:
 			if !mayWrite {
-				s.pump.abandonSQLiteWaiter(requestID)
 				return SQLiteResponse{}, ctx.Err()
 			}
 			cancellationErr = ctx.Err()
 		case <-s.done:
-			s.pump.abandonSQLiteWaiter(requestID)
 			return SQLiteResponse{}, ErrShuttingDown
 		case <-s.pump.done:
-			s.pump.abandonSQLiteWaiter(requestID)
 			return SQLiteResponse{}, ErrShuttingDown
 		}
 	}
