@@ -11,6 +11,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/ewhauser/rivet-go/internal/sqliteutil"
 	"github.com/ewhauser/rivet-go/internal/wire"
 )
 
@@ -122,6 +123,10 @@ func (c *Client) request(ctx context.Context, value request) (Result, error) {
 	if ctx == nil {
 		return Result{}, errors.New("SQLite socket context is nil")
 	}
+	if err := ctx.Err(); err != nil {
+		return Result{}, err
+	}
+	mayWrite := value.kind != requestQuery || !sqliteutil.DefinitelyReadOnly(value.sql)
 	result := make(chan response, 1)
 	value.id = c.addPending(result)
 	payload, err := encodeRequest(value)
@@ -141,22 +146,35 @@ func (c *Client) request(ctx context.Context, value request) (Result, error) {
 		}
 		return Result{}, err
 	}
-	select {
-	case response := <-result:
-		if response.err != nil {
-			return Result{}, response.err
+	var cancellationErr error
+	for {
+		contextDone := ctx.Done()
+		if cancellationErr != nil {
+			contextDone = nil
 		}
-		return Result{
-			Columns:      response.columns,
-			Values:       response.values,
-			RowsAffected: response.changes,
-			LastInsertID: response.lastInsertID,
-		}, nil
-	case <-ctx.Done():
-		c.abandonPending(value.id)
-		return Result{}, ctx.Err()
-	case <-c.closed:
-		return Result{}, errors.New("Actor Runtime Socket is closed")
+		select {
+		case response := <-result:
+			if response.err != nil {
+				if cancellationErr != nil {
+					return Result{}, cancellationErr
+				}
+				return Result{}, response.err
+			}
+			return Result{
+				Columns:      response.columns,
+				Values:       response.values,
+				RowsAffected: response.changes,
+				LastInsertID: response.lastInsertID,
+			}, nil
+		case <-contextDone:
+			if !mayWrite {
+				c.abandonPending(value.id)
+				return Result{}, ctx.Err()
+			}
+			cancellationErr = ctx.Err()
+		case <-c.closed:
+			return Result{}, errors.New("Actor Runtime Socket is closed")
+		}
 	}
 }
 

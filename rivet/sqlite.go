@@ -98,6 +98,10 @@ type sqliteBackend interface {
 // DB is one actor generation's SQLite database handle. Core serializes the
 // native SQLite worker; the SDK permits concurrent non-transaction calls and
 // core queues them. An active transaction exclusively gates other operations.
+// Context cancellation abandons definitely read-only SELECT calls. Once a
+// potentially mutating operation is admitted, the call waits for settlement;
+// a write that succeeds after its context expires is reported as successful so
+// callers cannot accidentally duplicate it by retrying an ambiguous timeout.
 // Sleep and stop reject new calls, roll back that transaction, wait for
 // admitted calls, and close this generation's transport.
 type DB struct {

@@ -14,6 +14,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/ewhauser/rivet-go/internal/sqliteutil"
 	"github.com/ewhauser/rivet-go/internal/wire"
 )
 
@@ -1234,6 +1235,11 @@ func (s *ActorSession) sqlite(ctx context.Context, command wire.Command) (SQLite
 	if ctx == nil {
 		return SQLiteResponse{}, errors.New("SQLite context is nil")
 	}
+	if err := ctx.Err(); err != nil {
+		return SQLiteResponse{}, err
+	}
+	mayWrite := command.Kind != wire.CommandSQLiteExec && command.Kind != wire.CommandSQLiteQuery ||
+		!sqliteutil.DefinitelyReadOnly(command.SQL)
 	if err := s.beginSQLite(); err != nil {
 		return SQLiteResponse{}, err
 	}
@@ -1248,25 +1254,43 @@ func (s *ActorSession) sqlite(ctx context.Context, command wire.Command) (SQLite
 	command.AID = s.AID()
 	command.Generation = s.Generation()
 	command.DeadlineMS = deadlineMS
-	if err := s.pump.submitInternal(ctx, command); err != nil {
+	submitCtx := ctx
+	if mayWrite {
+		// Once a potentially mutating command enters the submission queue, the
+		// caller must learn its terminal outcome instead of a context error that
+		// could make a successful write look safe to retry.
+		submitCtx = context.WithoutCancel(ctx)
+	}
+	if err := s.pump.submitInternal(submitCtx, command); err != nil {
 		s.pump.removeSQLiteWaiter(requestID)
 		return SQLiteResponse{}, err
 	}
 
 	var assembler sqliteResponseAssembler
+	var cancellationErr error
 	for {
+		contextDone := ctx.Done()
+		if cancellationErr != nil {
+			contextDone = nil
+		}
 		select {
 		case event := <-result:
 			done, err := assembler.add(event)
 			if err != nil {
+				if cancellationErr != nil {
+					return SQLiteResponse{}, cancellationErr
+				}
 				return SQLiteResponse{}, err
 			}
 			if done {
 				return assembler.response, nil
 			}
-		case <-ctx.Done():
-			s.pump.abandonSQLiteWaiter(requestID)
-			return SQLiteResponse{}, ctx.Err()
+		case <-contextDone:
+			if !mayWrite {
+				s.pump.abandonSQLiteWaiter(requestID)
+				return SQLiteResponse{}, ctx.Err()
+			}
+			cancellationErr = ctx.Err()
 		case <-s.done:
 			s.pump.abandonSQLiteWaiter(requestID)
 			return SQLiteResponse{}, ErrShuttingDown
