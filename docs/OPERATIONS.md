@@ -106,8 +106,10 @@ terminal. Keep transactions short and do not call the outer `DB` while holding
 one: regular operations wait behind the active transaction and may consume the
 caller deadline. A second `Begin` on the same generation returns
 `transaction_already_open` immediately. Sleep and stop reject new SQL, roll
-back the open lease, wait for already-admitted calls, and close the transport
-before lifecycle completion.
+back the open lease, and wait for already-admitted calls. If the sleep intent
+is rejected, the live generation accepts new SQL again (the old `Tx` remains
+terminal). Once sleep is accepted, cleanup closes the fenced transport before
+lifecycle completion.
 
 Public `Exec` and `Query` each accept one SQL statement. Both transports reject
 a multi-statement string as `sqlite_error` before any statement runs. Valid

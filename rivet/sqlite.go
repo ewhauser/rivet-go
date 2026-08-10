@@ -102,20 +102,23 @@ type sqliteBackend interface {
 // potentially mutating operation is admitted, the call waits for settlement;
 // a write that succeeds after its context expires is reported as successful so
 // callers cannot accidentally duplicate it by retrying an ambiguous timeout.
-// Sleep and stop reject new calls, roll back that transaction, wait for
-// admitted calls, and close this generation's transport.
+// Sleep and stop reject new calls, roll back that transaction, and wait for
+// admitted calls. A rejected sleep reopens admission; an accepted sleep leaves
+// the database fenced until actor cleanup closes this generation's transport.
 type DB struct {
 	backend sqliteBackend
 
-	lifecycleMu  sync.Mutex
-	lifecycle    *sync.Cond
-	closing      bool
-	active       int
-	beginning    bool
-	transactions map[*sqliteTx]struct{}
-	closeOnce    sync.Once
-	closeDone    chan struct{}
-	closeErr     error
+	sleepIntentMu sync.Mutex
+	lifecycleMu   sync.Mutex
+	lifecycle     *sync.Cond
+	closing       bool
+	sleepPrepared bool
+	active        int
+	beginning     bool
+	transactions  map[*sqliteTx]struct{}
+	closeOnce     sync.Once
+	closeDone     chan struct{}
+	closeErr      error
 }
 
 func makeDB(backend sqliteBackend) *DB {
@@ -229,7 +232,7 @@ func (d *DB) Begin(ctx context.Context) (Tx, error) {
 	}
 	transaction := &sqliteTx{owner: d, backend: d.backend, leaseKey: leaseKey}
 	d.lifecycleMu.Lock()
-	if d.closing {
+	if d.closing || d.sleepPrepared {
 		d.lifecycleMu.Unlock()
 		rollbackCtx, cancel := context.WithTimeout(context.Background(), defaultSQLiteCloseTimeout)
 		defer cancel()
@@ -249,11 +252,42 @@ func (d *DB) close() error {
 	return d.closeTransport()
 }
 
-func (d *DB) closeForSleep() error {
+func (d *DB) prepareForSleep() (bool, error) {
 	if d == nil || d.backend == nil {
-		return nil
+		return false, nil
 	}
-	return d.closeTransport()
+	d.lifecycleMu.Lock()
+	if d.closing {
+		d.lifecycleMu.Unlock()
+		return false, sqliteClosedError()
+	}
+	if d.sleepPrepared {
+		d.lifecycleMu.Unlock()
+		return false, nil
+	}
+	d.sleepPrepared = true
+	transactions := make([]*sqliteTx, 0, len(d.transactions))
+	for transaction := range d.transactions {
+		transactions = append(transactions, transaction)
+	}
+	d.lifecycleMu.Unlock()
+
+	err := d.drainOperations(transactions)
+	if err != nil {
+		d.resumeAfterSleepFailure()
+	}
+	return true, err
+}
+
+func (d *DB) resumeAfterSleepFailure() {
+	if d == nil {
+		return
+	}
+	d.lifecycleMu.Lock()
+	if !d.closing {
+		d.sleepPrepared = false
+	}
+	d.lifecycleMu.Unlock()
 }
 
 func (d *DB) closeForDestroy() error {
@@ -269,7 +303,7 @@ func (d *DB) beginOperation() error {
 	}
 	d.lifecycleMu.Lock()
 	defer d.lifecycleMu.Unlock()
-	if d.closing {
+	if d.closing || d.sleepPrepared {
 		return sqliteClosedError()
 	}
 	d.active++
@@ -305,25 +339,9 @@ func (d *DB) closeTransport() error {
 		d.lifecycleMu.Unlock()
 
 		var closeErrors []error
-		for _, transaction := range transactions {
-			if !transaction.terminal.CompareAndSwap(false, true) {
-				continue
-			}
-			rollbackCtx, cancel := context.WithTimeout(context.Background(), defaultSQLiteCloseTimeout)
-			err := d.backend.rollback(rollbackCtx, transaction.leaseKey)
-			cancel()
-			if !expectedCloseRollbackError(err) {
-				closeErrors = append(closeErrors, err)
-			}
-			d.unregisterTransaction(transaction)
+		if err := d.drainOperations(transactions); err != nil {
+			closeErrors = append(closeErrors, err)
 		}
-
-		d.lifecycleMu.Lock()
-		for d.active != 0 {
-			d.lifecycle.Wait()
-		}
-		d.lifecycleMu.Unlock()
-
 		if err := d.backend.close(); err != nil {
 			closeErrors = append(closeErrors, err)
 		}
@@ -332,6 +350,29 @@ func (d *DB) closeTransport() error {
 	})
 	<-d.closeDone
 	return d.closeErr
+}
+
+func (d *DB) drainOperations(transactions []*sqliteTx) error {
+	var drainErrors []error
+	for _, transaction := range transactions {
+		if !transaction.terminal.CompareAndSwap(false, true) {
+			continue
+		}
+		rollbackCtx, cancel := context.WithTimeout(context.Background(), defaultSQLiteCloseTimeout)
+		err := d.backend.rollback(rollbackCtx, transaction.leaseKey)
+		cancel()
+		if !expectedCloseRollbackError(err) {
+			drainErrors = append(drainErrors, err)
+		}
+		d.unregisterTransaction(transaction)
+	}
+
+	d.lifecycleMu.Lock()
+	for d.active != 0 {
+		d.lifecycle.Wait()
+	}
+	d.lifecycleMu.Unlock()
+	return errors.Join(drainErrors...)
 }
 
 func expectedCloseRollbackError(err error) bool {
