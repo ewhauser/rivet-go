@@ -468,13 +468,14 @@ func (h runLifecycleHandler) Run(ctx context.Context, session *ActorSession, sta
 
 type dispatchHandler struct {
 	lifecycleHandler
-	action     func(context.Context, *ActorSession, wire.Event, any) ([]byte, error)
-	alarm      func(context.Context, *ActorSession, wire.Event, any) error
-	fetch      func(context.Context, *ActorSession, wire.Event, any) error
-	wsOpen     func(context.Context, *ActorSession, wire.Event, any) error
-	wsMessage  func(context.Context, *ActorSession, wire.Event, any) error
-	wsClose    func(context.Context, *ActorSession, wire.Event, any) error
-	wsCloseAll func(context.Context, *ActorSession, any, string)
+	action       func(context.Context, *ActorSession, wire.Event, any) ([]byte, error)
+	actionResult func(context.Context, *ActorSession, wire.Event, any) (ActionResult, error)
+	alarm        func(context.Context, *ActorSession, wire.Event, any) error
+	fetch        func(context.Context, *ActorSession, wire.Event, any) error
+	wsOpen       func(context.Context, *ActorSession, wire.Event, any) error
+	wsMessage    func(context.Context, *ActorSession, wire.Event, any) error
+	wsClose      func(context.Context, *ActorSession, wire.Event, any) error
+	wsCloseAll   func(context.Context, *ActorSession, any, string)
 }
 
 type connectionDispatchHandler struct {
@@ -585,8 +586,12 @@ func (h dispatchHandler) Action(
 	session *ActorSession,
 	event wire.Event,
 	state any,
-) ([]byte, error) {
-	return h.action(ctx, session, event, state)
+) (ActionResult, error) {
+	if h.actionResult != nil {
+		return h.actionResult(ctx, session, event, state)
+	}
+	output, err := h.action(ctx, session, event, state)
+	return ActionResult{Output: output}, err
 }
 
 func (h dispatchHandler) Fetch(
@@ -704,6 +709,55 @@ func TestConnectionLifecycleAndCallingActionStateAreOrdered(t *testing.T) {
 	if closeResult.Kind != wire.CommandConnectionResult || closeResult.OperationID != 13 ||
 		closeResult.ConnectionState == nil || string(*closeResult.ConnectionState) != "action-mutated" {
 		t.Fatalf("close result = %#v", closeResult)
+	}
+
+	cancel()
+	if err := <-result; err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+}
+
+func TestPrevalidatedActionConnectionStateSkipsLateEncoding(t *testing.T) {
+	runner := newFakeRunner()
+	connectionState := []byte("prevalidated")
+	connectionID := "connection-1"
+	var lateEncodes atomic.Int32
+	handler := connectionDispatchHandler{
+		dispatchHandler: dispatchHandler{
+			actionResult: func(
+				context.Context, *ActorSession, wire.Event, any,
+			) (ActionResult, error) {
+				return ActionResult{Output: []byte("ok"), ConnectionState: &connectionState}, nil
+			},
+		},
+		state: func(context.Context, *ActorSession, string, any) ([]byte, bool, error) {
+			lateEncodes.Add(1)
+			return nil, false, errors.New("late connection-state encoding")
+		},
+	}
+	p := NewWithHandlers(runner, map[string]ActorHandler{"connected": handler})
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() { result <- p.Run(ctx) }()
+	waitPumpStarted(t, p)
+
+	runner.emit(wire.Event{
+		Kind: wire.EventActorStart, AID: "connected-aid", Generation: 1, Name: "connected",
+	})
+	if command := nextCommand(t, runner); command.Kind != wire.CommandActorStartResult || !command.OK {
+		t.Fatalf("start result = %#v", command)
+	}
+	runner.emit(wire.Event{
+		Kind: wire.EventActionCall, AID: "connected-aid", Generation: 1,
+		CallID: 21, Action: "move", ActionTimeoutMS: 1_000, ConnID: &connectionID,
+	})
+	actionResult := nextCommand(t, runner)
+	if actionResult.Kind != wire.CommandActionResult || string(actionResult.Output) != "ok" ||
+		actionResult.ConnectionState == nil || string(*actionResult.ConnectionState) != "prevalidated" {
+		t.Fatalf("action result = %#v", actionResult)
+	}
+	if lateEncodes.Load() != 0 {
+		t.Fatalf("late connection-state encodes = %d, want 0", lateEncodes.Load())
 	}
 
 	cancel()
