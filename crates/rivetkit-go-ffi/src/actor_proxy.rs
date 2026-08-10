@@ -4371,15 +4371,23 @@ mod tests {
     #[tokio::test]
     async fn mutating_sql_waits_for_settlement_after_deadline() {
         let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (late_tx, late_rx) = tokio::sync::oneshot::channel();
         let (release_tx, release_rx) = tokio::sync::oneshot::channel();
         let operation = async move {
             started_tx.send(()).expect("report operation start");
+            // Keep the mutation pending well past the one-millisecond deadline.
+            // Windows can coalesce short Tokio timers, so an external sleep can
+            // otherwise make the release and deadline ready in the same poll.
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            late_tx.send(()).expect("report operation is late");
             release_rx.await.expect("release late operation");
             Ok::<_, ()>(17)
         };
         let settlement = tokio::spawn(await_sqlite_deadline(1, false, operation));
         started_rx.await.expect("operation started");
-        tokio::time::sleep(Duration::from_millis(10)).await;
+        late_rx
+            .await
+            .expect("operation remained pending past deadline");
         assert!(!settlement.is_finished());
         release_tx.send(()).expect("release operation");
         match settlement.await.expect("settlement task") {
