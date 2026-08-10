@@ -18,6 +18,7 @@ import (
 	"testing"
 
 	"github.com/vmihailenco/msgpack/v5"
+	"go.uber.org/goleak"
 )
 
 func TestLoadAndABIVersion(t *testing.T) {
@@ -276,6 +277,20 @@ func TestAcquireDownloadsVerifiesAndCaches(t *testing.T) {
 	if requests := host.requests.Load(); requests != 1 {
 		t.Fatalf("host requests = %d, want 1 (second acquire must hit the cache)", requests)
 	}
+}
+
+func TestDownloadArtifactClosesItsIdleConnection(t *testing.T) {
+	host := newArtifactServer(t, http.StatusOK, []byte("native library"))
+	baseline := goleak.IgnoreCurrent()
+
+	data, err := downloadArtifact(host.server.URL)
+	if err != nil {
+		t.Fatalf("download artifact: %v", err)
+	}
+	if string(data) != "native library" {
+		t.Fatalf("downloaded artifact = %q", data)
+	}
+	goleak.VerifyNone(t, baseline)
 }
 
 func TestAcquireRejectsChecksumMismatch(t *testing.T) {
