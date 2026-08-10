@@ -33,10 +33,14 @@ func (s sizedConnectionState) MarshalBinary() ([]byte, error) {
 	return bytes.Repeat([]byte{'s'}, s.Size), nil
 }
 
+func (s *sizedConnectionState) UnmarshalBinary(data []byte) error {
+	s.Size = len(data)
+	return nil
+}
+
 func newConnectionTestContext[T any]() *Context[T] {
 	return &Context[T]{
-		connections:        make(map[string]*Connection),
-		pendingConnections: make(map[string]*Connection),
+		connections: make(map[string]*Connection),
 	}
 }
 
@@ -47,10 +51,12 @@ func TestActorConnectLifecycleInitializesMutatesAndClosesTypedState(t *testing.T
 	}
 	var opened *Connection
 	var closed *Connection
+	var initialized *Connection
 	adapter := &actorAdapter[struct{}]{definition: Actor[struct{}]{
 		ConnectionState: NewConnectionState(func(
 			ctx *Context[struct{}], connection *Connection,
 		) (testConnectionState, error) {
+			initialized = connection
 			if got := ctx.Connections(); len(got) != 0 {
 				t.Fatalf("preflight exposed connection: %#v", got)
 			}
@@ -103,6 +109,12 @@ func TestActorConnectLifecycleInitializesMutatesAndClosesTypedState(t *testing.T
 	}
 	if opened == nil || opened.ID() != snapshot.ID || !opened.CanHibernate() || opened.Resumed() {
 		t.Fatalf("opened connection = %#v", opened)
+	}
+	if opened == initialized {
+		t.Fatal("connection preflight retained its initializer object until open")
+	}
+	if initialized == nil || !initialized.Closed() {
+		t.Fatalf("initializer connection remained usable after preflight: %#v", initialized)
 	}
 	var persisted testConnectionState
 	if err := decodeJSONState(openState, &persisted); err != nil {
@@ -220,8 +232,8 @@ func TestConnectionStateSizeLimit(t *testing.T) {
 		if !errors.As(err, &structured) || structured.Code != "connection_state_too_large" {
 			t.Fatalf("connection error = %#v, want connection_state_too_large HandlerError", err)
 		}
-		if len(actorContext.pendingConnections) != 0 {
-			t.Fatalf("oversized preflight left pending connections: %#v", actorContext.pendingConnections)
+		if len(actorContext.connections) != 0 {
+			t.Fatalf("oversized preflight left active connections: %#v", actorContext.connections)
 		}
 	})
 
@@ -260,8 +272,8 @@ func TestConnectionStateSizeLimit(t *testing.T) {
 		if opened == nil || !opened.Closed() {
 			t.Fatalf("oversized opened connection was not closed: %#v", opened)
 		}
-		if len(actorContext.connections) != 0 || len(actorContext.pendingConnections) != 0 {
-			t.Fatalf("oversized open left tracked connections: active=%#v pending=%#v", actorContext.connections, actorContext.pendingConnections)
+		if len(actorContext.connections) != 0 {
+			t.Fatalf("oversized open left tracked connections: %#v", actorContext.connections)
 		}
 	})
 }
