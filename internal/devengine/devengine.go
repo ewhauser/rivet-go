@@ -281,6 +281,11 @@ func (e *Engine) Stop(ctx context.Context) error {
 		return nil
 	}
 	if process.command.Process != nil {
+		// Windows does not implement os.Interrupt for child processes. Fall back
+		// to the same hard kill Stop uses when a graceful shutdown times out.
+		if runtime.GOOS == "windows" {
+			return e.killProcess(process)
+		}
 		if err := process.command.Process.Signal(os.Interrupt); err != nil && !errors.Is(err, os.ErrProcessDone) {
 			return fmt.Errorf("signal engine: %w", err)
 		}
