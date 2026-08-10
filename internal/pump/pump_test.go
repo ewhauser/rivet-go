@@ -917,6 +917,119 @@ func TestActorSessionQueueAndManagedWorkCorrelation(t *testing.T) {
 	}
 }
 
+func TestBlockingQueueWaitsOutliveIntentTimeoutAndCancel(t *testing.T) {
+	longWait := 5 * time.Second
+	tests := []struct {
+		name      string
+		kind      wire.CommandKind
+		operation string
+		call      func(*ActorSession, context.Context) error
+	}{
+		{
+			name:      "next unbounded",
+			kind:      wire.CommandQueueNext,
+			operation: "next",
+			call: func(session *ActorSession, ctx context.Context) error {
+				_, err := session.QueueNext(ctx, nil, nil, false)
+				return err
+			},
+		},
+		{
+			name:      "next longer than intent timeout",
+			kind:      wire.CommandQueueNext,
+			operation: "next",
+			call: func(session *ActorSession, ctx context.Context) error {
+				_, err := session.QueueNext(ctx, nil, &longWait, false)
+				return err
+			},
+		},
+		{
+			name:      "enqueue wait unbounded",
+			kind:      wire.CommandQueueEnqueueWait,
+			operation: "enqueue_wait",
+			call: func(session *ActorSession, ctx context.Context) error {
+				_, _, err := session.QueueEnqueueWait(ctx, "jobs", []byte{0xa0}, nil)
+				return err
+			},
+		},
+		{
+			name:      "enqueue wait longer than intent timeout",
+			kind:      wire.CommandQueueEnqueueWait,
+			operation: "enqueue_wait",
+			call: func(session *ActorSession, ctx context.Context) error {
+				_, _, err := session.QueueEnqueueWait(ctx, "jobs", []byte{0xa0}, &longWait)
+				return err
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			runner := newFakeRunner()
+			sessionReady := make(chan *ActorSession, 1)
+			handler := lifecycleHandler{start: func(_ context.Context, session *ActorSession, _ wire.Event) (any, error) {
+				sessionReady <- session
+				return nil, nil
+			}}
+			p := NewWithHandlers(runner, map[string]ActorHandler{"queue": handler})
+			p.intentTimeout = 10 * time.Millisecond
+			ctx, cancel := context.WithCancel(context.Background())
+			runResult := make(chan error, 1)
+			go func() { runResult <- p.Run(ctx) }()
+			waitPumpStarted(t, p)
+
+			runner.emit(wire.Event{Kind: wire.EventActorStart, AID: "queue-wait-aid", Generation: 7, Name: "queue"})
+			if command := nextCommand(t, runner); command.Kind != wire.CommandActorStartResult || !command.OK {
+				t.Fatalf("ActorStartResult = %#v", command)
+			}
+			session := <-sessionReady
+			waitCtx, cancelWait := context.WithCancel(context.Background())
+			waitResult := make(chan error, 1)
+			go func() { waitResult <- test.call(session, waitCtx) }()
+			operation := nextCommand(t, runner)
+			if operation.Kind != test.kind || operation.OperationID == 0 {
+				t.Fatalf("queue operation = %#v, want %s", operation, test.kind)
+			}
+
+			select {
+			case err := <-waitResult:
+				t.Fatalf("queue wait returned after generic intent timeout: %v", err)
+			case <-time.After(5 * p.intentTimeout):
+			}
+			select {
+			case command := <-runner.submitted:
+				t.Fatalf("queue wait submitted command before cancellation: %#v", command)
+			default:
+			}
+
+			cancelWait()
+			cancelCommand := nextCommand(t, runner)
+			if cancelCommand.Kind != wire.CommandQueueCancel ||
+				cancelCommand.TargetOperation != operation.OperationID ||
+				cancelCommand.AID != "queue-wait-aid" || cancelCommand.Generation != 7 {
+				t.Fatalf("QueueCancel = %#v", cancelCommand)
+			}
+			runner.emit(wire.Event{
+				Kind: wire.EventActorQueueResult, OperationID: operation.OperationID,
+				QueueOperation: test.operation,
+				Error:          &wire.WireError{Code: "queue_cancelled", Message: "queue wait was cancelled"},
+			})
+			if err := <-waitResult; !errors.Is(err, context.Canceled) {
+				t.Fatalf("queue wait error = %v, want context.Canceled", err)
+			}
+
+			runner.emit(wire.Event{Kind: wire.EventActorStop, AID: "queue-wait-aid", Generation: 7, Reason: "destroy"})
+			if command := nextCommand(t, runner); command.Kind != wire.CommandActorStopResult {
+				t.Fatalf("ActorStopResult = %#v", command)
+			}
+			cancel()
+			if err := <-runResult; err != nil {
+				t.Fatalf("Run pump: %v", err)
+			}
+		})
+	}
+}
+
 func TestManagedWorkEndRetriesNativeBackpressure(t *testing.T) {
 	defer goleak.VerifyNone(t)
 	base := newFakeRunner()

@@ -801,8 +801,14 @@ func (s *ActorSession) submitActorOperation(ctx context.Context, command wire.Co
 		s.pump.removeActorIntentWaiter(operationID)
 		return wire.Event{}, err
 	}
-	timer := time.NewTimer(s.pump.intentTimeout)
-	defer timer.Stop()
+	queueWait := command.Kind == wire.CommandQueueNext || command.Kind == wire.CommandQueueEnqueueWait
+	var timer *time.Timer
+	var timeout <-chan time.Time
+	if !queueWait {
+		timer = time.NewTimer(s.pump.intentTimeout)
+		timeout = timer.C
+		defer timer.Stop()
+	}
 	select {
 	case event := <-result:
 		if event.Error != nil {
@@ -814,28 +820,14 @@ func (s *ActorSession) submitActorOperation(ctx context.Context, command wire.Co
 		}
 		return event, nil
 	case <-ctx.Done():
-		if command.Kind == wire.CommandQueueNext || command.Kind == wire.CommandQueueEnqueueWait {
-			cancelErr := s.pump.submitInternal(context.Background(), wire.Command{
-				Kind:            wire.CommandQueueCancel,
-				AID:             s.identity.aid,
-				Generation:      s.identity.generation,
-				TargetOperation: operationID,
-			})
-			if cancelErr == nil {
-				select {
-				case event := <-result:
-					if event.Error == nil && (command.Kind == wire.CommandQueueEnqueueWait || event.QueueMessage != nil) {
-						return event, nil
-					}
-				case <-timer.C:
-				case <-s.done:
-				case <-s.pump.done:
-				}
+		if queueWait {
+			if event, completed := s.settleQueueCancellation(command.Kind, operationID, result); completed {
+				return event, nil
 			}
 		}
 		s.pump.abandonActorIntentWaiter(operationID)
 		return wire.Event{}, ctx.Err()
-	case <-timer.C:
+	case <-timeout:
 		s.pump.abandonActorIntentWaiter(operationID)
 		return wire.Event{}, HandlerError{
 			Code:    "actor_intent_timeout",
@@ -848,6 +840,33 @@ func (s *ActorSession) submitActorOperation(ctx context.Context, command wire.Co
 		s.pump.abandonActorIntentWaiter(operationID)
 		return wire.Event{}, ErrShuttingDown
 	}
+}
+
+func (s *ActorSession) settleQueueCancellation(
+	kind wire.CommandKind,
+	operationID uint64,
+	result <-chan wire.Event,
+) (wire.Event, bool) {
+	if err := s.pump.submitInternal(context.Background(), wire.Command{
+		Kind:            wire.CommandQueueCancel,
+		AID:             s.identity.aid,
+		Generation:      s.identity.generation,
+		TargetOperation: operationID,
+	}); err != nil {
+		return wire.Event{}, false
+	}
+	timer := time.NewTimer(s.pump.intentTimeout)
+	defer timer.Stop()
+	select {
+	case event := <-result:
+		if event.Error == nil && (kind == wire.CommandQueueEnqueueWait || event.QueueMessage != nil) {
+			return event, true
+		}
+	case <-timer.C:
+	case <-s.done:
+	case <-s.pump.done:
+	}
+	return wire.Event{}, false
 }
 
 func (s *ActorSession) submitWebSocket(ctx context.Context, command wire.Command) error {
