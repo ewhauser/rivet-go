@@ -751,9 +751,11 @@ the schema's `SqliteQuery` request because `SqliteExec` accepts only a script
 and returns neither `changes` nor `lastInsertRowid`. The shared public API is
 single-statement for both `Exec` and `Query`; multi-statement input returns
 `sqlite_error` with statement index zero before either statement executes. The
-embedded executor also requires the argument count to exactly match SQLite's
-parsed parameter count, so omitted placeholders cannot execute as implicit
-`NULL` values.
+tail check ignores SQLite line and block comments after the prepared statement,
+but still rejects any trailing executable or malformed token. The embedded
+executor also requires the argument count to exactly match SQLite's parsed
+parameter count, so omitted placeholders cannot execute as implicit `NULL`
+values.
 
 Socket responses are not chunked by the upstream protocol. Columns and all
 rows, including encoding overhead, must fit one negotiated frame. The client
@@ -798,8 +800,8 @@ LocalNative requires bundled SQLite to be compiled with
 as the pinned upstream workspace. The pinned Depot decoder also collapsed a
 zero-length BLOB to NULL when SQLite reported `SQLITE_BLOB` with a null data
 pointer. The workspace Cargo patch vendors the exact v2.3.10 seven-file Depot
-client with two audited local corrections. The decoder returns an empty blob
-for that zero-length branch. During native database teardown, a failed or
+client with audited local corrections. The decoder returns an empty blob for
+that zero-length branch. During native database teardown, a failed or
 timed-out bounded final flush marks that connection's main VFS file to skip the
 redundant unbounded `xClose` flush, then still calls `sqlite3_close_v2`; this
 releases the native connection instead of abandoning its pointer. The

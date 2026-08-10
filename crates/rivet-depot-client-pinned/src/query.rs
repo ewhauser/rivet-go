@@ -137,7 +137,7 @@ pub fn execute_single_statement(
 			"failed to prepare sqlite execute statement",
 		));
 	}
-	if has_non_whitespace_tail(tail) {
+	if has_non_comment_tail(tail) {
 		if !stmt.is_null() {
 			unsafe {
 				sqlite3_finalize(stmt);
@@ -377,13 +377,44 @@ fn column_value(stmt: *mut libsqlite3_sys::sqlite3_stmt, index: i32) -> ColumnVa
 	}
 }
 
-fn has_non_whitespace_tail(tail: *const c_char) -> bool {
+fn has_non_comment_tail(tail: *const c_char) -> bool {
 	if tail.is_null() {
 		return false;
 	}
 
 	let bytes = unsafe { CStr::from_ptr(tail).to_bytes() };
-	bytes.iter().any(|byte| !byte.is_ascii_whitespace())
+	let mut index = 0;
+	while index < bytes.len() {
+		while index < bytes.len() && bytes[index].is_ascii_whitespace() {
+			index += 1;
+		}
+		if index == bytes.len() {
+			return false;
+		}
+
+		if bytes[index..].starts_with(b"--") {
+			index += 2;
+			while index < bytes.len() && bytes[index] != b'\n' {
+				index += 1;
+			}
+			continue;
+		}
+		if bytes[index..].starts_with(b"/*") {
+			index += 2;
+			while index + 1 < bytes.len() && !(bytes[index] == b'*' && bytes[index + 1] == b'/') {
+				index += 1;
+			}
+			if index + 1 >= bytes.len() {
+				return false;
+			}
+			index += 2;
+			continue;
+		}
+
+		return true;
+	}
+
+	false
 }
 
 fn sqlite_error(db: *mut sqlite3, statement_index: u32, context: &str) -> anyhow::Error {
@@ -604,6 +635,28 @@ mod tests {
 		let typed = err.downcast_ref::<SqliteStatementError>().unwrap();
 		assert_eq!(typed.code, -1);
 		assert_eq!(typed.statement_index, 0);
+	}
+
+	#[test]
+	fn execute_single_statement_accepts_trailing_comments() {
+		let db = MemoryDb::open();
+		for sql in [
+			"SELECT 1; -- trailing comment",
+			"SELECT 1; /* trailing ; SELECT 2 */",
+			"SELECT 1; /* first */ -- second\n",
+			"SELECT 1; /* unterminated trailing comment",
+		] {
+			let result = execute_single_statement(db.as_ptr(), sql, None).unwrap();
+			assert_eq!(result.rows, vec![vec![ColumnValue::Integer(1)]], "{sql}");
+		}
+
+		let err = execute_single_statement(
+			db.as_ptr(),
+			"SELECT 1; /* trailing comment */ SELECT 2;",
+			None,
+		)
+		.expect_err("a statement after a trailing comment should fail");
+		assert!(err.to_string().contains("single statement"));
 	}
 
 	#[test]
