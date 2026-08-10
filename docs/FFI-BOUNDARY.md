@@ -494,7 +494,18 @@ update as stale. The FFI therefore holds each serialized alarm completion for
 4 seconds: two complete 1.5-second `DatabaseKv` signal polls plus a 1-second
 scheduling margin. That settlement also orders rapid replacement and clear
 before the caller can submit the next mutation. Other core schedule rows are
-untouched. The reserved action
+untouched. If the generation later requests sleep after mutating its Go alarm,
+the FFI re-reads all current one-shot schedules, re-arms the earliest timestamp
+(or clears the transport when none remain), and waits until core persists an
+intermediate transport fence followed by the exact desired acknowledgement
+before requesting sleep. The distinct fence makes a repeated timestamp or
+clear distinguishable from a stale persisted value. A missing or failed
+acknowledgement leaves the generation awake rather than stranding its durable
+alarm. This second checkpoint is required for schedules
+created during `OnStart`: their first alarm signal can remain pending until
+startup completes and otherwise be overtaken by the first post-start sleep.
+Generations that did not mutate their Go alarm do not pay this additional
+settlement. The reserved action
 cannot be registered by an actor author. When core fires it, the FFI converts
 the scheduled action to `ActorAlarm`, waits for `AlarmHandled`, and replies to
 core only after the Go hook and its implicit state save complete. Core owns the

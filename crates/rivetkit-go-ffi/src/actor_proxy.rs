@@ -38,6 +38,11 @@ const ALARM_RESULT_TIMEOUT: Duration = ACTION_RESULT_TIMEOUT;
 // schedules report their committed mutation immediately but retain their actor
 // operation guard through the window so a following sleep cannot overtake it.
 const ALARM_TRANSPORT_SETTLEMENT: Duration = Duration::from_millis(2 * 1_500 + 1_000);
+const ALARM_TRANSPORT_CONFIRM_TIMEOUT: Duration = Duration::from_secs(30);
+const ALARM_TRANSPORT_CONFIRM_POLL: Duration = Duration::from_millis(25);
+const ALARM_TRANSPORT_CONFIRM_FENCE_TS: i64 = 4_102_444_800_000;
+const LOAD_LAST_PUSHED_ALARM_SQL: &str =
+    "SELECT last_pushed_alarm FROM _rivet_runtime WHERE id = 1";
 const HTTP_RESULT_TIMEOUT: Duration = Duration::from_secs(30);
 const WS_OPEN_RESULT_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_BODY_CHUNK: usize = 1 << 20;
@@ -50,6 +55,67 @@ const WS_MESSAGE_ACK_TIMEOUT: Duration = Duration::from_secs(60);
 const INTERNAL_ALARM_ACTION: &str = "__rivet_go_alarm";
 const MAX_SQLITE_RESULT_BYTES: usize = 32 * 1024 * 1024;
 const MAX_SQLITE_CHUNK_BYTES: usize = 1 << 20;
+
+fn next_one_shot_alarm(scheduled: &[ScheduledEventInfo]) -> Option<i64> {
+    scheduled.iter().map(|event| event.run_at).min()
+}
+
+#[derive(Deserialize, Serialize)]
+struct LastPushedAlarmRow {
+    last_pushed_alarm: Option<i64>,
+}
+
+fn decode_last_pushed_alarm(payload: &[u8]) -> Result<Option<Option<i64>>> {
+    let rows: Vec<LastPushedAlarmRow> = ciborium::de::from_reader(payload)
+        .context("decode persisted actor alarm acknowledgement")?;
+    Ok(rows.first().map(|row| row.last_pushed_alarm))
+}
+
+async fn wait_for_alarm_transport_confirmation(
+    ctx: &ActorContext,
+    expected: Option<i64>,
+) -> Result<()> {
+    let deadline = tokio::time::Instant::now() + ALARM_TRANSPORT_CONFIRM_TIMEOUT;
+    loop {
+        let payload = ctx
+            .db_query(LOAD_LAST_PUSHED_ALARM_SQL, None)
+            .await
+            .context("read persisted actor alarm acknowledgement")?;
+        if decode_last_pushed_alarm(&payload)? == Some(expected) {
+            return Ok(());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(anyhow!(
+                "actor alarm transport acknowledgement was not persisted within {:?}",
+                ALARM_TRANSPORT_CONFIRM_TIMEOUT
+            ));
+        }
+        tokio::time::sleep(ALARM_TRANSPORT_CONFIRM_POLL).await;
+    }
+}
+
+fn alarm_transport_confirmation_fence(expected: Option<i64>) -> Option<i64> {
+    if expected.is_some() {
+        None
+    } else {
+        Some(ALARM_TRANSPORT_CONFIRM_FENCE_TS)
+    }
+}
+
+async fn confirm_alarm_transport(ctx: &ActorContext, expected: Option<i64>) -> Result<()> {
+    // Persisting a distinct fence first makes confirmation meaningful even
+    // when the desired value already matches a prior acknowledgement or is
+    // NULL. The fence changes only the engine transport, not the durable
+    // schedule table, and the actor remains awake until the desired value is
+    // confirmed.
+    let fence = alarm_transport_confirmation_fence(expected);
+    ctx.set_alarm(fence)
+        .context("set actor alarm transport confirmation fence")?;
+    wait_for_alarm_transport_confirmation(ctx, fence).await?;
+    ctx.set_alarm(expected)
+        .context("restore actor alarm transport after confirmation fence")?;
+    wait_for_alarm_transport_confirmation(ctx, expected).await
+}
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
 struct ActorIdentity {
@@ -160,6 +226,7 @@ struct ActiveActor {
     state_version: Arc<AtomicU64>,
     operations: ActorOperations,
     alarm_updates: ActorAlarmUpdates,
+    alarm_transport_dirty: Arc<AtomicBool>,
     run_active: Arc<AtomicBool>,
     managed_work_admission: ManagedWorkAdmission,
 }
@@ -1085,6 +1152,7 @@ impl ActorProxy {
                     state_version: Arc::new(AtomicU64::new(0)),
                     operations: ActorOperations::default(),
                     alarm_updates: ActorAlarmUpdates::default(),
+                    alarm_transport_dirty: Arc::new(AtomicBool::new(false)),
                     run_active: Arc::new(AtomicBool::new(false)),
                     managed_work_admission: ManagedWorkAdmission::default(),
                 },
@@ -2146,6 +2214,7 @@ impl ActorProxy {
                 );
                 return;
             }
+            actor.alarm_transport_dirty.store(true, Ordering::Release);
             if let Some(alarm_ts) = alarm_ts
                 && let Err(error) = actor
                     .ctx
@@ -2192,6 +2261,48 @@ impl ActorProxy {
         self.emit_actor_intent_result(op_id, Ok(()));
         tokio::spawn(async move {
             actor.operations.wait_idle().await;
+            // At the pinned engine, schedule-alarm and sleep checkpoints are
+            // independent workflow signals. A schedule written during
+            // startup can therefore still be overtaken by the following
+            // sleep even after its original transport-settlement window.
+            // Re-arm the current earliest one-shot schedule after startup and
+            // immediately before sleep. Reading the complete table preserves
+            // action schedules that may precede the Go alarm; actors without
+            // schedule mutations keep ordinary sleeps on the fast path.
+            if actor.alarm_transport_dirty.load(Ordering::Acquire) {
+                let alarm_confirmed = match actor.ctx.list_scheduled_events().await {
+                    Ok(scheduled) => {
+                        let next_alarm = next_one_shot_alarm(&scheduled);
+                        match confirm_alarm_transport(&actor.ctx, next_alarm).await {
+                            Ok(()) => true,
+                            Err(error) => {
+                                tracing::error!(
+                                    actor_id = %identity.aid,
+                                    generation = identity.generation,
+                                    ?next_alarm,
+                                    ?error,
+                                    "actor alarm was not confirmed before sleep"
+                                );
+                                false
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        tracing::error!(
+                            actor_id = %identity.aid,
+                            generation = identity.generation,
+                            ?error,
+                            "failed to list actor schedules before sleep"
+                        );
+                        false
+                    }
+                };
+                // Leaving the generation awake is safer than acknowledging a
+                // sleep transition that can strand its next durable alarm.
+                if !alarm_confirmed {
+                    return;
+                }
+            }
             // The result above acknowledges admission of the intent. Once the
             // exact generation and its already-admitted work are fenced, core
             // owns the sleep transition and reports it through ActorStop.
@@ -2254,6 +2365,7 @@ impl ActorProxy {
                 .await
             {
                 Ok(schedule_id) => {
+                    actor.alarm_transport_dirty.store(true, Ordering::Release);
                     proxy.emit_schedule_create(op_id, schedule_id);
                     tokio::time::sleep(ALARM_TRANSPORT_SETTLEMENT).await;
                 }
@@ -2280,6 +2392,7 @@ impl ActorProxy {
             let _operation = operation;
             match actor.ctx.at(run_at, &action, &args).await {
                 Ok(schedule_id) => {
+                    actor.alarm_transport_dirty.store(true, Ordering::Release);
                     proxy.emit_schedule_create(op_id, schedule_id);
                     tokio::time::sleep(ALARM_TRANSPORT_SETTLEMENT).await;
                 }
@@ -2304,6 +2417,9 @@ impl ActorProxy {
             let _operation = operation;
             match actor.ctx.cancel_schedule(&schedule_id).await {
                 Ok(cancelled) => {
+                    if cancelled {
+                        actor.alarm_transport_dirty.store(true, Ordering::Release);
+                    }
                     proxy.emit_schedule_cancel(op_id, cancelled);
                     if cancelled {
                         tokio::time::sleep(ALARM_TRANSPORT_SETTLEMENT).await;
@@ -5109,5 +5225,56 @@ mod tests {
     #[test]
     fn alarm_transport_settlement_covers_two_pinned_signal_polls() {
         assert!(ALARM_TRANSPORT_SETTLEMENT >= Duration::from_millis(2 * 1_500));
+    }
+
+    #[test]
+    fn pre_sleep_alarm_rearm_preserves_the_earliest_one_shot_schedule() {
+        assert_eq!(next_one_shot_alarm(&[]), None);
+        let scheduled = [
+            ScheduledEventInfo {
+                id: "go-alarm".to_owned(),
+                action: INTERNAL_ALARM_ACTION.to_owned(),
+                args: Vec::new(),
+                run_at: 30,
+            },
+            ScheduledEventInfo {
+                id: "action-schedule".to_owned(),
+                action: "remind".to_owned(),
+                args: Vec::new(),
+                run_at: 20,
+            },
+        ];
+        assert_eq!(next_one_shot_alarm(&scheduled), Some(20));
+    }
+
+    #[test]
+    fn persisted_alarm_acknowledgement_decodes_exact_timestamp_and_clear() {
+        for expected in [Some(42), None] {
+            let mut payload = Vec::new();
+            ciborium::ser::into_writer(
+                &vec![LastPushedAlarmRow {
+                    last_pushed_alarm: expected,
+                }],
+                &mut payload,
+            )
+            .expect("encode persisted alarm acknowledgement");
+            assert_eq!(
+                decode_last_pushed_alarm(&payload).expect("decode persisted alarm acknowledgement"),
+                Some(expected)
+            );
+        }
+        let mut empty_payload = Vec::new();
+        ciborium::ser::into_writer(&Vec::<LastPushedAlarmRow>::new(), &mut empty_payload)
+            .expect("encode absent persisted alarm acknowledgement");
+        assert_eq!(
+            decode_last_pushed_alarm(&empty_payload)
+                .expect("decode absent persisted alarm acknowledgement"),
+            None
+        );
+        assert_eq!(
+            alarm_transport_confirmation_fence(None),
+            Some(ALARM_TRANSPORT_CONFIRM_FENCE_TS)
+        );
+        assert_eq!(alarm_transport_confirmation_fence(Some(42)), None);
     }
 }
