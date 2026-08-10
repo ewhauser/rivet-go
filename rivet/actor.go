@@ -251,15 +251,33 @@ func (c *Context[T]) Sleep() error {
 	if c == nil || c.session == nil {
 		return errors.New("actor context is unavailable")
 	}
+	return fenceSQLiteAndRequestSleep(c.db, c.session.Sleep)
+}
+
+func fenceSQLiteAndRequestSleep(database *DB, requestSleep func() error) error {
+	if database == nil {
+		return requestSleep()
+	}
+	database.sleepIntentMu.Lock()
+	defer database.sleepIntentMu.Unlock()
+
 	// Fence both SQLite transports before requesting eviction so admitted work
 	// finishes and an open lease is rolled back instead of gating sleep until
-	// its timeout.
-	if c.db != nil {
-		if err := c.db.closeForSleep(); err != nil {
-			return fmt.Errorf("close actor SQLite transport for sleep: %w", err)
-		}
+	// its timeout. The fence stays in place after acceptance for OnStop to close,
+	// but a rejected intent must reopen this still-live generation's database.
+	preparedNow, err := database.prepareForSleep()
+	if err != nil {
+		return fmt.Errorf("prepare actor SQLite transport for sleep: %w", err)
 	}
-	return c.session.Sleep()
+	if err = requestSleep(); err != nil {
+		// A redundant Sleep can race the lifecycle stop after an earlier intent
+		// was accepted. Its failure must not reopen that accepted intent's fence.
+		if preparedNow {
+			database.resumeAfterSleepFailure()
+		}
+		return err
+	}
+	return nil
 }
 
 // Destroy permanently destroys this actor after the current callback response

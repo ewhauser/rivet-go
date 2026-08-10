@@ -14,6 +14,8 @@ import (
 type lifecycleSQLiteBackend struct {
 	execStarted    chan struct{}
 	execRelease    chan struct{}
+	beginStarted   chan struct{}
+	beginRelease   chan struct{}
 	rollbackCalled chan string
 	closed         chan struct{}
 	closeOnce      sync.Once
@@ -30,8 +32,14 @@ func (*lifecycleSQLiteBackend) query(context.Context, string, []wire.SQLiteValue
 	return Rows{}, nil
 }
 
-func (*lifecycleSQLiteBackend) begin(context.Context, string, time.Duration) error { return nil }
-func (*lifecycleSQLiteBackend) commit(context.Context, string) error               { return nil }
+func (b *lifecycleSQLiteBackend) begin(context.Context, string, time.Duration) error {
+	if b.beginStarted != nil {
+		close(b.beginStarted)
+		<-b.beginRelease
+	}
+	return nil
+}
+func (*lifecycleSQLiteBackend) commit(context.Context, string) error { return nil }
 func (b *lifecycleSQLiteBackend) rollback(_ context.Context, leaseKey string) error {
 	b.rollbackCalled <- leaseKey
 	return nil
@@ -92,7 +100,7 @@ func TestSQLiteWireErrorKeepsStatementMetadata(t *testing.T) {
 	}
 }
 
-func TestSQLiteCloseRollsBackLeaseAndWaitsForInflightOperation(t *testing.T) {
+func TestSQLiteSleepFenceRollsBackLeaseAndWaitsForInflightOperation(t *testing.T) {
 	backend := &lifecycleSQLiteBackend{
 		execStarted:    make(chan struct{}),
 		execRelease:    make(chan struct{}),
@@ -116,16 +124,19 @@ func TestSQLiteCloseRollsBackLeaseAndWaitsForInflightOperation(t *testing.T) {
 		t.Fatal("transaction operation did not start")
 	}
 
-	closeDone := make(chan error, 1)
-	go func() { closeDone <- database.closeForSleep() }()
+	prepareDone := make(chan error, 1)
+	go func() {
+		_, err := database.prepareForSleep()
+		prepareDone <- err
+	}()
 	select {
 	case <-backend.rollbackCalled:
 	case <-time.After(time.Second):
 		t.Fatal("sleep close did not roll back the open lease")
 	}
 	select {
-	case err := <-closeDone:
-		t.Fatalf("sleep close returned before the accepted operation finished: %v", err)
+	case err := <-prepareDone:
+		t.Fatalf("sleep fence returned before the accepted operation finished: %v", err)
 	default:
 	}
 	select {
@@ -138,23 +149,182 @@ func TestSQLiteCloseRollsBackLeaseAndWaitsForInflightOperation(t *testing.T) {
 	if err := <-execDone; err != nil {
 		t.Fatalf("accepted operation failed: %v", err)
 	}
-	if err := <-closeDone; err != nil {
-		t.Fatalf("sleep close failed: %v", err)
+	if err := <-prepareDone; err != nil {
+		t.Fatalf("sleep fence failed: %v", err)
+	}
+	select {
+	case <-backend.closed:
+		t.Fatal("sleep fence closed the transport before intent acceptance")
+	default:
+	}
+
+	database.resumeAfterSleepFailure()
+	_, err = tx.Exec(context.Background(), "SELECT 1")
+	var structured *SQLiteError
+	if !errors.As(err, &structured) || structured.Code != "invalid_lease_key" {
+		t.Fatalf("old transaction error = %T %v, want invalid_lease_key", err, err)
+	}
+	if _, err = database.Query(context.Background(), "SELECT 1"); err != nil {
+		t.Fatalf("database was not reusable after rejected sleep: %v", err)
+	}
+	if err := database.close(); err != nil {
+		t.Fatal(err)
 	}
 	select {
 	case <-backend.closed:
 	default:
-		t.Fatal("transport was not closed")
+		t.Fatal("transport was not closed during actor cleanup")
 	}
+}
 
-	_, err = tx.Exec(context.Background(), "SELECT 1")
+func TestSleepIntentFailureRestoresSQLiteAdmission(t *testing.T) {
+	backend := &lifecycleSQLiteBackend{closed: make(chan struct{})}
+	database := makeDB(backend)
+	intentErr := errors.New("sleep intent rejected")
+
+	err := fenceSQLiteAndRequestSleep(database, func() error { return intentErr })
+	if !errors.Is(err, intentErr) {
+		t.Fatalf("Sleep error = %v, want %v", err, intentErr)
+	}
+	if _, err := database.Query(context.Background(), "SELECT 1"); err != nil {
+		t.Fatalf("database was not reusable after rejected sleep: %v", err)
+	}
+	select {
+	case <-backend.closed:
+		t.Fatal("rejected sleep closed the SQLite transport")
+	default:
+	}
+	if err := database.close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestSleepIntentAcceptanceKeepsSQLiteFencedUntilCleanup(t *testing.T) {
+	backend := &lifecycleSQLiteBackend{closed: make(chan struct{})}
+	database := makeDB(backend)
+
+	if err := fenceSQLiteAndRequestSleep(database, func() error { return nil }); err != nil {
+		t.Fatal(err)
+	}
+	_, err := database.Query(context.Background(), "SELECT 1")
 	var structured *SQLiteError
 	if !errors.As(err, &structured) || structured.Code != "sqlite_endpoint_closed" {
-		t.Fatalf("old transaction error = %T %v, want sqlite_endpoint_closed", err, err)
+		t.Fatalf("accepted-sleep database error = %T %v, want sqlite_endpoint_closed", err, err)
 	}
-	_, err = database.Query(context.Background(), "SELECT 1")
+	select {
+	case <-backend.closed:
+		t.Fatal("accepted sleep closed transport before actor cleanup")
+	default:
+	}
+	if err := database.close(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-backend.closed:
+	default:
+		t.Fatal("actor cleanup did not close accepted-sleep transport")
+	}
+}
+
+func TestRepeatedSleepReusesAcceptedSQLiteFence(t *testing.T) {
+	backend := &lifecycleSQLiteBackend{closed: make(chan struct{})}
+	database := makeDB(backend)
+	requests := 0
+	requestSleep := func() error {
+		requests++
+		return nil
+	}
+
+	if err := fenceSQLiteAndRequestSleep(database, requestSleep); err != nil {
+		t.Fatal(err)
+	}
+	if err := fenceSQLiteAndRequestSleep(database, requestSleep); err != nil {
+		t.Fatalf("repeated Sleep rejected the accepted SQLite fence: %v", err)
+	}
+	if requests != 2 {
+		t.Fatalf("sleep requests = %d, want 2", requests)
+	}
+	if err := database.close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestFailedRepeatedSleepDoesNotReopenAcceptedSQLiteFence(t *testing.T) {
+	backend := &lifecycleSQLiteBackend{closed: make(chan struct{})}
+	database := makeDB(backend)
+	if err := fenceSQLiteAndRequestSleep(database, func() error { return nil }); err != nil {
+		t.Fatal(err)
+	}
+	intentErr := errors.New("redundant sleep rejected")
+	if err := fenceSQLiteAndRequestSleep(database, func() error { return intentErr }); !errors.Is(err, intentErr) {
+		t.Fatalf("repeated Sleep error = %v, want %v", err, intentErr)
+	}
+	_, err := database.Query(context.Background(), "SELECT 1")
+	var structured *SQLiteError
 	if !errors.As(err, &structured) || structured.Code != "sqlite_endpoint_closed" {
-		t.Fatalf("closed database error = %T %v, want sqlite_endpoint_closed", err, err)
+		t.Fatalf("accepted-sleep database error = %T %v, want sqlite_endpoint_closed", err, err)
+	}
+	if err := database.close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestSQLiteSleepFenceRetiresTransactionRacingBegin(t *testing.T) {
+	backend := &lifecycleSQLiteBackend{
+		beginStarted:   make(chan struct{}),
+		beginRelease:   make(chan struct{}),
+		rollbackCalled: make(chan string, 1),
+		closed:         make(chan struct{}),
+	}
+	database := makeDB(backend)
+	beginResult := make(chan error, 1)
+	go func() {
+		_, err := database.Begin(context.Background())
+		beginResult <- err
+	}()
+	select {
+	case <-backend.beginStarted:
+	case <-time.After(time.Second):
+		t.Fatal("transaction begin did not reach backend")
+	}
+
+	prepareResult := make(chan error, 1)
+	go func() {
+		_, err := database.prepareForSleep()
+		prepareResult <- err
+	}()
+	deadline := time.Now().Add(time.Second)
+	for {
+		_, err := database.Query(context.Background(), "SELECT 1")
+		var structured *SQLiteError
+		if errors.As(err, &structured) && structured.Code == "sqlite_endpoint_closed" {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("sleep fence did not stop admission")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	close(backend.beginRelease)
+
+	var structured *SQLiteError
+	if err := <-beginResult; !errors.As(err, &structured) || structured.Code != "sqlite_endpoint_closed" {
+		t.Fatalf("racing Begin error = %T %v, want sqlite_endpoint_closed", err, err)
+	}
+	select {
+	case <-backend.rollbackCalled:
+	case <-time.After(time.Second):
+		t.Fatal("racing transaction lease was not rolled back")
+	}
+	if err := <-prepareResult; err != nil {
+		t.Fatalf("prepare sleep: %v", err)
+	}
+	database.resumeAfterSleepFailure()
+	if _, err := database.Query(context.Background(), "SELECT 1"); err != nil {
+		t.Fatalf("database was not reusable after racing Begin: %v", err)
+	}
+	if err := database.close(); err != nil {
+		t.Fatal(err)
 	}
 }
 
