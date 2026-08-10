@@ -1,11 +1,98 @@
 package pump
 
 import (
+	"context"
 	"errors"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/ewhauser/rivet-go/internal/wire"
 )
+
+func TestSQLiteMutationCancellationWaitsForTerminalResult(t *testing.T) {
+	runner := newFakeRunner()
+	p := New(runner)
+	pumpCtx, stopPump := context.WithCancel(context.Background())
+	pumpResult := make(chan error, 1)
+	go func() { pumpResult <- p.Run(pumpCtx) }()
+	waitPumpStarted(t, p)
+	t.Cleanup(func() {
+		stopPump()
+		if err := <-pumpResult; err != nil {
+			t.Errorf("Run: %v", err)
+		}
+	})
+
+	session := &ActorSession{
+		pump:      p,
+		done:      make(chan struct{}),
+		identity:  actorIdentity{aid: "sqlite-aid", generation: 3},
+		accepting: true,
+	}
+	session.lifecycleCond = sync.NewCond(&session.lifecycleMu)
+	ctx, cancel := context.WithCancel(context.Background())
+	callResult := make(chan error, 1)
+	go func() {
+		_, err := session.SQLiteExec(ctx, "INSERT INTO todos(label) VALUES ('once')", nil, nil)
+		callResult <- err
+	}()
+	command := nextCommand(t, runner)
+	if command.Kind != wire.CommandSQLiteExec || command.SQLiteRequestID == 0 {
+		t.Fatalf("SQLiteExec command = %#v", command)
+	}
+	cancel()
+	select {
+	case err := <-callResult:
+		t.Fatalf("mutation returned before native settlement: %v", err)
+	case <-time.After(25 * time.Millisecond):
+	}
+	runner.emit(wire.Event{
+		Kind: wire.EventSQLiteResult, SQLiteRequestID: command.SQLiteRequestID,
+		Done: true, RowsAffected: 1,
+	})
+	if err := <-callResult; err != nil {
+		t.Fatalf("late successful mutation = %v, want success", err)
+	}
+}
+
+func TestSQLiteReadCancellationCanAbandonNativeResult(t *testing.T) {
+	runner := newFakeRunner()
+	p := New(runner)
+	pumpCtx, stopPump := context.WithCancel(context.Background())
+	pumpResult := make(chan error, 1)
+	go func() { pumpResult <- p.Run(pumpCtx) }()
+	waitPumpStarted(t, p)
+	t.Cleanup(func() {
+		stopPump()
+		if err := <-pumpResult; err != nil {
+			t.Errorf("Run: %v", err)
+		}
+	})
+
+	session := &ActorSession{
+		pump:      p,
+		done:      make(chan struct{}),
+		identity:  actorIdentity{aid: "sqlite-aid", generation: 4},
+		accepting: true,
+	}
+	session.lifecycleCond = sync.NewCond(&session.lifecycleMu)
+	ctx, cancel := context.WithCancel(context.Background())
+	callResult := make(chan error, 1)
+	go func() {
+		_, err := session.SQLiteQuery(ctx, "SELECT 1", nil, nil)
+		callResult <- err
+	}()
+	command := nextCommand(t, runner)
+	cancel()
+	if err := <-callResult; !errors.Is(err, context.Canceled) {
+		t.Fatalf("read cancellation = %v, want context.Canceled", err)
+	}
+	// A late read result is safe to discard and must not poison the pump.
+	runner.emit(wire.Event{
+		Kind: wire.EventSQLiteResult, SQLiteRequestID: command.SQLiteRequestID, Done: true,
+	})
+}
 
 func TestSQLiteResponseAssemblerPreservesFirstChunkMetadata(t *testing.T) {
 	firstText := "first"

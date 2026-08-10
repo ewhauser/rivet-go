@@ -1,6 +1,7 @@
 //! Callback-free proxy from rivetkit-core actor factories to the Go pump.
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::future::Future;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
@@ -1829,29 +1830,35 @@ impl ActorProxy {
         let proxy = self.clone();
         tokio::spawn(async move {
             let _operation = operation;
+            let abandon_safe = sqlite_statement_is_definitely_read_only(&sql);
             let execute = async {
                 match transaction {
                     Some(transaction) => transaction.execute(sql, Some(params)).await,
                     None => actor.ctx.sql().execute(sql, Some(params)).await,
                 }
             };
-            match tokio::time::timeout(Duration::from_millis(u64::from(deadline_ms)), execute).await
-            {
-                Ok(Ok(mut result)) => {
+            match await_sqlite_deadline(deadline_ms, abandon_safe, execute).await {
+                SqliteDeadlineResult::OnTime(Ok(mut result))
+                | SqliteDeadlineResult::Late(Ok(mut result)) => {
                     if !include_rows {
                         result.columns.clear();
                         result.rows.clear();
                     }
                     proxy.emit_sqlite_execute_result(request_id, result);
                 }
-                Ok(Err(error)) => proxy.emit_sqlite_error(request_id, sqlite_wire_error(&error)),
-                Err(_) => proxy.emit_sqlite_error(
-                    request_id,
-                    WireError::new(
-                        "sqlite_deadline_exceeded",
-                        format!("SQLite operation exceeded its {deadline_ms} ms boundary deadline"),
+                SqliteDeadlineResult::OnTime(Err(error)) => {
+                    proxy.emit_sqlite_error(request_id, sqlite_wire_error(&error))
+                }
+                SqliteDeadlineResult::Late(Err(_)) | SqliteDeadlineResult::Abandoned => proxy
+                    .emit_sqlite_error(
+                        request_id,
+                        WireError::new(
+                            "sqlite_deadline_exceeded",
+                            format!(
+                                "SQLite operation exceeded its {deadline_ms} ms boundary deadline"
+                            ),
+                        ),
                     ),
-                ),
             }
         });
     }
@@ -1907,8 +1914,9 @@ impl ActorProxy {
                 .ctx
                 .sql()
                 .begin_transaction_with_key(lease_key, Some(Duration::from_millis(timeout_ms)));
-            match tokio::time::timeout(Duration::from_millis(u64::from(deadline_ms)), begin).await {
-                Ok(Ok(transaction)) => {
+            match await_sqlite_deadline(deadline_ms, false, begin).await {
+                SqliteDeadlineResult::OnTime(Ok(transaction))
+                | SqliteDeadlineResult::Late(Ok(transaction)) => {
                     proxy
                         .sqlite_transactions
                         .lock()
@@ -1924,14 +1932,17 @@ impl ActorProxy {
                         },
                     );
                 }
-                Ok(Err(error)) => proxy.emit_sqlite_error(request_id, sqlite_wire_error(&error)),
-                Err(_) => proxy.emit_sqlite_error(
-                    request_id,
-                    WireError::new(
-                        "sqlite_deadline_exceeded",
-                        format!("SQLite begin exceeded its {deadline_ms} ms boundary deadline"),
+                SqliteDeadlineResult::OnTime(Err(error)) => {
+                    proxy.emit_sqlite_error(request_id, sqlite_wire_error(&error))
+                }
+                SqliteDeadlineResult::Late(Err(_)) | SqliteDeadlineResult::Abandoned => proxy
+                    .emit_sqlite_error(
+                        request_id,
+                        WireError::new(
+                            "sqlite_deadline_exceeded",
+                            format!("SQLite begin exceeded its {deadline_ms} ms boundary deadline"),
+                        ),
                     ),
-                ),
             }
         });
     }
@@ -1990,24 +2001,33 @@ impl ActorProxy {
                     transaction.rollback().await
                 }
             };
-            match tokio::time::timeout(Duration::from_millis(u64::from(deadline_ms)), finish).await {
-                Ok(Ok(())) => proxy.emit_sqlite_execute_result(
-                    request_id,
-                    ExecuteResult {
-                        columns: Vec::new(),
-                        rows: Vec::new(),
-                        changes: 0,
-                        last_insert_row_id: None,
-                    },
-                ),
-                Ok(Err(error)) => proxy.emit_sqlite_error(request_id, sqlite_wire_error(&error)),
-                Err(_) => proxy.emit_sqlite_error(
-                    request_id,
-                    WireError::new(
-                        "sqlite_deadline_exceeded",
-                        format!("SQLite transaction finish exceeded its {deadline_ms} ms boundary deadline"),
-                    ),
-                ),
+            match await_sqlite_deadline(deadline_ms, false, finish).await {
+                SqliteDeadlineResult::OnTime(Ok(()))
+                | SqliteDeadlineResult::Late(Ok(())) => {
+                    proxy.emit_sqlite_execute_result(
+                        request_id,
+                        ExecuteResult {
+                            columns: Vec::new(),
+                            rows: Vec::new(),
+                            changes: 0,
+                            last_insert_row_id: None,
+                        },
+                    )
+                }
+                SqliteDeadlineResult::OnTime(Err(error)) => {
+                    proxy.emit_sqlite_error(request_id, sqlite_wire_error(&error))
+                }
+                SqliteDeadlineResult::Late(Err(_)) | SqliteDeadlineResult::Abandoned => {
+                    proxy.emit_sqlite_error(
+                        request_id,
+                        WireError::new(
+                            "sqlite_deadline_exceeded",
+                            format!(
+                                "SQLite transaction finish exceeded its {deadline_ms} ms boundary deadline"
+                            ),
+                        ),
+                    )
+                }
             }
         });
     }
@@ -3889,6 +3909,48 @@ fn sqlite_bind_param(value: SqliteValue) -> BindParam {
     }
 }
 
+enum SqliteDeadlineResult<T, E> {
+    OnTime(std::result::Result<T, E>),
+    Late(std::result::Result<T, E>),
+    Abandoned,
+}
+
+async fn await_sqlite_deadline<F, T, E>(
+    deadline_ms: u32,
+    abandon_safe: bool,
+    future: F,
+) -> SqliteDeadlineResult<T, E>
+where
+    F: Future<Output = std::result::Result<T, E>>,
+{
+    tokio::pin!(future);
+    match tokio::time::timeout(
+        Duration::from_millis(u64::from(deadline_ms)),
+        future.as_mut(),
+    )
+    .await
+    {
+        Ok(result) => SqliteDeadlineResult::OnTime(result),
+        Err(_) if abandon_safe => SqliteDeadlineResult::Abandoned,
+        Err(_) => SqliteDeadlineResult::Late(future.await),
+    }
+}
+
+fn sqlite_statement_is_definitely_read_only(sql: &str) -> bool {
+    let trimmed = sql.trim();
+    let Some(keyword) = trimmed.get(.."SELECT".len()) else {
+        return false;
+    };
+    if !keyword.eq_ignore_ascii_case("SELECT") {
+        return false;
+    }
+    match trimmed.as_bytes().get("SELECT".len()) {
+        None => true,
+        Some(b' ' | b'\t' | b'\n' | b'\r' | 0x0c) => true,
+        Some(_) => false,
+    }
+}
+
 fn sqlite_result_events(request_id: u64, result: ExecuteResult) -> Result<Vec<Event>, WireError> {
     let column_count = result.columns.len();
     if column_count > 1_024 {
@@ -4271,6 +4333,56 @@ mod tests {
 
         let error = anyhow::Error::new(depot_client::worker::SqliteWorkerClosingError);
         assert_eq!(sqlite_wire_error(&error).code, "sqlite_endpoint_closed");
+    }
+
+    #[test]
+    fn sqlite_read_only_classification_is_conservative() {
+        assert!(sqlite_statement_is_definitely_read_only("SELECT 1"));
+        assert!(sqlite_statement_is_definitely_read_only(
+            "\nselect\t* FROM todos"
+        ));
+        assert!(!sqlite_statement_is_definitely_read_only(
+            "WITH todo AS (SELECT 1) SELECT * FROM todo"
+        ));
+        assert!(!sqlite_statement_is_definitely_read_only(
+            "WITH todo AS (SELECT 1) INSERT INTO todos SELECT * FROM todo"
+        ));
+        assert!(!sqlite_statement_is_definitely_read_only(
+            "PRAGMA user_version"
+        ));
+        assert!(!sqlite_statement_is_definitely_read_only(
+            "SELECT/* generated */ 1"
+        ));
+        assert!(!sqlite_statement_is_definitely_read_only("SELECTED"));
+    }
+
+    #[tokio::test]
+    async fn mutating_sql_waits_for_settlement_after_deadline() {
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let operation = async move {
+            started_tx.send(()).expect("report operation start");
+            release_rx.await.expect("release late operation");
+            Ok::<_, ()>(17)
+        };
+        let settlement = tokio::spawn(await_sqlite_deadline(1, false, operation));
+        started_rx.await.expect("operation started");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(!settlement.is_finished());
+        release_tx.send(()).expect("release operation");
+        match settlement.await.expect("settlement task") {
+            SqliteDeadlineResult::Late(Ok(value)) => assert_eq!(value, 17),
+            _ => panic!("mutation did not settle as a late success"),
+        }
+    }
+
+    #[tokio::test]
+    async fn read_only_sql_can_be_abandoned_at_deadline() {
+        let operation = std::future::pending::<std::result::Result<(), ()>>();
+        assert!(matches!(
+            await_sqlite_deadline(1, true, operation).await,
+            SqliteDeadlineResult::Abandoned
+        ));
     }
 
     #[tokio::test]

@@ -1,9 +1,9 @@
 use std::{
 	error::Error,
-	fmt,
+	fmt, ptr,
 	sync::{
 		Arc,
-		atomic::{AtomicU8, Ordering},
+		atomic::{AtomicBool, AtomicPtr, AtomicU8, AtomicU64, Ordering},
 	},
 	thread::JoinHandle,
 	time::{Duration, Instant},
@@ -11,7 +11,9 @@ use std::{
 
 use anyhow::{Context, Result, anyhow};
 use crossbeam_channel::{Receiver, Sender, TrySendError};
-use libsqlite3_sys::{SQLITE_OPEN_CREATE, SQLITE_OPEN_READWRITE, sqlite3_get_autocommit};
+use libsqlite3_sys::{
+	SQLITE_OPEN_CREATE, SQLITE_OPEN_READWRITE, sqlite3, sqlite3_get_autocommit, sqlite3_interrupt,
+};
 use parking_lot::Mutex;
 use tokio::sync::{Notify, oneshot};
 
@@ -36,6 +38,7 @@ const STATE_RUNNING: u8 = 0;
 const STATE_CLOSING: u8 = 1;
 const STATE_CLOSED: u8 = 2;
 const STATE_DEAD: u8 = 3;
+const ACTIVE_COMMAND_CANCELING: u64 = u64::MAX;
 
 #[derive(Clone)]
 pub struct SqliteWorkerHandle {
@@ -50,15 +53,25 @@ struct SqliteWorkerInner {
 	closed: Notify,
 	join: Mutex<Option<JoinHandle<()>>>,
 	ready: Mutex<Option<oneshot::Receiver<Result<()>>>>,
+	next_command: AtomicU64,
+	// The async cancellation guard changes id -> CANCELING before calling
+	// sqlite3_interrupt. The worker does not advance until the guard restores
+	// zero, so a delayed interrupt can never target the following command.
+	active_command: AtomicU64,
+	connection: AtomicPtr<sqlite3>,
 }
 
 enum SqliteCommand {
 	Execute {
+		id: u64,
+		cancelled: Arc<AtomicBool>,
 		sql: String,
 		params: Option<Vec<BindParam>>,
 		reply: oneshot::Sender<Result<ExecuteResult>>,
 	},
 	Exec {
+		id: u64,
+		cancelled: Arc<AtomicBool>,
 		sql: String,
 		reply: oneshot::Sender<Result<QueryResult>>,
 	},
@@ -72,6 +85,13 @@ enum SqliteCommand {
 }
 
 struct CloseRequest;
+
+struct SqliteCommandCancellation {
+	inner: Arc<SqliteWorkerInner>,
+	id: u64,
+	cancelled: Arc<AtomicBool>,
+	armed: bool,
+}
 
 /// Tracks an in-progress SQLite transaction so its wall-clock duration and the
 /// network round trips it issued can be reported once it commits or rolls back.
@@ -109,6 +129,9 @@ impl SqliteWorkerHandle {
 			closed: Notify::new(),
 			join: Mutex::new(None),
 			ready: Mutex::new(Some(ready_rx)),
+			next_command: AtomicU64::new(0),
+			active_command: AtomicU64::new(0),
+			connection: AtomicPtr::new(ptr::null_mut()),
 		});
 
 		let thread_inner = Arc::clone(&inner);
@@ -156,9 +179,17 @@ impl SqliteWorkerHandle {
 	}
 
 	pub async fn exec(&self, sql: String) -> Result<QueryResult> {
+		let mut cancellation = SqliteCommandCancellation::new(Arc::clone(&self.inner));
 		let (reply, result) = oneshot::channel();
-		self.enqueue(SqliteCommand::Exec { sql, reply })?;
-		result.await.map_err(|_| sqlite_worker_dead_error())?
+		self.enqueue(SqliteCommand::Exec {
+			id: cancellation.id,
+			cancelled: Arc::clone(&cancellation.cancelled),
+			sql,
+			reply,
+		})?;
+		let result = result.await.map_err(|_| sqlite_worker_dead_error());
+		cancellation.disarm();
+		result?
 	}
 
 	pub async fn execute(
@@ -166,9 +197,18 @@ impl SqliteWorkerHandle {
 		sql: String,
 		params: Option<Vec<BindParam>>,
 	) -> Result<ExecuteResult> {
+		let mut cancellation = SqliteCommandCancellation::new(Arc::clone(&self.inner));
 		let (reply, result) = oneshot::channel();
-		self.enqueue(SqliteCommand::Execute { sql, params, reply })?;
-		result.await.map_err(|_| sqlite_worker_dead_error())?
+		self.enqueue(SqliteCommand::Execute {
+			id: cancellation.id,
+			cancelled: Arc::clone(&cancellation.cancelled),
+			sql,
+			params,
+			reply,
+		})?;
+		let result = result.await.map_err(|_| sqlite_worker_dead_error());
+		cancellation.disarm();
+		result?
 	}
 
 	pub async fn close(&self) -> Result<()> {
@@ -321,6 +361,18 @@ impl SqliteWorkerHandle {
 }
 
 impl SqliteWorkerInner {
+	fn next_command_id(&self) -> u64 {
+		loop {
+			let id = self
+				.next_command
+				.fetch_add(1, Ordering::Relaxed)
+				.wrapping_add(1);
+			if id != 0 && id != ACTIVE_COMMAND_CANCELING {
+				return id;
+			}
+		}
+	}
+
 	fn mark_closing(&self) -> bool {
 		self.state
 			.compare_exchange(
@@ -335,6 +387,49 @@ impl SqliteWorkerInner {
 	fn record_queue_depth(&self, depth: u64) {
 		if let Some(metrics) = &self.metrics {
 			metrics.set_worker_queue_depth(depth);
+		}
+	}
+}
+
+impl SqliteCommandCancellation {
+	fn new(inner: Arc<SqliteWorkerInner>) -> Self {
+		let id = inner.next_command_id();
+		Self {
+			inner,
+			id,
+			cancelled: Arc::new(AtomicBool::new(false)),
+			armed: true,
+		}
+	}
+
+	fn disarm(&mut self) {
+		self.armed = false;
+	}
+}
+
+impl Drop for SqliteCommandCancellation {
+	fn drop(&mut self) {
+		if !self.armed {
+			return;
+		}
+		self.cancelled.store(true, Ordering::Release);
+		if self
+			.inner
+			.active_command
+			.compare_exchange(
+				self.id,
+				ACTIVE_COMMAND_CANCELING,
+				Ordering::AcqRel,
+				Ordering::Acquire,
+			)
+			.is_ok()
+		{
+			let connection = self.inner.connection.load(Ordering::Acquire);
+			if !connection.is_null() {
+				// SQLite explicitly permits sqlite3_interrupt from another thread.
+				unsafe { sqlite3_interrupt(connection) };
+			}
+			self.inner.active_command.store(0, Ordering::Release);
 		}
 	}
 }
@@ -371,6 +466,7 @@ fn worker_main(mut ctx: WorkerContext) {
 	};
 
 	let mut transaction: Option<TransactionTracker> = None;
+	ctx.inner.connection.store(db.as_ptr(), Ordering::Release);
 	loop {
 		if ctx.close_rx.try_recv().is_ok()
 			|| ctx.inner.state.load(Ordering::Acquire) == STATE_CLOSING
@@ -411,6 +507,7 @@ fn worker_main(mut ctx: WorkerContext) {
 				run_command(
 					&mut db,
 					command,
+					&ctx.inner,
 					ctx.inner.metrics.as_deref(),
 					&ctx.file_name,
 					&mut transaction,
@@ -419,6 +516,10 @@ fn worker_main(mut ctx: WorkerContext) {
 		}
 	}
 
+	ctx.inner
+		.connection
+		.store(ptr::null_mut(), Ordering::Release);
+	ctx.inner.active_command.store(0, Ordering::Release);
 	drop(db);
 	ctx.inner.state.store(STATE_CLOSED, Ordering::Release);
 	ctx.inner.closed.notify_waiters();
@@ -441,14 +542,22 @@ fn open_worker_connection(ctx: &WorkerContext) -> Result<NativeConnection> {
 fn run_command(
 	db: &mut NativeConnection,
 	command: SqliteCommand,
+	inner: &SqliteWorkerInner,
 	metrics: Option<&dyn SqliteVfsMetrics>,
 	file_name: &str,
 	transaction: &mut Option<TransactionTracker>,
 ) {
 	let start = Instant::now();
 	match command {
-		SqliteCommand::Execute { sql, params, reply } => {
-			if reply.is_closed() {
+		SqliteCommand::Execute {
+			id,
+			cancelled,
+			sql,
+			params,
+			reply,
+		} => {
+			if !begin_command(inner, id, &cancelled) || reply.is_closed() {
+				finish_command(inner, id);
 				return;
 			}
 			begin_transaction_if_needed(db, transaction);
@@ -467,10 +576,17 @@ fn run_command(
 				start.elapsed(),
 			);
 			finalize_transaction_if_complete(db, metrics, file_name, transaction);
+			finish_command(inner, id);
 			let _ = reply.send(result);
 		}
-		SqliteCommand::Exec { sql, reply } => {
-			if reply.is_closed() {
+		SqliteCommand::Exec {
+			id,
+			cancelled,
+			sql,
+			reply,
+		} => {
+			if !begin_command(inner, id, &cancelled) || reply.is_closed() {
+				finish_command(inner, id);
 				return;
 			}
 			begin_transaction_if_needed(db, transaction);
@@ -479,6 +595,7 @@ fn run_command(
 			let result = exec_statements(db.as_ptr(), &sql);
 			record_command_metrics(metrics, "exec", in_tx, stmt_kind, &result, start.elapsed());
 			finalize_transaction_if_complete(db, metrics, file_name, transaction);
+			finish_command(inner, id);
 			let _ = reply.send(result);
 		}
 		#[cfg(test)]
@@ -490,6 +607,33 @@ fn run_command(
 		SqliteCommand::Panic => {
 			panic!("test sqlite worker panic");
 		}
+	}
+}
+
+fn begin_command(inner: &SqliteWorkerInner, id: u64, cancelled: &AtomicBool) -> bool {
+	if cancelled.load(Ordering::Acquire) {
+		return false;
+	}
+	inner.active_command.store(id, Ordering::Release);
+	if cancelled.load(Ordering::Acquire) {
+		finish_command(inner, id);
+		return false;
+	}
+	true
+}
+
+fn finish_command(inner: &SqliteWorkerInner, id: u64) {
+	match inner
+		.active_command
+		.compare_exchange(id, 0, Ordering::AcqRel, Ordering::Acquire)
+	{
+		Ok(_) | Err(0) => {}
+		Err(ACTIVE_COMMAND_CANCELING) => {
+			while inner.active_command.load(Ordering::Acquire) == ACTIVE_COMMAND_CANCELING {
+				std::thread::yield_now();
+			}
+		}
+		Err(other) => panic!("sqlite worker active command changed from {id} to {other}"),
 	}
 }
 

@@ -169,6 +169,11 @@ tunnels. Where a name matches the wire protocol, semantics must match
   content or 1,024 values, whichever comes first. Only chunk zero carries the
   columns and mutation metadata. The complete content limit is 32 MiB; Go
   buffers and reassembles it before returning `Rows`.
+- SQLite deadlines may abandon only statements conservatively identified as
+  read-only `SELECT`s. Potentially mutating statements, transaction begin, and
+  transaction finish retain their actor-operation fence through terminal
+  settlement. A mutation that commits after its caller context expires is
+  returned as success, never as a retryable timeout.
 - `rk_runner_submit` queue is bounded (default 1024 commands); a full queue
   returns a `Backpressure` error and the Go writer retries with jitter — this
   propagates engine-side tunnel backpressure to `http.ResponseWriter.Write`.
