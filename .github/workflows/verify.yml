@@ -9,6 +9,10 @@ on:
 # grants exactly what it needs.
 permissions: {}
 
+concurrency:
+  group: verify-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 jobs:
   native:
     name: ${{ matrix.name }}
@@ -77,6 +81,10 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           cache-on-failure: true
+          # Pull-request caches are scoped to that PR and cannot accelerate the
+          # post-merge run. Restoring the default-branch cache is still useful,
+          # but saving six one-use native caches crowds out the pinned engine.
+          save-if: ${{ github.event_name != 'pull_request' }}
 
       - name: Install Zig
         if: matrix.libc == 'gnu' || matrix.libc == 'musl'
@@ -172,6 +180,7 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           cache-on-failure: true
+          save-if: ${{ github.event_name != 'pull_request' }}
 
       - name: Check pinned Depot crate standalone
         env:
@@ -241,13 +250,68 @@ jobs:
           if-no-files-found: ignore
           retention-days: 14
 
-  conformance:
-    name: linux-amd64-conformance
+  unit-race:
+    name: linux-amd64-unit-race
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read # checkout only
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install 1.97.0 --profile minimal
+          rustup default 1.97.0
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          cache-on-failure: true
+          shared-key: linux-amd64-host-ffi
+          save-if: ${{ github.event_name != 'pull_request' }}
+
+      - name: Build host native FFI library
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --manifest-path Cargo.toml --package rivetkit-go-ffi \
+            --features ffi-test --locked --release
+          echo "RIVET_GO_FFI_LIB=$PWD/target/release/librivetkit_go_ffi.so" >> "$GITHUB_ENV"
+
+      - name: Run race-enabled unit suite
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p .ci-logs
+          go test -race -short -count=1 -timeout=10m -v ./... 2>&1 | tee .ci-logs/unit-race.log
+
+      - name: Upload unit race failure logs
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: linux-amd64-unit-race-logs
+          path: .ci-logs/unit-race.log
+          if-no-files-found: ignore
+          retention-days: 14
+
+  conformance-shard:
+    name: linux-amd64-conformance-${{ matrix.shard }}
     runs-on: ubuntu-latest
     needs: engine
     permissions:
       contents: read # checkout only
-    timeout-minutes: 35
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [scheduling, state, transport]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -275,6 +339,8 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           cache-on-failure: true
+          shared-key: linux-amd64-host-ffi
+          save-if: ${{ github.event_name != 'pull_request' }}
 
       - name: Build host native FFI library
         shell: bash
@@ -284,23 +350,43 @@ jobs:
             --features ffi-test --locked --release
           echo "RIVET_GO_FFI_LIB=$PWD/target/release/librivetkit_go_ffi.so" >> "$GITHUB_ENV"
 
-      - name: Run real-engine conformance
+      - name: Run real-engine conformance shard
         shell: bash
+        env:
+          CONFORMANCE_SHARD: ${{ matrix.shard }}
         run: |
           set -euo pipefail
           mkdir -p .ci-logs
-          go test -race -count=1 -timeout=25m -v ./... 2>&1 | tee .ci-logs/conformance.log
+          .github/scripts/run-conformance-shard.sh "$CONFORMANCE_SHARD" \
+            2>&1 | tee ".ci-logs/conformance-$CONFORMANCE_SHARD.log"
 
       - name: Upload conformance failure logs
         if: failure()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: linux-amd64-conformance-logs
+          name: linux-amd64-conformance-${{ matrix.shard }}-logs
           path: |
-            .ci-logs/conformance.log
+            .ci-logs/conformance-${{ matrix.shard }}.log
             ~/.cache/rivet-go/engine-v2.3.10/build.log
           if-no-files-found: ignore
           retention-days: 14
+
+  conformance:
+    name: linux-amd64-conformance
+    runs-on: ubuntu-latest
+    needs: [unit-race, conformance-shard]
+    if: always()
+    permissions: {}
+    timeout-minutes: 5
+    steps:
+      - name: Require every race and conformance shard
+        env:
+          CONFORMANCE_RESULT: ${{ needs.conformance-shard.result }}
+          UNIT_RACE_RESULT: ${{ needs.unit-race.result }}
+        run: |
+          set -euo pipefail
+          test "$CONFORMANCE_RESULT" = success
+          test "$UNIT_RACE_RESULT" = success
 
   soak-smoke:
     name: linux-amd64-soak-smoke
@@ -336,6 +422,8 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           cache-on-failure: true
+          shared-key: linux-amd64-host-ffi
+          save-if: ${{ github.event_name != 'pull_request' }}
 
       - name: Build host native FFI library
         shell: bash

@@ -207,10 +207,11 @@ request returns `503 Actor not found`, and no new Go `ActorStart` occurs. The
 sleep-first durability case above is the supported recovery fixture at this
 pin.
 
-The suite is intentionally part of normal `go test ./conformance` and the full
-`go test -race -count=1 -timeout=25m ./...` gate. It is not skipped as a long
-test. No fuzz or deliberately malformed socket-input cases live here; the
-supervisor owns that work. The explicit timeout is required because the
-unshortened race-enabled real-engine suite can exceed Go's default ten-minute
-alarm. The timeout must be set on `go test` itself; changing `test.timeout`
-from `TestMain` cannot extend the parent command's kill deadline.
+The suite is intentionally part of normal `go test ./conformance`; it is not
+skipped as a long test. CI runs the short race-enabled repository suite and
+three balanced real-engine shards, with a coverage check that requires every
+top-level conformance test to belong to exactly one shard. A local full gate is
+`go test -race -count=1 -timeout=25m ./...`. Its explicit timeout is required
+because the unshortened race-enabled real-engine suite can exceed Go's default
+ten-minute alarm. The timeout must be set on `go test` itself; changing
+`test.timeout` from `TestMain` cannot extend the parent command's kill deadline.
