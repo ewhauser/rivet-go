@@ -241,7 +241,7 @@ jobs:
 
       - name: Upload engine build failure logs
         if: failure()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: linux-amd64-engine-logs
           path: |
@@ -294,7 +294,7 @@ jobs:
 
       - name: Upload unit race failure logs
         if: failure()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: linux-amd64-unit-race-logs
           path: .ci-logs/unit-race.log
@@ -362,7 +362,7 @@ jobs:
 
       - name: Upload conformance failure logs
         if: failure()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: linux-amd64-conformance-${{ matrix.shard }}-logs
           path: |
@@ -442,7 +442,7 @@ jobs:
 
       - name: Upload soak failure logs
         if: failure()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: linux-amd64-soak-smoke-logs
           path: |
