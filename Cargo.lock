@@ -1565,7 +1565,19 @@ source = "git+https://github.com/rivet-dev/rivet?tag=v2.3.10#957d4e482f404913ca1
 dependencies = [
  "anyhow",
  "indoc",
- "rivet-error-macros",
+ "rivet-error-macros 2.3.10",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "rivet-error"
+version = "2.3.11"
+source = "git+https://github.com/rivet-dev/rivet?tag=v2.3.11#2c9b996d48e9adf708d736def1d0a2c2a5a16410"
+dependencies = [
+ "anyhow",
+ "indoc",
+ "rivet-error-macros 2.3.11",
  "serde",
  "serde_json",
 ]
@@ -1574,6 +1586,18 @@ dependencies = [
 name = "rivet-error-macros"
 version = "2.3.10"
 source = "git+https://github.com/rivet-dev/rivet?tag=v2.3.10#957d4e482f404913ca1955d8ecc357533f6fd081"
+dependencies = [
+ "indoc",
+ "proc-macro2",
+ "quote",
+ "serde_json",
+ "syn 2.0.119",
+]
+
+[[package]]
+name = "rivet-error-macros"
+version = "2.3.11"
+source = "git+https://github.com/rivet-dev/rivet?tag=v2.3.11#2c9b996d48e9adf708d736def1d0a2c2a5a16410"
 dependencies = [
  "indoc",
  "proc-macro2",
@@ -1682,7 +1706,7 @@ dependencies = [
  "rivet-depot-client",
  "rivet-depot-client-types",
  "rivet-envoy-client",
- "rivet-error",
+ "rivet-error 2.3.10",
  "rivet-metrics",
  "rivetkit-actor-persist",
  "rivetkit-client-protocol",
@@ -1716,7 +1740,7 @@ source = "git+https://github.com/rivet-dev/rivet?tag=v2.3.10#957d4e482f404913ca1
 dependencies = [
  "anyhow",
  "reqwest",
- "rivet-error",
+ "rivet-error 2.3.10",
  "serde",
  "serde_json",
  "sha2",
@@ -1738,7 +1762,7 @@ dependencies = [
  "reqwest",
  "rivet-depot-client",
  "rivet-envoy-protocol",
- "rivet-error",
+ "rivet-error 2.3.11",
  "rivetkit-core",
  "rmp-serde",
  "serde",
