@@ -1503,7 +1503,7 @@ dependencies = [
  "moka",
  "parking_lot",
  "rivet-depot-client-types",
- "rivet-envoy-protocol",
+ "rivet-envoy-protocol 2.3.10",
  "scc",
  "tokio",
  "tracing",
@@ -1525,7 +1525,7 @@ dependencies = [
  "hex",
  "parking_lot",
  "rand 0.8.7",
- "rivet-envoy-protocol",
+ "rivet-envoy-protocol 2.3.10",
  "rivet-metrics",
  "rivet-util-serde",
  "rustls",
@@ -1551,6 +1551,21 @@ dependencies = [
  "hex",
  "rand 0.8.7",
  "rivet-util-serde",
+ "rivet-vbare-compiler",
+ "serde",
+ "serde_bare",
+ "utoipa",
+ "vbare",
+]
+
+[[package]]
+name = "rivet-envoy-protocol"
+version = "2.3.11"
+source = "git+https://github.com/rivet-dev/rivet?tag=v2.3.11#2c9b996d48e9adf708d736def1d0a2c2a5a16410"
+dependencies = [
+ "anyhow",
+ "hex",
+ "rand 0.8.7",
  "rivet-vbare-compiler",
  "serde",
  "serde_bare",
@@ -1737,7 +1752,7 @@ dependencies = [
  "proptest",
  "reqwest",
  "rivet-depot-client",
- "rivet-envoy-protocol",
+ "rivet-envoy-protocol 2.3.11",
  "rivet-error",
  "rivetkit-core",
  "rmp-serde",
