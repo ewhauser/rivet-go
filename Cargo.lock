@@ -1487,7 +1487,7 @@ dependencies = [
  "anyhow",
  "rivet-vbare-compiler",
  "serde",
- "serde_bare",
+ "serde_bare 0.5.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "vbare",
 ]
 
@@ -1503,7 +1503,7 @@ dependencies = [
  "moka",
  "parking_lot",
  "rivet-depot-client-types",
- "rivet-envoy-protocol",
+ "rivet-envoy-protocol 2.3.10",
  "scc",
  "tokio",
  "tracing",
@@ -1525,13 +1525,13 @@ dependencies = [
  "hex",
  "parking_lot",
  "rand 0.8.7",
- "rivet-envoy-protocol",
+ "rivet-envoy-protocol 2.3.10",
  "rivet-metrics",
  "rivet-util-serde",
  "rustls",
  "scc",
  "serde",
- "serde_bare",
+ "serde_bare 0.5.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "serde_json",
  "tokio",
  "tokio-tungstenite",
@@ -1553,7 +1553,22 @@ dependencies = [
  "rivet-util-serde",
  "rivet-vbare-compiler",
  "serde",
- "serde_bare",
+ "serde_bare 0.5.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "utoipa",
+ "vbare",
+]
+
+[[package]]
+name = "rivet-envoy-protocol"
+version = "2.3.14"
+source = "git+https://github.com/rivet-dev/rivet?tag=v2.3.15#caed5835fe3cc3cd37c9a6eb715abd5105024f2a"
+dependencies = [
+ "anyhow",
+ "hex",
+ "rand 0.8.7",
+ "rivet-vbare-compiler",
+ "serde",
+ "serde_bare 0.5.0 (git+https://github.com/rivet-dev/serde_bare?rev=f63f155db7e0ab989255ee0d6991ff8eb9ebee25)",
  "utoipa",
  "vbare",
 ]
@@ -1637,7 +1652,7 @@ dependencies = [
  "anyhow",
  "rivet-vbare-compiler",
  "serde",
- "serde_bare",
+ "serde_bare 0.5.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "vbare",
 ]
 
@@ -1649,7 +1664,7 @@ dependencies = [
  "anyhow",
  "rivet-vbare-compiler",
  "serde",
- "serde_bare",
+ "serde_bare 0.5.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "vbare",
 ]
 
@@ -1691,7 +1706,7 @@ dependencies = [
  "rivetkit-shared-types",
  "scc",
  "serde",
- "serde_bare",
+ "serde_bare 0.5.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "serde_bytes",
  "serde_json",
  "sha2",
@@ -1737,7 +1752,7 @@ dependencies = [
  "proptest",
  "reqwest",
  "rivet-depot-client",
- "rivet-envoy-protocol",
+ "rivet-envoy-protocol 2.3.14",
  "rivet-error",
  "rivetkit-core",
  "rmp-serde",
@@ -1760,7 +1775,7 @@ dependencies = [
  "anyhow",
  "rivet-vbare-compiler",
  "serde",
- "serde_bare",
+ "serde_bare 0.5.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "vbare",
 ]
 
@@ -1961,6 +1976,14 @@ name = "serde_bare"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "51c55386eed0f1ae957b091dc2ca8122f287b60c79c774cbe3d5f2b69fded660"
+dependencies = [
+ "serde",
+]
+
+[[package]]
+name = "serde_bare"
+version = "0.5.0"
+source = "git+https://github.com/rivet-dev/serde_bare?rev=f63f155db7e0ab989255ee0d6991ff8eb9ebee25#f63f155db7e0ab989255ee0d6991ff8eb9ebee25"
 dependencies = [
  "serde",
 ]
