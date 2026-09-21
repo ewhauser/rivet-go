@@ -8,15 +8,18 @@ updates:
       interval: weekly
     cooldown:
       default-days: 7
+    open-pull-requests-limit: 0
   - package-ecosystem: gomod
     directory: /
     schedule:
       interval: weekly
     cooldown:
       default-days: 7
+    open-pull-requests-limit: 0
   - package-ecosystem: cargo
     directory: /
     schedule:
       interval: weekly
     cooldown:
       default-days: 7
+    open-pull-requests-limit: 0
